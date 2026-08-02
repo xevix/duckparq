@@ -1,0 +1,13 @@
+# Vendored DuckDB static libraries, fetched and checksum-verified by
+# scripts/fetch-duckdb.sh. Ignored because it is ~90 MB of build inputs pinned
+# by version + SHA256 in the script; delete these two lines to commit them
+# instead and the fetch step becomes optional.
+Vendor/
+
+# Generated parquet fixtures (scripts/make-fixtures.sh)
+.fixtures/
+
+.build/
+.swiftpm/
+Package.resolved
+.DS_Store
