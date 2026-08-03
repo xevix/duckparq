@@ -326,6 +326,27 @@ public enum SQLBuilder {
     /// `maxDistinct` values in any subset proves more than `maxDistinct` values
     /// overall, so a bounded read can reject a column but can never wrongly
     /// admit one. Pass nil to ask the real question.
+    /// A column's distinct values with how many rows carry each, bounded to
+    /// `maxDistinct + 1`.
+    ///
+    /// The same shape of work as `distinctValues` — `DISTINCT` *is* a group-by,
+    /// so DuckDB builds the same hash table either way and the counts come off
+    /// the groups it already has. That is why the filter list can show them
+    /// without the probe costing more than it did without them.
+    public static func valueCounts(
+        source: DataSource,
+        column: ColumnInfo,
+        maxDistinct: Int = 50
+    ) -> BoundSQL {
+        let reference = quote(column.name)
+        let sql = """
+            SELECT CAST(\(reference) AS VARCHAR) AS value, count(*) AS occurrences \
+            FROM \(source.readExpression(parameterIndex: 1)) \
+            GROUP BY 1 LIMIT \(maxDistinct + 1)
+            """
+        return BoundSQL(sql: sql, params: [source.readPath])
+    }
+
     public static func distinctValues(
         source: DataSource,
         column: ColumnInfo,

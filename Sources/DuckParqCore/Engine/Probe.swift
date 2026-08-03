@@ -1,13 +1,24 @@
 import Foundation
 
+/// One value a column takes, and how many rows carry it.
+public struct DistinctValue: Sendable, Equatable, Hashable {
+    public let value: String
+    public let count: Int
+
+    public init(value: String, count: Int) {
+        self.value = value
+        self.count = count
+    }
+}
+
 /// What a lazily-probed column filter should show.
 public enum FilterAffordance: Sendable, Equatable {
     /// Few enough distinct values to pick from a list.
     ///
     /// The values are the column's complete, exact set — not a sample of it —
-    /// so there is nothing for the UI to qualify. `hasNull` reports whether NULL
-    /// is among them.
-    case dropdown(values: [String], hasNull: Bool)
+    /// so there is nothing for the UI to qualify, and the counts are the real
+    /// row counts. `nullCount` is how many rows are NULL, zero when none are.
+    case dropdown(values: [DistinctValue], nullCount: Int)
     /// Too many distinct values (or the type isn't enumerable) — use operators.
     case comparison
 }
@@ -82,27 +93,28 @@ public struct Probe: Sendable {
         // One more row than the cap means "too many to enumerate".
         guard screened.rowCount <= maxDistinct else { return .comparison }
 
-        let exact = SQLBuilder.distinctValues(
-            source: source, column: column,
-            sampleRows: nil, maxDistinct: maxDistinct
-        )
+        let exact = SQLBuilder.valueCounts(source: source, column: column, maxDistinct: maxDistinct)
         let batch = try await session.queryAll(exact.sql, params: exact.params, limit: maxDistinct + 1)
         guard batch.rowCount <= maxDistinct else { return .comparison }
 
-        var values: [String] = []
-        var hasNull = false
+        var values: [DistinctValue] = []
+        var nullCount = 0
         for row in 0..<batch.rowCount {
+            let occurrences = Int(batch[row, 1] ?? "") ?? 0
             if let value = batch[row, 0] {
-                values.append(value)
+                values.append(DistinctValue(value: value, count: occurrences))
             } else {
-                hasNull = true
+                nullCount = occurrences
             }
         }
         // Nothing to choose from is not a dropdown. A column with no values at
         // all is an empty source, and offering an empty list would look exactly
         // like a broken one.
-        guard !values.isEmpty || hasNull else { return .comparison }
-        return .dropdown(values: values.sorted(), hasNull: hasNull)
+        guard !values.isEmpty || nullCount > 0 else { return .comparison }
+        // Alphabetical, not by frequency: a list you are picking from should be
+        // in the order you would look something up in, and the counts are right
+        // there to be read.
+        return .dropdown(values: values.sorted { $0.value < $1.value }, nullCount: nullCount)
     }
 
     public func fileMetadata(of source: DataSource) async throws -> RowBatch {

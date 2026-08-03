@@ -223,6 +223,12 @@ for one more value than the cap is what separates "too many to list" from
 "exactly the cap". The result is cached against the source's fingerprint, so a
 popover is answered once per file version.
 
+Each value is listed with how many rows carry it, NULL included. That is free:
+`DISTINCT` *is* a group-by, so DuckDB builds the same hash table either way and
+the counts come off the groups it already has. The list is alphabetical rather
+than by frequency — it is something you look a value up in, and the counts are
+right there to be read.
+
 The values in the list are therefore the column's, complete, and the popover says
 nothing to qualify them. An earlier version showed the head sample's values
 directly, labelled "from the first 200,000 rows" — which on a column whose

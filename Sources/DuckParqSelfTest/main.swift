@@ -349,9 +349,12 @@ do {
 do {
     let affordance = try await probe.filterAffordance(
         for: ColumnInfo(name: "category", typeName: "VARCHAR"), in: .file(smallParquet))
-    if case .dropdown(let values, let hasNull) = affordance {
-        expectEqual(values, ["alpha", "beta", "delta", "gamma"], "low-cardinality column offers its values")
-        expect(!hasNull, "no NULLs in the category fixture")
+    if case .dropdown(let values, let nullCount) = affordance {
+        expectEqual(values.map(\.value), ["alpha", "beta", "delta", "gamma"],
+                    "low-cardinality column offers its values")
+        expectEqual(values.map(\.count), [250, 250, 250, 250],
+                    "each value carries how many rows have it")
+        expectEqual(nullCount, 0, "no NULLs in the category fixture")
     } else {
         expect(false, "a 4-value column should offer a dropdown")
     }
@@ -1103,7 +1106,7 @@ do {
     let probe = Probe(session: session)
     if case .dropdown(let values, _) =
         try await probe.filterAffordance(for: categoryColumn, in: .file(smallParquet)) {
-        expectEqual(values, ["alpha", "beta", "delta", "gamma"],
+        expectEqual(values.map(\.value), ["alpha", "beta", "delta", "gamma"],
                     "a low-cardinality column offers a list, sorted for reading")
     } else {
         expect(false, "a four-value column gets a dropdown")
@@ -1133,11 +1136,13 @@ do {
     let headBatch = try await session.queryAll(headOnly.sql, params: headOnly.params, limit: 64)
     expectEqual(headBatch.rowCount, 1, "the head of this column really is nothing but NULL")
 
-    if case .dropdown(let values, let hasNull) =
+    if case .dropdown(let values, let nullCount) =
         try await probe.filterAffordance(for: flagColumn, in: .file(sparse)) {
-        expectEqual(values, ["alpha", "beta", "gamma"],
+        expectEqual(values.map(\.value), ["alpha", "beta", "gamma"],
                     "the dropdown lists the column's values, not the head's")
-        expect(hasNull, "and still reports that NULL is among them")
+        expectEqual(nullCount, 400_000, "and counts the NULLs it found rather than just noting them")
+        expectEqual(values.map(\.count).reduce(0, +) + nullCount, 420_000,
+                    "the counts account for every row in the column")
     } else {
         expect(false, "a three-value column gets a dropdown however its rows are ordered")
     }
@@ -1168,11 +1173,13 @@ do {
 
     let dataset = DataSource.dataset(partitioned)
     let flagInDataset = ColumnInfo(name: "m_flag", typeName: "VARCHAR")
-    if case .dropdown(let values, let hasNull) =
+    if case .dropdown(let values, let nullCount) =
         try await probe.filterAffordance(for: flagInDataset, in: dataset) {
-        expectEqual(values, ["B", "D", "H", "T"],
+        expectEqual(values.map(\.value), ["B", "D", "H", "T"],
                     "a sparse flag column across many partitions lists all its values")
-        expect(hasNull, "including that most of the archive has none")
+        expectEqual(nullCount, 300_000, "including that most of the archive has none")
+        expectEqual(values.map(\.count).reduce(0, +) + nullCount, 420_000,
+                    "counts across partitions add up to the whole dataset")
     } else {
         expect(false, "a four-value column in a hive dataset gets a dropdown")
     }

@@ -135,8 +135,8 @@ struct FilterEditor: View {
             } else if let probeError {
                 Text(probeError).font(.callout).foregroundStyle(.red)
                 comparisonControls
-            } else if case .dropdown(let values, let hasNull) = affordance {
-                dropdownControls(values: values, hasNull: hasNull)
+            } else if case .dropdown(let values, let nullCount) = affordance {
+                dropdownControls(values: values, nullCount: nullCount)
             } else {
                 comparisonControls
             }
@@ -168,22 +168,47 @@ struct FilterEditor: View {
     private static let inlineChoiceLimit = 12
 
     @ViewBuilder
-    private func choices(_ values: [String], hasNull: Bool) -> some View {
-        ForEach(values, id: \.self) { value in
-            Toggle(isOn: binding(for: value)) {
-                Text(value.isEmpty ? "(empty)" : value)
-                    .lineLimit(1)
-                    .font(.system(size: 11, design: .monospaced))
+    private func choices(_ values: [DistinctValue], nullCount: Int) -> some View {
+        ForEach(values, id: \.value) { entry in
+            choiceRow(count: entry.count) {
+                Toggle(isOn: binding(for: entry.value)) {
+                    Text(entry.value.isEmpty ? "(empty)" : entry.value)
+                        .lineLimit(1)
+                        .font(.system(size: 11, design: .monospaced))
+                }
+                .toggleStyle(.checkbox)
             }
-            .toggleStyle(.checkbox)
         }
-        if hasNull {
-            Toggle("NULL", isOn: $includeNull).toggleStyle(.checkbox).italic()
+        if nullCount > 0 {
+            choiceRow(count: nullCount) {
+                Toggle("NULL", isOn: $includeNull).toggleStyle(.checkbox).italic()
+            }
         }
     }
 
+    /// A checkbox with its row count against the trailing edge.
+    ///
+    /// The count is a sibling of the toggle rather than part of its label: a
+    /// `Spacer` inside a control's label has no width to expand into, so it
+    /// would sit jammed against the value instead of lining up down the list.
+    private func choiceRow<Content: View>(
+        count: Int,
+        @ViewBuilder _ toggle: () -> Content
+    ) -> some View {
+        HStack(spacing: 6) {
+            toggle()
+            Spacer(minLength: 8)
+            Text(count.formatted())
+                .font(.system(size: 10))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .help("\(count.formatted()) rows")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     @ViewBuilder
-    private func dropdownControls(values: [String], hasNull: Bool) -> some View {
+    private func dropdownControls(values: [DistinctValue], nullCount: Int) -> some View {
         Text("Show rows where \(column.name) is any of:")
             .font(.callout)
             .foregroundStyle(.secondary)
@@ -193,12 +218,12 @@ struct FilterEditor: View {
         // rendered as a zero-height gap between the heading and the link below
         // it. A short list is laid out directly; only a long one is scrolled,
         // and then with an explicit height rather than a hopeful maximum.
-        let choiceCount = values.count + (hasNull ? 1 : 0)
+        let choiceCount = values.count + (nullCount > 0 ? 1 : 0)
         if choiceCount <= Self.inlineChoiceLimit {
-            VStack(alignment: .leading, spacing: 3) { choices(values, hasNull: hasNull) }
+            VStack(alignment: .leading, spacing: 3) { choices(values, nullCount: nullCount) }
         } else {
             ScrollView {
-                VStack(alignment: .leading, spacing: 3) { choices(values, hasNull: hasNull) }
+                VStack(alignment: .leading, spacing: 3) { choices(values, nullCount: nullCount) }
             }
             .frame(height: 220)
         }
