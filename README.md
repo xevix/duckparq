@@ -123,8 +123,8 @@ cheap file summary reports how many there are, and the panel offers to read them
 
 ### Sessions
 
-Six independent DuckDB sessions — grid, schema, row count, inspector, SQL
-editor, export.
+Seven independent DuckDB sessions — grid, schema, row count, filter probe,
+inspector, SQL editor, export.
 
 **A session is a serial queue**, so "its own session" is the only thing that
 actually makes two concerns concurrent; running them as two Swift tasks against
@@ -208,16 +208,26 @@ formatting and comparing the rows.
 Applying a filter also updates the editor, as long as it is still showing the
 view's query — anything typed is left alone.
 
-Filter popovers pick their controls with `SELECT DISTINCT … LIMIT 51`, run *when
-the popover opens* — probing every column on file select would mean a scan per
-column, which is what this app exists to avoid. Asking for one more value than
-the cap is what distinguishes "too many to list" from "exactly the cap", and a
-bounded `DISTINCT` can stop as soon as it has them — where the `GROUP BY` with
-counts this replaced had to aggregate the whole sample first, only for the
-frequency ordering it produced to be discarded and the values sorted
-alphabetically. Low cardinality gets a multi-select list; anything else gets
-comparison operators. The sample reads the first 200,000 rows, and the popover
-says so.
+Filter popovers pick their controls from **how many distinct values a column
+actually has**, asked *when the popover opens* — probing every column on file
+select would mean a scan per column, which is what this app exists to avoid.
+
+Two queries, in cost order, and the answer is exact either way. First a bounded
+read of the head: more than 50 distinct values in *any* subset proves more than
+50 in the column, so this can rule a column out cheaply, and can never wrongly
+rule one in. Whatever survives gets the real question — `SELECT DISTINCT` over
+the whole column. `DISTINCT` is a blocking hash aggregate, so it does read the
+column; it is only ever reached for columns that look enumerable, where the hash
+table stays small and parquet's dictionary encoding makes the scan cheap. Asking
+for one more value than the cap is what separates "too many to list" from
+"exactly the cap". The result is cached against the source's fingerprint, so a
+popover is answered once per file version.
+
+The values in the list are therefore the column's, complete, and the popover says
+nothing to qualify them. An earlier version showed the head sample's values
+directly, labelled "from the first 200,000 rows" — which on a column whose
+leading rows are all NULL, as flag columns in real datasets very often are,
+showed an empty list and a caveat in place of an answer.
 
 ## Layout
 

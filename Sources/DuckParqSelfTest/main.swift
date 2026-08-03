@@ -349,7 +349,7 @@ do {
 do {
     let affordance = try await probe.filterAffordance(
         for: ColumnInfo(name: "category", typeName: "VARCHAR"), in: .file(smallParquet))
-    if case .dropdown(let values, let hasNull, _) = affordance {
+    if case .dropdown(let values, let hasNull) = affordance {
         expectEqual(values, ["alpha", "beta", "delta", "gamma"], "low-cardinality column offers its values")
         expect(!hasNull, "no NULLs in the category fixture")
     } else {
@@ -1101,7 +1101,7 @@ do {
 
     // The affordance those queries feed, end to end.
     let probe = Probe(session: session)
-    if case .dropdown(let values, _, _) =
+    if case .dropdown(let values, _) =
         try await probe.filterAffordance(for: categoryColumn, in: .file(smallParquet)) {
         expectEqual(values, ["alpha", "beta", "delta", "gamma"],
                     "a low-cardinality column offers a list, sorted for reading")
@@ -1110,6 +1110,44 @@ do {
     }
     expectEqual(try await probe.filterAffordance(for: idColumn, in: .file(smallParquet)), .comparison,
                 "a column with a thousand values gets comparison operators instead")
+
+    // The case that made this wrong: a low-cardinality column whose leading
+    // rows are all NULL. Reading the head and showing what it found reported an
+    // empty list — a caveat where the answer should have been. Real parquet is
+    // full of these; every flag column in a weather dataset looks like this.
+    let sparse = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("duckparq-sparse-\(UUID().uuidString).parquet")
+    defer { try? FileManager.default.removeItem(at: sparse) }
+    try await session.execute("""
+        COPY (
+            SELECT i AS id,
+                   CASE WHEN i < 400000 THEN NULL
+                        ELSE ['alpha', 'beta', 'gamma'][(i % 3) + 1] END AS flag
+            FROM range(420000) t(i)
+        ) TO '\(sparse.path)' (FORMAT parquet)
+        """)
+
+    let flagColumn = ColumnInfo(name: "flag", typeName: "VARCHAR")
+    let headOnly = SQLBuilder.distinctValues(
+        source: .file(sparse), column: flagColumn, sampleRows: 200_000)
+    let headBatch = try await session.queryAll(headOnly.sql, params: headOnly.params, limit: 64)
+    expectEqual(headBatch.rowCount, 1, "the head of this column really is nothing but NULL")
+
+    if case .dropdown(let values, let hasNull) =
+        try await probe.filterAffordance(for: flagColumn, in: .file(sparse)) {
+        expectEqual(values, ["alpha", "beta", "gamma"],
+                    "the dropdown lists the column's values, not the head's")
+        expect(hasNull, "and still reports that NULL is among them")
+    } else {
+        expect(false, "a three-value column gets a dropdown however its rows are ordered")
+    }
+
+    // The bounded read can still reject, which is what keeps the exact question
+    // off high-cardinality columns: more distinct values in a subset proves more
+    // distinct values overall, so rejection is sound where admission would not be.
+    expectEqual(try await probe.filterAffordance(for: ColumnInfo(name: "id", typeName: "BIGINT"),
+                                                 in: .file(sparse)),
+                .comparison, "a column with 420,000 values is still rejected cheaply")
 }
 
 // MARK: - Preview cache
@@ -1284,6 +1322,7 @@ do {
         gridSession: try DuckDBSession(engine: engine, label: "model-grid"),
         metaSession: try DuckDBSession(engine: engine, label: "model-meta"),
         countSession: try DuckDBSession(engine: engine, label: "model-count"),
+        filterSession: try DuckDBSession(engine: engine, label: "model-filter"),
         cache: modelCache
     )
 
@@ -1492,7 +1531,8 @@ if FileManager.default.fileExists(atPath: bigParquet.path) {
     let model = TableModel(
         gridSession: try DuckDBSession(engine: engine, label: "big-grid"),
         metaSession: try DuckDBSession(engine: engine, label: "big-meta"),
-        countSession: try DuckDBSession(engine: engine, label: "big-count")
+        countSession: try DuckDBSession(engine: engine, label: "big-count"),
+        filterSession: try DuckDBSession(engine: engine, label: "big-filter")
     )
 
     // Opening a big file must show rows quickly, not read 10M of them.

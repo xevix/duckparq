@@ -22,6 +22,7 @@ final class AppModel {
     let metaSession: DuckDBSession
     let countSession: DuckDBSession
     let inspectorSession: DuckDBSession
+    let filterSession: DuckDBSession
     let sqlSession: DuckDBSession
     let exportSession: DuckDBSession
     let probe: Probe
@@ -89,13 +90,15 @@ final class AppModel {
         self.metaSession = try! DuckDBSession(engine: engine, label: "meta")
         self.countSession = try! DuckDBSession(engine: engine, label: "count")
         self.inspectorSession = try! DuckDBSession(engine: engine, label: "inspector")
+        self.filterSession = try! DuckDBSession(engine: engine, label: "filter")
         self.sqlSession = try! DuckDBSession(engine: engine, label: "sql")
         self.exportSession = try! DuckDBSession(engine: engine, label: "export")
         self.probe = Probe(session: inspectorSession)
         self.table = TableModel(
             gridSession: gridSession,
             metaSession: metaSession,
-            countSession: countSession
+            countSession: countSession,
+            filterSession: filterSession
         )
         self.formatsOnSave = UserDefaults.standard.bool(forKey: Defaults.formatOnSave)
 

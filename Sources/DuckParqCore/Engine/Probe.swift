@@ -2,9 +2,12 @@ import Foundation
 
 /// What a lazily-probed column filter should show.
 public enum FilterAffordance: Sendable, Equatable {
-    /// Few enough distinct values to pick from a list. `hasNull` reports whether
-    /// NULL appeared in the sample.
-    case dropdown(values: [String], hasNull: Bool, sampled: Bool)
+    /// Few enough distinct values to pick from a list.
+    ///
+    /// The values are the column's complete, exact set — not a sample of it —
+    /// so there is nothing for the UI to qualify. `hasNull` reports whether NULL
+    /// is among them.
+    case dropdown(values: [String], hasNull: Bool)
     /// Too many distinct values (or the type isn't enumerable) — use operators.
     case comparison
 }
@@ -41,26 +44,49 @@ public struct Probe: Sendable {
         return value
     }
 
-    /// Decide which filter UI a column deserves, by sampling its distinct values.
+    /// Decide which filter UI a column deserves, from how many distinct values
+    /// it actually has.
     ///
     /// Run when the filter popover opens rather than on file select: probing
     /// every column up front would turn "click a file and look at it" into a
-    /// full scan per column, which is exactly what this app exists to avoid.
+    /// scan per column, which is exactly what this app exists to avoid.
+    ///
+    /// Two questions, in cost order, and the answer is exact either way:
+    ///
+    /// 1. **A bounded read of the head.** More than `maxDistinct` values in any
+    ///    subset proves more than `maxDistinct` values in the column, so this
+    ///    can reject a column outright — cheaply, and without ever being able to
+    ///    wrongly admit one. It is a rejection filter, not an estimate.
+    /// 2. **The real distinct set**, for whatever survives. `DISTINCT` is a
+    ///    blocking hash aggregate, so this reads the column; it is only reached
+    ///    for columns that look enumerable, where the hash table stays small and
+    ///    parquet's dictionary encoding makes the scan cheap.
+    ///
+    /// The values shown are therefore the column's, complete. An earlier version
+    /// showed the head sample's values directly and labelled them "from the
+    /// first 200,000 rows" — which on a column whose early rows are all NULL
+    /// meant an empty list, and a caveat in place of the answer.
     public func filterAffordance(
         for column: ColumnInfo,
         in source: DataSource,
         maxDistinct: Int = 50,
-        sampleRows: Int = 200_000
+        screenRows: Int = 200_000
     ) async throws -> FilterAffordance {
         guard column.kind != .nested, column.kind != .binary else { return .comparison }
 
-        let query = SQLBuilder.distinctValues(
+        let screen = SQLBuilder.distinctValues(
             source: source, column: column,
-            sampleRows: sampleRows, maxDistinct: maxDistinct
+            sampleRows: screenRows, maxDistinct: maxDistinct
         )
-        let batch = try await session.queryAll(query.sql, params: query.params, limit: maxDistinct + 1)
-
+        let screened = try await session.queryAll(screen.sql, params: screen.params, limit: maxDistinct + 1)
         // One more row than the cap means "too many to enumerate".
+        guard screened.rowCount <= maxDistinct else { return .comparison }
+
+        let exact = SQLBuilder.distinctValues(
+            source: source, column: column,
+            sampleRows: nil, maxDistinct: maxDistinct
+        )
+        let batch = try await session.queryAll(exact.sql, params: exact.params, limit: maxDistinct + 1)
         guard batch.rowCount <= maxDistinct else { return .comparison }
 
         var values: [String] = []
@@ -72,10 +98,7 @@ public struct Probe: Sendable {
                 hasNull = true
             }
         }
-
-        let total = try? await rowCount(of: source)
-        let sampled = (total ?? Int.max) > sampleRows
-        return .dropdown(values: values.sorted(), hasNull: hasNull, sampled: sampled)
+        return .dropdown(values: values.sorted(), hasNull: hasNull)
     }
 
     public func fileMetadata(of source: DataSource) async throws -> RowBatch {

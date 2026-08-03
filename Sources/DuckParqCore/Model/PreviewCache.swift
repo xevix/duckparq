@@ -120,6 +120,8 @@ public final class PreviewCache: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [SourceFingerprint: CachedPreview] = [:]
     private var stats: [SourceFingerprint: CachedStats] = [:]
+    /// Filter affordances, by column name within a source.
+    private var affordances: [SourceFingerprint: [String: FilterAffordance]] = [:]
     /// Least-recently-used first.
     private var order: [SourceFingerprint] = []
 
@@ -160,11 +162,37 @@ public final class PreviewCache: @unchecked Sendable {
         evict()
     }
 
+    /// What a column's filter popover decided last time.
+    ///
+    /// Worth keeping because establishing that a column really has few distinct
+    /// values means reading it — the one question here that cannot be answered
+    /// from a bounded read. Re-opening the same popover should not re-ask it.
+    public func affordance(for fingerprint: SourceFingerprint, column: String) -> FilterAffordance? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = affordances[fingerprint]?[column] else { return nil }
+        touch(fingerprint)
+        return entry
+    }
+
+    public func storeAffordance(
+        _ affordance: FilterAffordance,
+        for fingerprint: SourceFingerprint,
+        column: String
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        affordances[fingerprint, default: [:]][column] = affordance
+        touch(fingerprint)
+        evict()
+    }
+
     public func clear() {
         lock.lock()
         defer { lock.unlock() }
         entries.removeAll()
         stats.removeAll()
+        affordances.removeAll()
         order.removeAll()
     }
 
@@ -187,6 +215,7 @@ public final class PreviewCache: @unchecked Sendable {
             order.removeFirst()
             entries.removeValue(forKey: oldest)
             stats.removeValue(forKey: oldest)
+            affordances.removeValue(forKey: oldest)
         }
     }
 }

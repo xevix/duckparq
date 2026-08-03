@@ -135,8 +135,8 @@ struct FilterEditor: View {
             } else if let probeError {
                 Text(probeError).font(.callout).foregroundStyle(.red)
                 comparisonControls
-            } else if case .dropdown(let values, let hasNull, let sampled) = affordance {
-                dropdownControls(values: values, hasNull: hasNull, sampled: sampled)
+            } else if case .dropdown(let values, let hasNull) = affordance {
+                dropdownControls(values: values, hasNull: hasNull)
             } else {
                 comparisonControls
             }
@@ -164,7 +164,7 @@ struct FilterEditor: View {
     // MARK: - Controls
 
     @ViewBuilder
-    private func dropdownControls(values: [String], hasNull: Bool, sampled: Bool) -> some View {
+    private func dropdownControls(values: [String], hasNull: Bool) -> some View {
         Text("Show rows where \(column.name) is any of:")
             .font(.callout)
             .foregroundStyle(.secondary)
@@ -186,13 +186,7 @@ struct FilterEditor: View {
         }
         .frame(maxHeight: 220)
 
-        if sampled {
-            // The probe reads the head of the file to stay fast, so say so
-            // rather than implying these are all the distinct values.
-            Label("Values from the first 200,000 rows", systemImage: "info.circle")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        }
+        // No caveat: these are the column's distinct values, all of them.
 
         Button("Use a comparison instead") {
             affordance = .comparison

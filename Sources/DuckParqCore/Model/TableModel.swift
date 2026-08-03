@@ -88,6 +88,8 @@ public final class TableModel {
     /// hold up the `DESCRIBE` beside it, and "these run concurrently" would be
     /// true of the Swift tasks and false of the work.
     private let counter: Probe
+    /// Column cardinality for filter popovers, which can mean reading a column.
+    private let filterProbe: Probe
     private let cache: PreviewCache
 
     private var cursor: QueryCursor?
@@ -111,11 +113,13 @@ public final class TableModel {
         gridSession: DuckDBSession,
         metaSession: DuckDBSession,
         countSession: DuckDBSession,
+        filterSession: DuckDBSession,
         cache: PreviewCache = .shared
     ) {
         self.gridSession = gridSession
         self.probe = Probe(session: metaSession)
         self.counter = Probe(session: countSession)
+        self.filterProbe = Probe(session: filterSession)
         self.cache = cache
     }
 
@@ -291,9 +295,27 @@ public final class TableModel {
         reload(keepingRows: true)
     }
 
+    /// What the filter popover for a column should offer.
+    ///
+    /// Cached against the source's fingerprint, because establishing that a
+    /// column really does have few distinct values means reading it — the one
+    /// question here a bounded read cannot answer. Runs on its own session so a
+    /// slow one cannot hold up the schema lookup for the next file you click.
     public func filterAffordance(for column: ColumnInfo) async throws -> FilterAffordance {
         guard case .source(let source) = mode else { return .comparison }
-        return try await probe.filterAffordance(for: column, in: source)
+
+        let fingerprint = await Task.detached(priority: .userInitiated) {
+            SourceFingerprint.compute(for: source)
+        }.value
+        if let fingerprint, let cached = cache.affordance(for: fingerprint, column: column.name) {
+            return cached
+        }
+
+        let affordance = try await filterProbe.filterAffordance(for: column, in: source)
+        if let fingerprint {
+            cache.storeAffordance(affordance, for: fingerprint, column: column.name)
+        }
+        return affordance
     }
 
     // MARK: - Loading

@@ -312,31 +312,36 @@ public enum SQLBuilder {
         return BoundSQL(sql: "SELECT count(*) AS row_count FROM (\(trimmed))", params: [])
     }
 
-    /// Sample a column's distinct values to decide between a dropdown and a
-    /// comparison widget.
+    /// A column's distinct values, bounded to `maxDistinct + 1`.
     ///
-    /// `SELECT DISTINCT` with an outer `LIMIT`, not a `GROUP BY` with counts:
-    /// the caller only needs the values and how many there are, and a distinct
-    /// bounded to 51 can stop the moment it has seen 51 of them. Counting
-    /// occurrences meant aggregating the whole sample before anything could be
-    /// returned, and then the frequency ordering it produced was discarded by
-    /// the caller, which sorts the values alphabetically anyway.
+    /// `SELECT DISTINCT` rather than a `GROUP BY` with counts: the caller needs
+    /// the values and how many there are, nothing else. The counts it used to
+    /// compute were aggregated over the whole input and then discarded, since
+    /// the values get sorted alphabetically for display anyway.
     ///
-    /// The inner LIMIT is what keeps this fast enough to run on popover open —
-    /// it reads the head of the file rather than scanning it. That makes the
-    /// result a head-biased sample, which the UI states plainly rather than
-    /// implying a full distinct scan.
+    /// `sampleRows` reads only the head of the source. That is **not** a way to
+    /// approximate the answer — a head sample is badly biased, and on a column
+    /// whose early rows are all NULL it reports one value where the column has
+    /// twenty. It is only ever used to *rule a column out*: more than
+    /// `maxDistinct` values in any subset proves more than `maxDistinct` values
+    /// overall, so a bounded read can reject a column but can never wrongly
+    /// admit one. Pass nil to ask the real question.
     public static func distinctValues(
         source: DataSource,
         column: ColumnInfo,
-        sampleRows: Int = 200_000,
+        sampleRows: Int? = nil,
         maxDistinct: Int = 50
     ) -> BoundSQL {
         let reference = quote(column.name)
+        let from: String
+        if let sampleRows {
+            from = "(SELECT \(reference) FROM \(source.readExpression(parameterIndex: 1)) LIMIT \(sampleRows))"
+        } else {
+            from = "(SELECT \(reference) FROM \(source.readExpression(parameterIndex: 1)))"
+        }
         let sql = """
             SELECT DISTINCT CAST(\(reference) AS VARCHAR) AS value \
-            FROM (SELECT \(reference) FROM \(source.readExpression(parameterIndex: 1)) LIMIT \(sampleRows)) \
-            LIMIT \(maxDistinct + 1)
+            FROM \(from) LIMIT \(maxDistinct + 1)
             """
         return BoundSQL(sql: sql, params: [source.readPath])
     }
