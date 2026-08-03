@@ -82,6 +82,25 @@ public struct CachedPreview: Sendable {
     }
 }
 
+/// The inspector's answers about a source.
+///
+/// Worth remembering for the same reason as the preview, and more so: the
+/// per-column row-group statistics are `parquet_metadata`, which is O(row groups
+/// × columns) and reads every footer in the dataset. On anything large that is
+/// the slowest question the app asks, and it is asked again every time you click
+/// back to a file you already looked at.
+public struct CachedStats: Sendable {
+    public let fileSummary: RowBatch?
+    public let columnStatistics: RowBatch?
+    public let keyValues: RowBatch?
+
+    public init(fileSummary: RowBatch?, columnStatistics: RowBatch?, keyValues: RowBatch?) {
+        self.fileSummary = fileSummary
+        self.columnStatistics = columnStatistics
+        self.keyValues = keyValues
+    }
+}
+
 /// Remembers the opening view of recently browsed sources.
 ///
 /// Scope is deliberately narrow: **only the unfiltered, unsorted first page**,
@@ -100,6 +119,7 @@ public final class PreviewCache: @unchecked Sendable {
 
     private let lock = NSLock()
     private var entries: [SourceFingerprint: CachedPreview] = [:]
+    private var stats: [SourceFingerprint: CachedStats] = [:]
     /// Least-recently-used first.
     private var order: [SourceFingerprint] = []
 
@@ -120,16 +140,31 @@ public final class PreviewCache: @unchecked Sendable {
         defer { lock.unlock() }
         entries[fingerprint] = preview
         touch(fingerprint)
-        while order.count > capacity, let oldest = order.first {
-            order.removeFirst()
-            entries.removeValue(forKey: oldest)
-        }
+        evict()
+    }
+
+    /// The inspector's metadata for a source, if it has been read before.
+    public func stats(for fingerprint: SourceFingerprint) -> CachedStats? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = stats[fingerprint] else { return nil }
+        touch(fingerprint)
+        return entry
+    }
+
+    public func storeStats(_ value: CachedStats, for fingerprint: SourceFingerprint) {
+        lock.lock()
+        defer { lock.unlock() }
+        stats[fingerprint] = value
+        touch(fingerprint)
+        evict()
     }
 
     public func clear() {
         lock.lock()
         defer { lock.unlock() }
         entries.removeAll()
+        stats.removeAll()
         order.removeAll()
     }
 
@@ -143,5 +178,15 @@ public final class PreviewCache: @unchecked Sendable {
     private func touch(_ fingerprint: SourceFingerprint) {
         order.removeAll { $0 == fingerprint }
         order.append(fingerprint)
+    }
+
+    /// Caller holds the lock. One recency order covers both stores, so a source
+    /// leaves with everything remembered about it.
+    private func evict() {
+        while order.count > capacity, let oldest = order.first {
+            order.removeFirst()
+            entries.removeValue(forKey: oldest)
+            stats.removeValue(forKey: oldest)
+        }
     }
 }

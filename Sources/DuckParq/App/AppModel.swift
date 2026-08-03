@@ -20,6 +20,8 @@ final class AppModel {
     let engine: DuckDBEngine
     let table: TableModel
     let metaSession: DuckDBSession
+    let countSession: DuckDBSession
+    let inspectorSession: DuckDBSession
     let sqlSession: DuckDBSession
     let exportSession: DuckDBSession
     let probe: Probe
@@ -80,11 +82,21 @@ final class AppModel {
         self.engine = engine
 
         let gridSession = try! DuckDBSession(engine: engine, label: "grid")
+        // A session is a serial queue, so "its own session" is the only way one
+        // concern avoids waiting on another. The inspector and the row counter
+        // each get one because both can run for seconds on a large dataset, and
+        // neither should be able to hold up a schema lookup or each other.
         self.metaSession = try! DuckDBSession(engine: engine, label: "meta")
+        self.countSession = try! DuckDBSession(engine: engine, label: "count")
+        self.inspectorSession = try! DuckDBSession(engine: engine, label: "inspector")
         self.sqlSession = try! DuckDBSession(engine: engine, label: "sql")
         self.exportSession = try! DuckDBSession(engine: engine, label: "export")
-        self.probe = Probe(session: metaSession)
-        self.table = TableModel(gridSession: gridSession, metaSession: metaSession)
+        self.probe = Probe(session: inspectorSession)
+        self.table = TableModel(
+            gridSession: gridSession,
+            metaSession: metaSession,
+            countSession: countSession
+        )
         self.formatsOnSave = UserDefaults.standard.bool(forKey: Defaults.formatOnSave)
 
         self.backgroundActivity = ProcessInfo.processInfo.beginActivity(

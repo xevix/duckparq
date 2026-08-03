@@ -27,8 +27,9 @@ public final class TableModel {
         }
     }
 
-    /// Rows per fetch. Large enough that scrolling rarely waits, small enough
-    /// that the first screenful appears promptly.
+    /// The opening window, and the size of a single fetch from a cursor. Large
+    /// enough that scrolling rarely waits, small enough that the first
+    /// screenful appears promptly.
     public static let pageSize = 500
     /// Start fetching once the viewport gets within this many rows of the end.
     public static let prefetchDistance = 150
@@ -61,8 +62,32 @@ public final class TableModel {
     /// The rows on screen came from `PreviewCache` rather than a fresh read.
     public private(set) var servedFromCache = false
 
+    /// How many rows the grid asks DuckDB for — a real `LIMIT` on the query.
+    ///
+    /// This is what makes sorting a file far too large to sort usable: with the
+    /// clause present, `ORDER BY … LIMIT 500` plans as a Top-N, so DuckDB keeps
+    /// 500 rows as it scans instead of ordering three billion of them and
+    /// discarding all but the first screenful. Without it, the first row cannot
+    /// appear until the entire sort has finished.
+    ///
+    /// The price is that widening the window re-runs the query rather than
+    /// reading further along an open stream. It therefore **doubles** rather
+    /// than stepping by a page, so reaching row N costs a logarithmic number of
+    /// re-runs and a total of about 2N rows transferred — instead of a re-run
+    /// per page. Browsing is what this app is for; reading a million rows in
+    /// order is what the export button is for.
+    public private(set) var windowSize = pageSize
+
     private let gridSession: DuckDBSession
+    /// Schema and cardinality lookups.
     private let probe: Probe
+    /// Row counting, deliberately on its own session.
+    ///
+    /// A `DuckDBSession` runs everything on one serial queue, so sharing a
+    /// session is sharing a queue: a `count(*)` over three billion rows would
+    /// hold up the `DESCRIBE` beside it, and "these run concurrently" would be
+    /// true of the Swift tasks and false of the work.
+    private let counter: Probe
     private let cache: PreviewCache
 
     private var cursor: QueryCursor?
@@ -72,20 +97,25 @@ public final class TableModel {
     private var countTask: Task<Void, Never>?
     private var schemaTask: Task<Void, Never>?
 
-    /// The query whose cursor has not been opened yet, because the first page
-    /// came from the cache. Opened if the user scrolls past it.
-    private var deferredQuery: BoundSQL?
     /// Where to file this result once it has both a page and a count.
     private var pendingCacheKey: SourceFingerprint?
     private var loadedSource: DataSource?
+    /// Raised by `continuePastCap()`, so the memory guard is the user's to lift.
+    private var rowCap = TableModel.loadedRowCap
+    /// What DuckDB's parser made of the statement in `.sql` mode. Only `EXPLAIN`
+    /// matters: it is the one read-only statement that cannot be selected from,
+    /// so it is the one that cannot be windowed.
+    private var sqlStatementKind: StatementKind = .select
 
     public init(
         gridSession: DuckDBSession,
         metaSession: DuckDBSession,
+        countSession: DuckDBSession,
         cache: PreviewCache = .shared
     ) {
         self.gridSession = gridSession
         self.probe = Probe(session: metaSession)
+        self.counter = Probe(session: countSession)
         self.cache = cache
     }
 
@@ -172,8 +202,10 @@ public final class TableModel {
 
         loadTask = Task { [weak self] in
             guard let self else { return }
+            let kinds: [StatementKind]
             do {
-                try await self.gridSession.validateReadOnly(trimmed)
+                kinds = try await self.gridSession.statementKinds(trimmed)
+                try SQLPolicy.validateReadOnly(kinds)
             } catch {
                 guard generation == self.generation else { return }
                 self.isLoading = false
@@ -181,6 +213,7 @@ public final class TableModel {
                 return
             }
             guard generation == self.generation else { return }
+            self.sqlStatementKind = kinds.first ?? .select
             self.mode = .sql(trimmed)
             self.filters = []
             self.sort = []
@@ -198,8 +231,9 @@ public final class TableModel {
         errorMessage = nil
         totalRowCount = nil
         loadedSource = nil
-        deferredQuery = nil
         pendingCacheKey = nil
+        windowSize = Self.pageSize
+        rowCap = Self.loadedRowCap
         isLoading = false
         isLoadingMore = false
         isCountingRows = false
@@ -277,6 +311,31 @@ public final class TableModel {
         }
     }
 
+    /// `currentQuery` bounded to the window the grid is showing.
+    ///
+    /// The window is applied here rather than folded into `currentQuery`
+    /// because it belongs to the viewport: export means every matching row, the
+    /// row count counts every matching row, and the SQL offered in the editor is
+    /// the query without a limit the user did not write.
+    private var windowedQuery: BoundSQL? {
+        guard let query = currentQuery else { return nil }
+        guard !isExplain else { return query }
+        return SQLBuilder.windowed(query, limit: windowSize)
+    }
+
+    /// An `EXPLAIN` in the editor.
+    ///
+    /// It is the one read-only statement DuckDB will not let you select from,
+    /// so neither the row window nor the bridge's `COLUMNS(*)::VARCHAR` wrap can
+    /// be applied — both are a `SELECT` over the statement, and both turn it
+    /// into a parse error. Its output is already text, and a handful of rows, so
+    /// it needs neither. Decided from the kind DuckDB's parser reported, not by
+    /// looking at the SQL.
+    private var isExplain: Bool { isSQLMode && sqlStatementKind == .explain }
+
+    /// Whether the result needs DuckDB to render its columns as text.
+    private var rendersAsText: Bool { !isExplain }
+
     /// The current view expressed as SQL a person can read and edit.
     ///
     /// This is what the editor is seeded with when it opens over a selected
@@ -311,10 +370,9 @@ public final class TableModel {
         isLoadingMore = false
         isCountingRows = false
         wasCancelled = true
-        // Paging deliberately stops here rather than resuming on the next
-        // scroll. Re-opening the stream would re-run the query the user just
-        // stopped, and skip its way back to where they were to do it.
-        deferredQuery = nil
+        // The window stays where it is, so scrolling does not immediately
+        // re-issue the query the user just stopped.
+        reachedEnd = true
         pendingCacheKey = nil
         rowsAreStale = false
     }
@@ -346,6 +404,19 @@ public final class TableModel {
     /// nothing is misrepresented in the meantime — the status bar says the query
     /// is running.
     public func reload(keepingRows: Bool = false) {
+        // A fresh look at a query starts from the opening window again, however
+        // far the last one had been widened.
+        windowSize = Self.pageSize
+        rowCap = Self.loadedRowCap
+        runQuery(keepingRows: keepingRows, widening: false)
+    }
+
+    /// Issue the current window.
+    ///
+    /// `widening` distinguishes "show me more of this" from "show me this": the
+    /// row count, the schema and the cache lookup all belong to the query, not
+    /// to the window, so they are not repeated when only the limit grew.
+    private func runQuery(keepingRows: Bool, widening: Bool) {
         generation += 1
         let generation = self.generation
         cancelInFlight()
@@ -353,28 +424,31 @@ public final class TableModel {
         if !keepingRows { rows = [] }
         rowsAreStale = keepingRows && !rows.isEmpty
         reachedEnd = false
-        hitRowCap = false
         errorMessage = nil
-        isLoading = true
-        isLoadingMore = false
+        isLoading = !widening
+        isLoadingMore = widening
         wasCancelled = false
-        servedFromCache = false
-        deferredQuery = nil
-        pendingCacheKey = nil
-        totalRowCount = nil
         queryStartedAt = Date()
         lastQueryDuration = nil
 
-        guard let query = currentQuery else {
+        if !widening {
+            hitRowCap = false
+            servedFromCache = false
+            pendingCacheKey = nil
+            totalRowCount = nil
+        }
+
+        guard let query = windowedQuery else {
             isLoading = false
+            isLoadingMore = false
             isCountingRows = false
             stopTiming()
             return
         }
 
-        isCountingRows = true
+        if !widening { isCountingRows = true }
         loadTask = Task { [weak self] in
-            await self?.performInitialLoad(query: query, generation: generation)
+            await self?.performInitialLoad(query: query, generation: generation, widening: widening)
         }
     }
 
@@ -382,28 +456,33 @@ public final class TableModel {
     /// appended to, when the next page arrives.
     private var rowsAreStale = false
 
-    private func performInitialLoad(query: BoundSQL, generation: Int) async {
-        // A cache hit has to be settled before anything is issued, or the work
-        // it is meant to avoid is already underway.
-        if let key = await fingerprintForCaching() {
-            guard generation == self.generation else { return }
-            if let cached = cache.preview(for: key) {
-                apply(cached, query: query, generation: generation)
-                return
+    private func performInitialLoad(query: BoundSQL, generation: Int, widening: Bool) async {
+        if !widening {
+            // A cache hit has to be settled before anything is issued, or the
+            // work it is meant to avoid is already underway.
+            if let key = await fingerprintForCaching() {
+                guard generation == self.generation else { return }
+                if let cached = cache.preview(for: key) {
+                    apply(cached, generation: generation)
+                    return
+                }
+                pendingCacheKey = key
             }
-            pendingCacheKey = key
+            guard generation == self.generation else { return }
+
+            // Schema, preview and total row count are three independent
+            // questions. They used to be asked in a chain, so a DESCRIBE across
+            // a thousand-file dataset held up rows that DuckDB could already
+            // have produced. Each now renders the moment it can.
+            startSchemaLoad(generation: generation)
+            startRowCount(generation: generation)
         }
-        guard generation == self.generation else { return }
 
-        // Schema, preview and total row count are three independent questions.
-        // They used to be asked in a chain, so a DESCRIBE across a thousand-file
-        // dataset held up rows that DuckDB could already have streamed. Each now
-        // renders the moment it can.
-        startSchemaLoad(generation: generation)
-        startRowCount(generation: generation)
-
+        let target = windowSize
         do {
-            let cursor = try await gridSession.openCursor(query.sql, params: query.params)
+            let cursor = try await gridSession.openCursor(
+                query.sql, params: query.params, renderAsText: rendersAsText
+            )
             guard generation == self.generation else {
                 await cursor.close()
                 return
@@ -417,17 +496,47 @@ public final class TableModel {
                 columns = cursor.columnNames.map { ColumnInfo(name: $0, typeName: "VARCHAR") }
             }
 
-            let page = try await cursor.fetch(maxRows: Self.pageSize)
+            // Collected in full and committed in one step. The window is a
+            // single coherent result, so the grid never shows part of the new
+            // one stitched onto part of the old — which is also what keeps a
+            // widened window free of the duplicates that `LIMIT`/`OFFSET`
+            // paging produces when a sort has ties.
+            var collected: [[String?]] = []
+            collected.reserveCapacity(target)
+            while collected.count < target {
+                let page = try await cursor.fetch(maxRows: min(Self.pageSize, target - collected.count))
+                guard generation == self.generation else { return }
+                guard let page, page.rowCount > 0 else { break }
+                let width = max(page.columnCount, 1)
+                for row in 0..<page.rowCount {
+                    let start = row * width
+                    collected.append(Array(page.cells[start..<min(start + width, page.cells.count)]))
+                }
+            }
             guard generation == self.generation else { return }
-            append(page, cursor: cursor)
+            commit(collected, requested: target)
+            await cursor.close()
+            self.cursor = nil
         } catch {
             guard generation == self.generation else { return }
             report(error)
         }
         guard generation == self.generation else { return }
         isLoading = false
+        isLoadingMore = false
         stopTiming()
         storePreviewIfReady()
+    }
+
+    /// Replace the grid's rows with the window that was just read.
+    private func commit(_ cells: [[String?]], requested: Int) {
+        rows = cells.enumerated().map { GridRow(id: $0.offset, cells: $0.element) }
+        rowsAreStale = false
+        // Fewer rows than asked for means the result really is exhausted; the
+        // limit is what stopped it otherwise.
+        reachedEnd = cells.count < requested
+        if let totalRowCount, rows.count >= totalRowCount { reachedEnd = true }
+        if !reachedEnd, windowSize >= rowCap { hitRowCap = true }
     }
 
     /// DESCRIBE for the current source, if its schema isn't already known.
@@ -453,122 +562,36 @@ public final class TableModel {
 
     /// Called by the grid as it approaches the end of the loaded rows.
     public func loadMoreIfNeeded(displayedIndex: Int) {
+        // Deliberately not `isBusy`: a `count(*)` over a huge dataset can run
+        // for a while, and scrolling should not wait on it.
         guard !isLoading, !isLoadingMore, !reachedEnd, !hitRowCap else { return }
-        guard cursor != nil || deferredQuery != nil else { return }
         guard displayedIndex >= rows.count - Self.prefetchDistance else { return }
         loadMore()
     }
 
+    /// Widen the window and re-run.
+    ///
+    /// Doubling, not stepping: each widening is a fresh query, so a fixed step
+    /// would mean a re-run per 500 rows. Doubling bounds the number of re-runs
+    /// to reach any depth and keeps the rows transferred to roughly twice the
+    /// window you end up with.
     public func loadMore() {
-        guard !isLoadingMore, !reachedEnd else { return }
-        if rows.count >= Self.loadedRowCap {
+        guard !isLoading, !isLoadingMore, !reachedEnd else { return }
+        let widened = min(windowSize * 2, rowCap)
+        guard widened > windowSize else {
             hitRowCap = true
             return
         }
-        guard let cursor else {
-            openDeferredCursor()
-            return
-        }
-        isLoadingMore = true
-        let generation = self.generation
-
-        loadTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                let page = try await cursor.fetch(maxRows: Self.pageSize)
-                guard generation == self.generation else { return }
-                self.append(page, cursor: cursor)
-            } catch {
-                guard generation == self.generation else { return }
-                self.report(error)
-            }
-            if generation == self.generation { self.isLoadingMore = false }
-        }
-    }
-
-    /// Open the stream that a cache hit let us skip.
-    ///
-    /// The rows on screen came from memory, so no cursor exists yet. A stream
-    /// always starts at the first row, so the cached page has to be read past
-    /// before appending — one page of work, paid only if the user scrolls.
-    private func openDeferredCursor() {
-        guard let query = deferredQuery else { return }
-        deferredQuery = nil
-        isLoadingMore = true
-        let generation = self.generation
-        let alreadyShown = rows.count
-
-        loadTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                let cursor = try await self.gridSession.openCursor(query.sql, params: query.params)
-                guard generation == self.generation else {
-                    await cursor.close()
-                    return
-                }
-                self.cursor = cursor
-
-                var skipped = 0
-                var exhausted = false
-                while skipped < alreadyShown {
-                    let page = try await cursor.fetch(maxRows: min(Self.pageSize, alreadyShown - skipped))
-                    guard generation == self.generation else { return }
-                    guard let page, page.rowCount > 0 else {
-                        exhausted = true
-                        break
-                    }
-                    skipped += page.rowCount
-                }
-
-                if exhausted {
-                    self.reachedEnd = true
-                } else {
-                    let page = try await cursor.fetch(maxRows: Self.pageSize)
-                    guard generation == self.generation else { return }
-                    self.append(page, cursor: cursor)
-                }
-            } catch {
-                guard generation == self.generation else { return }
-                self.report(error)
-            }
-            if generation == self.generation { self.isLoadingMore = false }
-        }
+        windowSize = widened
+        runQuery(keepingRows: true, widening: true)
     }
 
     /// Continue past the loaded-row cap at the user's request.
     public func continuePastCap() {
         guard hitRowCap else { return }
+        rowCap *= 2
         hitRowCap = false
         loadMore()
-    }
-
-    private func append(_ page: RowPage?, cursor: QueryCursor) {
-        if rowsAreStale {
-            // The first page of the new query displaces the previous result in
-            // one step, so the grid never shows a mixture of the two.
-            rows = []
-            rowsAreStale = false
-        }
-        guard let page, page.rowCount > 0 else {
-            reachedEnd = true
-            return
-        }
-        let width = max(page.columnCount, 1)
-        var appended: [GridRow] = []
-        appended.reserveCapacity(page.rowCount)
-        for row in 0..<page.rowCount {
-            let start = row * width
-            let cells = Array(page.cells[start..<min(start + width, page.cells.count)])
-            appended.append(GridRow(id: rows.count + row, cells: cells))
-        }
-        rows.append(contentsOf: appended)
-        if page.rowCount < Self.pageSize { reachedEnd = true }
-        // A stream only reveals it is finished when a fetch comes back empty,
-        // which would leave the last full page looking like there is more to
-        // come. When the total is known (and matches these filters), the end is
-        // already provable — so say so now rather than after another round trip.
-        if let totalRowCount, rows.count >= totalRowCount { reachedEnd = true }
-        if rows.count >= Self.loadedRowCap { hitRowCap = true }
     }
 
     private func report(_ error: Error) {
@@ -619,7 +642,7 @@ public final class TableModel {
             // A count can legitimately fail (a non-SELECT statement in the SQL
             // editor, say). That is not worth an error banner — the status bar
             // simply falls back to reporting what is loaded.
-            let count = try? await self.probe.count(countQuery)
+            let count = try? await self.counter.count(countQuery)
             guard generation == self.generation else { return }
             self.totalRowCount = count
             self.isCountingRows = false
@@ -638,13 +661,15 @@ public final class TableModel {
     /// is actively composing, where serving a remembered one would be
     /// indistinguishable from a fresh one and wrong in a way they could not see.
     private func fingerprintForCaching() async -> SourceFingerprint? {
-        guard case .source(let source) = mode, filters.isEmpty, sort.isEmpty else { return nil }
+        guard case .source(let source) = mode, filters.isEmpty, sort.isEmpty,
+              windowSize == Self.pageSize
+        else { return nil }
         return await Task.detached(priority: .userInitiated) {
             SourceFingerprint.compute(for: source)
         }.value
     }
 
-    private func apply(_ cached: CachedPreview, query: BoundSQL, generation: Int) {
+    private func apply(_ cached: CachedPreview, generation: Int) {
         columns = cached.columns
         if case .source(let source) = mode { loadedSource = source }
         rows = cached.rows.enumerated().map { GridRow(id: $0.offset, cells: $0.element) }
@@ -654,9 +679,8 @@ public final class TableModel {
         reachedEnd = cached.reachedEnd
         isLoading = false
         servedFromCache = true
-        // Nothing has been queried, so there is no stream. One is opened only if
-        // the user scrolls past what was remembered.
-        deferredQuery = cached.reachedEnd ? nil : query
+        // Nothing was queried. Scrolling past the remembered window widens it
+        // and reads for real, the same as any other widening.
         stopTiming()
     }
 
@@ -665,20 +689,18 @@ public final class TableModel {
         guard let key = pendingCacheKey,
               !isLoading, !isCountingRows,
               case .source = mode, filters.isEmpty, sort.isEmpty,
+              windowSize == Self.pageSize,
               errorMessage == nil,
               !columns.isEmpty, !rows.isEmpty
         else { return }
 
         pendingCacheKey = nil
-        let firstPage = rows.prefix(Self.pageSize).map(\.cells)
         cache.store(
             CachedPreview(
                 columns: columns,
-                rows: Array(firstPage),
+                rows: rows.map(\.cells),
                 totalRowCount: totalRowCount,
-                // `reachedEnd` describes everything loaded so far; it only says
-                // something about the first page when that is all there is.
-                reachedEnd: reachedEnd && rows.count <= Self.pageSize
+                reachedEnd: reachedEnd
             ),
             for: key
         )

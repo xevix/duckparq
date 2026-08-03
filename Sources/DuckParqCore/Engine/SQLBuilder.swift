@@ -200,6 +200,26 @@ public enum SQLBuilder {
         return out
     }
 
+    /// Bound a query to the rows the grid is going to show.
+    ///
+    /// This is the viewer's window, not part of the query: `currentQuery` stays
+    /// unbounded so exporting still means every matching row, and the SQL shown
+    /// in the editor is the query without it.
+    ///
+    /// It is what makes sorting a file too large to sort affordable. DuckDB
+    /// plans `SELECT * FROM (… ORDER BY x) LIMIT 500` as a **Top-N** — it keeps
+    /// 500 rows as it scans rather than materialising and ordering the whole
+    /// result before producing a first row. Verified against the vendored
+    /// engine's own plan, and asserted in the suite, because the entire value of
+    /// the clause is that DuckDB pushes it through the wrapper.
+    ///
+    /// Wrapped rather than appended so it applies to a query the user typed as
+    /// well as one built here, and so it composes with a query that already ends
+    /// in its own `LIMIT` (the tighter of the two wins, which is correct).
+    public static func windowed(_ query: BoundSQL, limit: Int) -> BoundSQL {
+        BoundSQL(sql: "SELECT * FROM (\(query.sql)) LIMIT \(max(limit, 1))", params: query.params)
+    }
+
     /// Wrap an arbitrary query the user typed, applying grid sort on top.
     /// Used by the SQL editor so its results stay sortable by header click.
     public static func sorted(rawSQL: String, sort: [SortKey]) -> String {
@@ -295,6 +315,13 @@ public enum SQLBuilder {
     /// Sample a column's distinct values to decide between a dropdown and a
     /// comparison widget.
     ///
+    /// `SELECT DISTINCT` with an outer `LIMIT`, not a `GROUP BY` with counts:
+    /// the caller only needs the values and how many there are, and a distinct
+    /// bounded to 51 can stop the moment it has seen 51 of them. Counting
+    /// occurrences meant aggregating the whole sample before anything could be
+    /// returned, and then the frequency ordering it produced was discarded by
+    /// the caller, which sorts the values alphabetically anyway.
+    ///
     /// The inner LIMIT is what keeps this fast enough to run on popover open —
     /// it reads the head of the file rather than scanning it. That makes the
     /// result a head-biased sample, which the UI states plainly rather than
@@ -307,9 +334,9 @@ public enum SQLBuilder {
     ) -> BoundSQL {
         let reference = quote(column.name)
         let sql = """
-            SELECT CAST(\(reference) AS VARCHAR) AS value, count(*) AS occurrences \
+            SELECT DISTINCT CAST(\(reference) AS VARCHAR) AS value \
             FROM (SELECT \(reference) FROM \(source.readExpression(parameterIndex: 1)) LIMIT \(sampleRows)) \
-            GROUP BY 1 ORDER BY occurrences DESC, value LIMIT \(maxDistinct + 1)
+            LIMIT \(maxDistinct + 1)
             """
         return BoundSQL(sql: sql, params: [source.readPath])
     }

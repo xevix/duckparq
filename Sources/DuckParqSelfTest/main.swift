@@ -990,6 +990,128 @@ do {
     }
 }
 
+// MARK: - Row window
+
+section("Row window")
+
+do {
+    let sorted = SQLBuilder.rows(
+        source: .file(smallParquet),
+        sort: [SortKey(column: "id", direction: .ascending)]
+    )
+
+    // The window is applied on top of the query, never folded into it: export
+    // means every matching row, and the SQL offered in the editor must not
+    // carry a limit the user did not write.
+    expect(!sorted.sql.uppercased().contains("LIMIT"), "the query itself is unbounded")
+    let windowed = SQLBuilder.windowed(sorted, limit: TableModel.pageSize)
+    expect(windowed.sql.hasSuffix("LIMIT 500"), "the window is a real LIMIT clause")
+    expectEqual(windowed.params, sorted.params, "windowing binds no new parameters")
+
+    // The entire point of the clause: DuckDB must plan a sorted, limited query
+    // as a Top-N, keeping 500 rows as it scans. Without that it materialises and
+    // orders the whole result before producing a first row, which is the
+    // difference between browsing a three-billion-row dataset and waiting for it
+    // to be sorted. Asserted against the engine's own plan, since it is a
+    // property of DuckDB's optimiser and not of anything written here.
+    // Read verbatim: an EXPLAIN cannot go through the bridge's VARCHAR wrap
+    // either, for exactly the reason it cannot be windowed.
+    let planCursor = try await session.openCursor(
+        "EXPLAIN " + windowed.sql, params: windowed.params, renderAsText: false)
+    var planText = ""
+    while let page = try await planCursor.fetch(maxRows: 256) {
+        planText += page.cells.compactMap { $0 }.joined(separator: "\n")
+    }
+    await planCursor.close()
+    expect(planText.contains("TOP_N"), "a sorted window plans as Top-N")
+    expect(!planText.contains("ORDER_BY"), "no separate full ordering survives in the plan")
+
+    // And the limit really does pass through the wrapper.
+    let bounded = try await session.queryAll(windowed.sql, params: windowed.params)
+    expectEqual(bounded.rowCount, TableModel.pageSize, "the window bounds what comes back")
+
+    // Every read-only statement the policy admits has to survive being wrapped,
+    // because that is what the grid does to whatever is in the editor. EXPLAIN
+    // is the one that cannot be selected from, which is why TableModel checks
+    // the parsed kind rather than the text.
+    for statement in [
+        "SELECT 1 AS a",
+        "DESCRIBE SELECT 1 AS a",
+        "SUMMARIZE SELECT 1 AS a",
+        "SHOW TABLES",
+        "VALUES (1), (2)",
+        "WITH x AS (SELECT 1 AS a) SELECT * FROM x",
+        "FROM range(3)",
+    ] {
+        let wrapped = SQLBuilder.windowed(BoundSQL(sql: statement, params: []), limit: 5)
+        do {
+            _ = try await session.queryAll(wrapped.sql, limit: 5)
+        } catch {
+            expect(false, "a windowed \(statement) still runs, got \(error)")
+        }
+    }
+    expect(true, "every wrappable read-only form survives the window")
+
+    do {
+        let wrapped = SQLBuilder.windowed(BoundSQL(sql: "EXPLAIN SELECT 1", params: []), limit: 5)
+        let cursor = try await session.openCursor(wrapped.sql, renderAsText: false)
+        await cursor.close()
+        expect(false, "wrapping an EXPLAIN is expected to fail, so the model must not do it")
+    } catch {
+        expect(true, "EXPLAIN cannot be windowed, which is why it is exempted by parsed kind")
+    }
+
+    // Run verbatim, it works — which is the whole reason the exemption exists
+    // rather than EXPLAIN simply being refused.
+    do {
+        let cursor = try await session.openCursor("EXPLAIN SELECT 1", renderAsText: false)
+        let page = try await cursor.fetch(maxRows: 64)
+        await cursor.close()
+        expect((page?.rowCount ?? 0) > 0, "an unwrapped EXPLAIN returns its plan")
+    } catch {
+        expect(false, "an unwrapped EXPLAIN runs, got \(error)")
+    }
+}
+
+// MARK: - Distinct value probe
+
+section("Distinct values")
+
+do {
+    let categoryColumn = ColumnInfo(name: "category", typeName: "VARCHAR")
+    let query = SQLBuilder.distinctValues(source: .file(smallParquet), column: categoryColumn)
+    expect(query.sql.contains("SELECT DISTINCT"),
+           "the probe asks for distinct values rather than counting occurrences")
+    expect(!query.sql.uppercased().contains("GROUP BY"),
+           "no aggregate is computed for a result that only needs the values")
+    expectEqual(query.params, [smallParquet.path], "the path is still bound, not interpolated")
+
+    let batch = try await session.queryAll(query.sql, params: query.params, limit: 64)
+    expectEqual(batch.rowCount, 4, "the low-cardinality column reports its four values")
+    expectEqual(batch.column("value").compactMap { $0 }.sorted(),
+                ["alpha", "beta", "delta", "gamma"],
+                "and they are the actual values, not counts")
+
+    // Above the cap the probe must return one more than the maximum, which is
+    // how the caller tells "too many to enumerate" from "exactly the maximum".
+    let idColumn = ColumnInfo(name: "id", typeName: "BIGINT")
+    let wide = SQLBuilder.distinctValues(source: .file(smallParquet), column: idColumn, maxDistinct: 50)
+    let wideBatch = try await session.queryAll(wide.sql, params: wide.params, limit: 128)
+    expectEqual(wideBatch.rowCount, 51, "a high-cardinality column stops one past the cap")
+
+    // The affordance those queries feed, end to end.
+    let probe = Probe(session: session)
+    if case .dropdown(let values, _, _) =
+        try await probe.filterAffordance(for: categoryColumn, in: .file(smallParquet)) {
+        expectEqual(values, ["alpha", "beta", "delta", "gamma"],
+                    "a low-cardinality column offers a list, sorted for reading")
+    } else {
+        expect(false, "a four-value column gets a dropdown")
+    }
+    expectEqual(try await probe.filterAffordance(for: idColumn, in: .file(smallParquet)), .comparison,
+                "a column with a thousand values gets comparison operators instead")
+}
+
 // MARK: - Preview cache
 
 section("Preview cache")
@@ -1031,6 +1153,33 @@ do {
     cache.store(preview, for: secondPrint!)
     cache.store(preview, for: datasetPrint!)
     expectEqual(cache.count, 2, "the cache stays at its capacity")
+
+    // The inspector's answers are remembered against the same fingerprint. Its
+    // per-column statistics come from parquet_metadata, which reads every
+    // footer in the dataset — the most expensive question the app asks, and the
+    // one most worth not asking twice.
+    let statsCache = PreviewCache(capacity: 2)
+    let summary = try await Probe(session: session).fileMetadata(of: .file(smallParquet))
+    statsCache.storeStats(
+        CachedStats(fileSummary: summary, columnStatistics: nil, keyValues: nil),
+        for: firstPrint!)
+    expect(statsCache.stats(for: firstPrint!) != nil, "stored stats come back")
+    expectEqual(statsCache.stats(for: firstPrint!)?.fileSummary?.value(row: 0, named: "files"), "1",
+                "and they are the same answer, not a placeholder")
+    expect(statsCache.stats(for: secondPrint!) == nil, "a changed file is a miss for stats too")
+    statsCache.clear()
+    expect(statsCache.stats(for: firstPrint!) == nil, "clearing drops stats as well as previews")
+
+    // One recency order governs both stores, so a source cannot linger in one
+    // after being evicted from the other.
+    let shared = PreviewCache(capacity: 1)
+    shared.store(preview, for: firstPrint!)
+    shared.storeStats(CachedStats(fileSummary: summary, columnStatistics: nil, keyValues: nil),
+                      for: firstPrint!)
+    shared.store(preview, for: secondPrint!)
+    expect(shared.preview(for: firstPrint!) == nil, "the evicted source loses its preview")
+    expect(shared.stats(for: firstPrint!) == nil, "and its stats go with it")
+
     cache.clear()
     expectEqual(cache.count, 0, "clearing empties it")
 }
@@ -1134,6 +1283,7 @@ do {
     let model = TableModel(
         gridSession: try DuckDBSession(engine: engine, label: "model-grid"),
         metaSession: try DuckDBSession(engine: engine, label: "model-meta"),
+        countSession: try DuckDBSession(engine: engine, label: "model-count"),
         cache: modelCache
     )
 
@@ -1149,14 +1299,18 @@ do {
     expectEqual(model.totalRowCount, 1000, "the total row count is reported alongside the preview")
     expect(!model.reachedEnd, "500 of 1000 rows is not the end")
 
-    // Scroll-driven paging.
+    expectEqual(model.windowSize, TableModel.pageSize, "the query is bounded to the opening window")
+
+    // Scrolling widens the window and re-runs, rather than reading further
+    // along an open stream.
     model.loadMoreIfNeeded(displayedIndex: model.rows.count - 1)
     await settle(model)
-    expectEqual(model.rows.count, 1000, "scrolling to the end loads the next page")
-    expect(model.reachedEnd, "a short final page marks the end of the stream")
+    expectEqual(model.windowSize, TableModel.pageSize * 2, "scrolling doubles the window")
+    expectEqual(model.rows.count, 1000, "scrolling to the end loads the rest of the file")
+    expect(model.reachedEnd, "fewer rows than the window asked for means the result is exhausted")
 
-    // Row ids must stay contiguous across pages, since the grid keys on them.
-    expectEqual(model.rows.map(\.id), Array(0..<1000), "row ids stay contiguous across pages")
+    // Row ids must stay contiguous, since the grid keys on them.
+    expectEqual(model.rows.map(\.id), Array(0..<1000), "row ids stay contiguous across a widening")
 
     // Three-state sort cycling, each step a fresh DuckDB query.
     let idIndex = model.columns.firstIndex { $0.name == "id" }!
@@ -1256,6 +1410,14 @@ do {
         "the refused COPY wrote nothing to disk"
     )
 
+    // EXPLAIN, end to end. It is the one read-only statement that can be
+    // neither windowed nor rendered as text, since both are a SELECT over it —
+    // so this checks the exemption reaches all the way through to the grid.
+    model.runSQL("EXPLAIN SELECT 1 AS a")
+    await settle(model)
+    expectEqual(model.errorMessage, String?.none, "EXPLAIN runs in the editor rather than failing to parse")
+    expect(model.rows.count > 0, "EXPLAIN returns its plan")
+
     // Recovering afterwards must work — the error is not sticky.
     model.open(.file(smallParquet))
     await settle(model)
@@ -1290,9 +1452,9 @@ do {
     await settle(model)
     expect(!model.wasCancelled, "the next load clears the cancelled state")
 
-    // Second open of an unchanged file comes from memory. Paging past the
-    // remembered page still has to work, which means opening the stream at that
-    // point and reading past what was already shown.
+    // Second open of an unchanged file comes from memory. Scrolling past the
+    // remembered window still has to work, which means reading for real at that
+    // point.
     model.clear()
     model.open(.file(smallParquet))
     await settle(model)
@@ -1303,12 +1465,12 @@ do {
 
     model.loadMore()
     await settle(model)
-    expectEqual(model.rows.count, 1000, "scrolling past the cached page opens the stream and continues")
+    expectEqual(model.rows.count, 1000, "scrolling past the cached window reads the rest for real")
     expectEqual(model.rows.map(\.id), Array(0..<1000), "ids stay contiguous across the cache boundary")
-    // The real risk here is re-serving the first page instead of continuing
-    // past it, which contiguous ids alone would not catch.
+    // The rows past the cached ones must be the file's actual next rows, which
+    // contiguous ids alone would not catch.
     expectEqual(model.rows[500].cells[idIndex], "500",
-                "the stream resumes after the cached rows rather than repeating them")
+                "the widened window continues past the cached rows rather than repeating them")
 
     modelCache.clear()
     model.clear()
@@ -1329,7 +1491,8 @@ if FileManager.default.fileExists(atPath: bigParquet.path) {
 
     let model = TableModel(
         gridSession: try DuckDBSession(engine: engine, label: "big-grid"),
-        metaSession: try DuckDBSession(engine: engine, label: "big-meta")
+        metaSession: try DuckDBSession(engine: engine, label: "big-meta"),
+        countSession: try DuckDBSession(engine: engine, label: "big-count")
     )
 
     // Opening a big file must show rows quickly, not read 10M of them.
@@ -1346,22 +1509,31 @@ if FileManager.default.fileExists(atPath: bigParquet.path) {
     expect(openElapsed < 5, "opening a 10M-row file is fast (took \(String(format: "%.2f", openElapsed))s)")
     print("  open: \(String(format: "%.2f", openElapsed))s")
 
-    // Paging continues the same stream, so later pages stay cheap.
+    expectEqual(model.windowSize, TableModel.pageSize, "the opening window is one page")
+
+    // Widening doubles, so reaching depth costs a bounded number of re-runs
+    // rather than one per 500 rows.
     let pageAt = Date()
     for _ in 0..<4 {
         model.loadMore()
         await settle(model)
     }
     let pageElapsed = Date().timeIntervalSince(pageAt)
-    expectEqual(model.rows.count, TableModel.pageSize * 5, "four more pages append to the stream")
-    expect(pageElapsed < 5, "paging stays cheap (4 pages in \(String(format: "%.2f", pageElapsed))s)")
-    print("  4 more pages: \(String(format: "%.2f", pageElapsed))s")
+    expectEqual(model.windowSize, TableModel.pageSize * 16, "four widenings double the window each time")
+    expectEqual(model.rows.count, TableModel.pageSize * 16, "and the grid holds the whole widened window")
+    expect(pageElapsed < 10, "widening stays cheap (4 steps in \(String(format: "%.2f", pageElapsed))s)")
+    print("  4 widenings to \(model.windowSize) rows: \(String(format: "%.2f", pageElapsed))s")
 
     // Sorting 10M rows is a real sort; it must be pushed down and correct.
+    // With the window in place it is a Top-N, so the elapsed time here is the
+    // number the LIMIT exists to hold down.
+    model.reload()
+    await settle(model)
     let sortAt = Date()
     model.toggleSort(column: "measure")
     await settle(model)
     let sortElapsed = Date().timeIntervalSince(sortAt)
+    expectEqual(model.windowSize, TableModel.pageSize, "sorting starts from the opening window again")
     let measureIndex = model.columns.firstIndex { $0.name == "measure" }!
     let head = model.rows.prefix(20).map { Double($0.cells[measureIndex] ?? "") ?? -1 }
     expect(head == head.sorted(), "a 10M-row sort returns rows in order")

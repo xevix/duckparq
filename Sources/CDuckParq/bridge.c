@@ -237,6 +237,12 @@ int32_t dpq_statement_kinds(dpq_conn conn, const char *sql, int32_t *out_kinds,
 dpq_cursor dpq_cursor_open(dpq_conn conn, const char *sql,
                            const char *const *params, int32_t nparams,
                            char **err) {
+  return dpq_cursor_open_ex(conn, sql, params, nparams, 1, err);
+}
+
+dpq_cursor dpq_cursor_open_ex(dpq_conn conn, const char *sql,
+                              const char *const *params, int32_t nparams,
+                              int32_t render_as_text, char **err) {
   if (!conn) {
     set_err(err, "no connection");
     return NULL;
@@ -247,17 +253,25 @@ dpq_cursor dpq_cursor_open(dpq_conn conn, const char *sql,
     set_err(err, "out of memory");
     return NULL;
   }
-  /* See duckparq.h: one uniform VARCHAR path, order-preserving. */
-  static const char *prefix = "SELECT COLUMNS(*)::VARCHAR FROM (";
-  static const char *suffix = ")";
-  size_t len = strlen(prefix) + strlen(inner) + strlen(suffix) + 1;
-  char *wrapped = (char *)malloc(len);
-  if (!wrapped) {
-    free(inner);
-    set_err(err, "out of memory");
-    return NULL;
+  char *wrapped;
+  if (render_as_text) {
+    /* See duckparq.h: one uniform VARCHAR path, order-preserving. */
+    static const char *prefix = "SELECT COLUMNS(*)::VARCHAR FROM (";
+    static const char *suffix = ")";
+    size_t len = strlen(prefix) + strlen(inner) + strlen(suffix) + 1;
+    wrapped = (char *)malloc(len);
+    if (!wrapped) {
+      free(inner);
+      set_err(err, "out of memory");
+      return NULL;
+    }
+    snprintf(wrapped, len, "%s%s%s", prefix, inner, suffix);
+  } else {
+    /* Statements that cannot be selected from run as written. See the header.
+       `wrapped` takes ownership; free(NULL) below is a no-op. */
+    wrapped = inner;
+    inner = NULL;
   }
-  snprintf(wrapped, len, "%s%s%s", prefix, inner, suffix);
   free(inner);
 
   struct dpq_cursor_s *cur = (struct dpq_cursor_s *)calloc(1, sizeof(*cur));

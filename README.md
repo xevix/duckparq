@@ -47,13 +47,33 @@ requirement, not an optimization: the grid holds a *window* into a result, so
 sorting the loaded rows would reorder a fragment and present it as the file's
 order.
 
-**Rows stream.** One cursor stays open per (file, filters, sort); scrolling
-pulls the next page from the same stream. Paging never re-runs the query, so a
-sort is paid for once rather than once per page as `LIMIT/OFFSET` would.
-Changing sort or filters interrupts the running query and opens a new cursor —
-but the rows already on screen stay put until the replacements arrive. Re-sorting
-shows the same rows in a different order, so blanking the grid while the sort
-runs would state something untrue about the data.
+**Every query carries a `LIMIT`.** The grid asks for a window — 500 rows to
+begin with — and that clause is the difference between browsing a large file and
+waiting for one. DuckDB plans `ORDER BY … LIMIT 500` as a **Top-N**: it keeps 500
+rows as it scans, instead of ordering three billion of them and discarding all
+but the first screenful. Without the limit, the first row cannot appear until the
+entire sort has finished. The suite asserts the plan, not just the behaviour,
+because the whole benefit rests on DuckDB pushing the limit through the wrapper.
+
+The window belongs to the viewport, not to the query: `currentQuery` stays
+unbounded, so export still means every matching row, the row count still counts
+every matching row, and the SQL offered in the editor carries no limit you did
+not write.
+
+**Scrolling widens the window and re-runs**, doubling it each time. Two
+alternatives were considered and rejected. Keeping one long-lived cursor and
+reading further along it is what this used to do; it makes paging free but costs
+a *full sort before the first row*, which is the problem. `LIMIT`/`OFFSET` per
+page transfers less, but each page is a separate execution, and DuckDB's sort is
+not stable — with ties, a row can land on two pages or on none. Doubling avoids
+both: every rendered view is one coherent result set, and reaching row N takes a
+logarithmic number of re-runs rather than one per page. It is the wrong trade for
+reading a million rows in order, which is what the export button is for.
+
+Changing sort or filters interrupts the running query — but the rows already on
+screen stay put until the replacements arrive. Re-sorting shows the same rows in
+a different order, so blanking the grid while the sort runs would state something
+untrue about the data.
 
 **Preview, schema and row count are three separate questions**, asked at once.
 The first page does not wait behind a `DESCRIBE` of a thousand-file dataset, and
@@ -75,7 +95,12 @@ output that re-enters through the parser like anything else you might type.
 **SQL from the editor is read-only.** Every statement is classified by DuckDB's
 own parser before it runs; only a single `SELECT` or `EXPLAIN` is accepted.
 `DESCRIBE`, `SUMMARIZE`, `SHOW`, `WITH`, `VALUES` and bare `FROM t` all parse as
-SELECT, so the restriction costs a viewer nothing, while `COPY … TO`, `ATTACH`,
+SELECT, so the restriction costs a viewer nothing. `EXPLAIN` is admitted too, and
+is the one statement that has to be run verbatim: both the row window and the
+`COLUMNS(*)::VARCHAR` wrap are a `SELECT` over the statement, and you cannot
+select from an `EXPLAIN`. Its output is already text, so it needs neither — and
+the exemption keys off the kind DuckDB's parser reported, never off the text.
+Meanwhile `COPY … TO`, `ATTACH`,
 `INSTALL`, `CREATE`, `DROP` and the rest are refused. Because the check is a
 parse and not a pattern match, `SELECT 1; DROP VIEW t` is seen as two
 statements, one of which is a write — which is what makes opening a `.sql` file
@@ -89,13 +114,27 @@ That misses a rewrite which preserved both size and timestamp, so **Clear Cache*
 exists, and the cache is never consulted for a filtered, sorted or SQL result:
 those are answers you are actively composing, where a remembered one would be
 indistinguishable from a fresh one and wrong in a way you could not see. A cache
-hit leaves the stream unopened; scrolling past the remembered page opens it then.
+hit costs no query at all; scrolling past the remembered window reads for real.
+The inspector's answers are cached against the same fingerprint, which matters
+most for the per-column row-group statistics — `parquet_metadata` is O(row groups
+× columns) and opens every footer in the dataset, the most expensive question the
+app asks. Above a few thousand row groups it is not asked unattended at all: the
+cheap file summary reports how many there are, and the panel offers to read them.
 
 ### Sessions
 
-Four independent DuckDB sessions — grid, metadata, SQL editor, export — so a
-slow sort can't delay a schema lookup and cancelling one never disturbs another.
-Each cursor gets its own connection, because DuckDB permits only one active
+Six independent DuckDB sessions — grid, schema, row count, inspector, SQL
+editor, export.
+
+**A session is a serial queue**, so "its own session" is the only thing that
+actually makes two concerns concurrent; running them as two Swift tasks against
+one session just queues them. That was a real bug: the schema lookup, the
+`count(*)` and the inspector's metadata all shared one session, so opening the
+inspector on a large dataset waited behind a count of every row in it. They are
+split accordingly, and the split follows the cost — counting and inspecting are
+the two that can run for seconds.
+
+Each cursor also gets its own connection, because DuckDB permits only one active
 streaming result per connection.
 
 ## Using it
@@ -169,11 +208,16 @@ formatting and comparing the rows.
 Applying a filter also updates the editor, as long as it is still showing the
 view's query — anything typed is left alone.
 
-Filter popovers pick their controls by sampling a column's distinct values *when
+Filter popovers pick their controls with `SELECT DISTINCT … LIMIT 51`, run *when
 the popover opens* — probing every column on file select would mean a scan per
-column, which is what this app exists to avoid. Low cardinality gets a
-multi-select list; anything else gets comparison operators. The sample reads the
-first 200,000 rows, and the popover says so.
+column, which is what this app exists to avoid. Asking for one more value than
+the cap is what distinguishes "too many to list" from "exactly the cap", and a
+bounded `DISTINCT` can stop as soon as it has them — where the `GROUP BY` with
+counts this replaced had to aggregate the whole sample first, only for the
+frequency ordering it produced to be discarded and the values sorted
+alphabetically. Low cardinality gets a multi-select list; anything else gets
+comparison operators. The sample reads the first 200,000 rows, and the popover
+says so.
 
 ## Layout
 
@@ -204,8 +248,14 @@ every cell compared.
 The cache is tested against a real rewrite: write a parquet file, fingerprint it,
 write different contents to the same path, and require a different fingerprint.
 The `TableModel` half checks that a second open is served from memory and that
-scrolling past the remembered page resumes the stream *after* those rows rather
-than repeating them.
+scrolling past the remembered window continues *after* those rows rather than
+repeating them.
+
+The row window is tested against DuckDB's own plan, not just its output: a sorted
+window has to come out as `TOP_N` with no surviving `ORDER_BY`, because the value
+of the clause is entirely in the optimiser pushing it through the wrapper. Every
+read-only statement form is also run through the wrapper, which is how `EXPLAIN`
+being the one that cannot be is a checked fact rather than a remembered one.
 
 The read-only policy is tested from both ends: reads that must be allowed
 (including `DESCRIBE`, `SUMMARIZE`, `SHOW`), writes that must be refused, and a

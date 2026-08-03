@@ -138,6 +138,20 @@ dpq_cursor dpq_cursor_open(dpq_conn conn, const char *sql,
                            const char *const *params, int32_t nparams,
                            char **err);
 
+/*
+ * As above, but `render_as_text = 0` runs the statement exactly as given.
+ *
+ * Needed because the VARCHAR wrap is a SELECT over the statement, and not every
+ * statement can be selected from: `SELECT * FROM (EXPLAIN ...)` is a parse
+ * error. EXPLAIN is the one read-only form DuckParq admits that this applies
+ * to, and it already produces VARCHAR columns, so it needs neither the cast nor
+ * the wrap. Callers decide from the parsed statement kind
+ * (dpq_statement_kinds), never by inspecting the text.
+ */
+dpq_cursor dpq_cursor_open_ex(dpq_conn conn, const char *sql,
+                              const char *const *params, int32_t nparams,
+                              int32_t render_as_text, char **err);
+
 int32_t dpq_cursor_column_count(dpq_cursor cur);
 /* Borrowed, valid until the cursor is closed. */
 const char *dpq_cursor_column_name(dpq_cursor cur, int32_t index);

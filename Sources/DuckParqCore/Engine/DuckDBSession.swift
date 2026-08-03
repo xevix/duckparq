@@ -159,14 +159,27 @@ public final class DuckDBSession: @unchecked Sendable {
 
     /// Open a streaming cursor on its own connection. The caller owns it and
     /// must close it, which also releases that connection.
-    public func openCursor(_ sql: String, params: [String] = []) async throws -> QueryCursor {
+    ///
+    /// `renderAsText` is the `SELECT COLUMNS(*)::VARCHAR FROM (…)` wrap that
+    /// makes every column arrive as text. Turn it off only for a statement that
+    /// cannot be selected from — `EXPLAIN` — whose output is already text. The
+    /// decision belongs to the caller because it comes from the parsed
+    /// statement kind, not from looking at the SQL.
+    public func openCursor(
+        _ sql: String,
+        params: [String] = [],
+        renderAsText: Bool = true
+    ) async throws -> QueryCursor {
         let (token, connection) = try makeCursorConnection()
         let boxed = UncheckedBox(connection)
         do {
             return try await onQueue {
                 var err: UnsafeMutablePointer<CChar>?
                 let handle = withCStringArray(params) { pointers in
-                    dpq_cursor_open(boxed.value, sql, pointers, Int32(params.count), &err)
+                    dpq_cursor_open_ex(
+                        boxed.value, sql, pointers, Int32(params.count),
+                        renderAsText ? 1 : 0, &err
+                    )
                 }
                 guard let handle else {
                     throw DuckDBError.engine(takeMessage(&err) ?? "query failed")

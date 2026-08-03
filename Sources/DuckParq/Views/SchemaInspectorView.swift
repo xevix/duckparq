@@ -14,6 +14,15 @@ struct SchemaInspectorView: View {
     /// be worth saying so; a single file almost never does, and a spinner that
     /// appears and vanishes is just a flash.
     @State private var showsProgress = false
+    /// Row-group statistics were judged too expensive to run unasked.
+    @State private var deferredColumnStats = false
+    @State private var isLoadingColumnStats = false
+    @State private var fingerprint: SourceFingerprint?
+
+    /// Above this many row groups, `parquet_metadata` waits to be asked for.
+    /// A few thousand is milliseconds; a dataset with tens of thousands is the
+    /// case that made opening the panel feel broken.
+    private static let automaticRowGroupLimit = 4_000
 
     private var source: DataSource? { app.table.currentSource }
 
@@ -116,7 +125,29 @@ struct SchemaInspectorView: View {
 
     @ViewBuilder
     private var columnStatsSection: some View {
-        if let columnMetadata, columnMetadata.rowCount > 0 {
+        if deferredColumnStats {
+            Section {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("\(rowGroupCount.formatted()) row groups across \(fileCountLabel). Reading their per-column statistics means opening every footer in the dataset.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Read Column Statistics") { loadColumnStatsNow() }
+                        .controlSize(.small)
+                }
+            } header: {
+                sectionHeader("Columns", subtitle: "not loaded")
+            }
+        } else if isLoadingColumnStats {
+            Section {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Reading row group statistics…").font(.caption).foregroundStyle(.secondary)
+                }
+            } header: {
+                sectionHeader("Columns", subtitle: nil)
+            }
+        } else if let columnMetadata, columnMetadata.rowCount > 0 {
             Section {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(0..<columnMetadata.rowCount, id: \.self) { row in
@@ -213,12 +244,21 @@ struct SchemaInspectorView: View {
         return value.formatted()
     }
 
-    /// The three metadata queries are independent, so they run at once and each
-    /// section appears as its own answer arrives.
+    /// Read the source's metadata, cheapest question first.
     ///
-    /// They used to be awaited in a chain, which meant the file summary — the
-    /// cheapest of the three and the one people actually look at — waited behind
-    /// a per-column statistics scan of every row group in the dataset.
+    /// Three things make this fast enough to open on a large dataset:
+    ///
+    /// 1. It runs on the inspector's **own** DuckDB session. A session is a
+    ///    serial queue, so when this shared one with the grid it queued behind
+    ///    whatever the grid was doing — including a `count(*)` over billions of
+    ///    rows, which is exactly when you want to look at the metadata.
+    /// 2. The answers are cached against the same fingerprint as the preview, so
+    ///    clicking back to a file you already inspected costs nothing.
+    /// 3. Per-column row-group statistics are `parquet_metadata`, which is
+    ///    O(row groups × columns) and reads every footer. The file summary is
+    ///    O(files) and reports how many row groups there are — so it is asked
+    ///    first, and used to decide whether the expensive one is worth running
+    ///    without being asked.
     private func load() async {
         guard let source else { return }
         isLoading = true
@@ -226,6 +266,7 @@ struct SchemaInspectorView: View {
         fileMetadata = nil
         columnMetadata = nil
         keyValueMetadata = nil
+        deferredColumnStats = false
 
         showsProgress = false
         let delayedSpinner = Task {
@@ -233,15 +274,72 @@ struct SchemaInspectorView: View {
             guard !Task.isCancelled else { return }
             showsProgress = true
         }
+        defer {
+            delayedSpinner.cancel()
+            showsProgress = false
+            isLoading = false
+        }
 
+        let fingerprint = await Task.detached(priority: .userInitiated) {
+            SourceFingerprint.compute(for: source)
+        }.value
+        self.fingerprint = fingerprint
+        if let fingerprint, let cached = PreviewCache.shared.stats(for: fingerprint) {
+            fileMetadata = cached.fileSummary
+            columnMetadata = cached.columnStatistics
+            keyValueMetadata = cached.keyValues
+            deferredColumnStats = cached.columnStatistics == nil
+            return
+        }
+
+        // The cheap pair, concurrently.
         async let file: Void = loadFileMetadata(source)
-        async let columns: Void = loadColumnMetadata(source)
         async let keyValues: Void = loadKeyValueMetadata(source)
-        _ = await (file, columns, keyValues)
+        _ = await (file, keyValues)
 
-        delayedSpinner.cancel()
-        showsProgress = false
-        isLoading = false
+        if rowGroupCount > Self.automaticRowGroupLimit {
+            // Reading every row group's statistics here would cost more than
+            // the whole rest of the panel. Say so and let it be asked for.
+            deferredColumnStats = true
+        } else {
+            await loadColumnMetadata(source)
+        }
+        storeStats()
+    }
+
+    /// Run the deferred per-column statistics at the user's request.
+    private func loadColumnStatsNow() {
+        guard let source else { return }
+        deferredColumnStats = false
+        Task {
+            isLoadingColumnStats = true
+            await loadColumnMetadata(source)
+            isLoadingColumnStats = false
+            storeStats()
+        }
+    }
+
+    private func storeStats() {
+        guard let fingerprint, loadError == nil else { return }
+        PreviewCache.shared.storeStats(
+            CachedStats(
+                fileSummary: fileMetadata,
+                columnStatistics: columnMetadata,
+                keyValues: keyValueMetadata
+            ),
+            for: fingerprint
+        )
+    }
+
+    /// Total row groups across the source, from the cheap summary.
+    private var rowGroupCount: Int {
+        guard let raw = fileMetadata?.value(row: 0, named: "num_row_groups") else { return 0 }
+        return Int(raw) ?? 0
+    }
+
+    private var fileCountLabel: String {
+        let files = Int(fileMetadata?.value(row: 0, named: "files") ?? "1") ?? 1
+        return files == 1 ? "this file" : "\(files.formatted()) files"
     }
 
     private func loadFileMetadata(_ source: DataSource) async {
