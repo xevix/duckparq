@@ -50,7 +50,15 @@ order.
 **Rows stream.** One cursor stays open per (file, filters, sort); scrolling
 pulls the next page from the same stream. Paging never re-runs the query, so a
 sort is paid for once rather than once per page as `LIMIT/OFFSET` would.
-Changing sort or filters interrupts the running query and opens a new cursor.
+Changing sort or filters interrupts the running query and opens a new cursor —
+but the rows already on screen stay put until the replacements arrive. Re-sorting
+shows the same rows in a different order, so blanking the grid while the sort
+runs would state something untrue about the data.
+
+**Preview, schema and row count are three separate questions**, asked at once.
+The first page does not wait behind a `DESCRIBE` of a thousand-file dataset, and
+a `count(*)` over the whole thing does not hold up either. Each renders when it
+can; the status bar says which are still running, and Cancel interrupts them.
 
 **Cells arrive as text.** Queries are wrapped as
 `SELECT COLUMNS(*)::VARCHAR FROM (<query>)`, so DuckDB renders every type —
@@ -73,6 +81,16 @@ parse and not a pattern match, `SELECT 1; DROP VIEW t` is seen as two
 statements, one of which is a write — which is what makes opening a `.sql` file
 someone else wrote safe.
 
+**Opening the same file twice is free.** The first page, schema and row count of
+an unfiltered, unsorted view are remembered against a fingerprint of the source —
+file count, total size and newest modification time, which is what `stat` can
+answer cheaply. Hashing the bytes to avoid reading them would defeat the point.
+That misses a rewrite which preserved both size and timestamp, so **Clear Cache**
+exists, and the cache is never consulted for a filtered, sorted or SQL result:
+those are answers you are actively composing, where a remembered one would be
+indistinguishable from a fresh one and wrong in a way you could not see. A cache
+hit leaves the stream unopened; scrolling past the remembered page opens it then.
+
 ### Sessions
 
 Four independent DuckDB sessions — grid, metadata, SQL editor, export — so a
@@ -91,13 +109,29 @@ streaming result per connection.
 | ⇧⌘E | Show/hide the SQL editor |
 | ⌥⌘I | Show/hide schema & file metadata |
 | ⌘R | Re-run the current query |
+| ⌘. | Cancel the running query |
 | ⌘C | Copy the selected row as TSV |
 | ⌘S | Save the editor's query as a `.sql` file |
 | ⇧⌘O | Open a saved `.sql` query |
+| ⇧⌘F | Re-indent the editor's SQL |
 
 Folders holding parquet files — or `key=value` hive partitions — get a
 **dataset** badge and open as a single table. Right-click one to copy its path,
-or the `read_parquet(…)` call for it.
+or the `read_parquet(…)` call for it. Hive partitions are *not* listed as
+folders: `year=2024/region=eu/` is a column of one table, not somewhere to browse
+into, so the layout is recognised and the folder offered whole.
+
+Sidebar folders collapse and expand individually, and the two toolbar buttons do
+it wholesale. Expand All is the one place the sidebar reads the whole tree rather
+than a level at a time, so it is bounded and runs off the main thread.
+
+The grid scrolls on both axes in one scroll view, so the vertical scrollbar sits
+against the window rather than against the last column, and the header pins to
+the top while still scrolling sideways with the columns it labels.
+
+The status bar counts up while a query runs and keeps the final figure
+afterwards, with **Cancel** beside it — that interrupts the query inside DuckDB
+rather than abandoning it, so a cancelled sort of a large file actually stops.
 
 Opening the SQL editor over a selected file fills it with the query driving the
 grid — source, filters and sort, with the path written out — so you start from
@@ -118,12 +152,22 @@ highlighter and the parser agree by construction — which is why `count` and
 dark and light palettes and picks between them by asking the terminal for its
 background colour; here the window's appearance answers the same question.
 
-**Queries ▸ Save Query…** writes the editor to a `.sql` file, and **Open
-Query…** loads one back. Saved queries default to
-`~/Library/Application Support/DuckParq/Queries` and are listed in the same
-menu, but they are ordinary files and can live anywhere. A loaded file is put in
-the editor and *not* run — you see it before it executes, and when you do run
-it, it goes through the read-only check above.
+**Save** and **Open** are one click each. Saved queries default to
+`~/Library/Application Support/DuckParq/Queries` and the ones already there are
+behind the small chevron, but they are ordinary files and can live anywhere. A
+loaded file is put in the editor and *not* run — you see it before it executes,
+and when you do run it, it goes through the read-only check above.
+
+**Format** re-indents the query, and the checkbox beside Save runs it on the way
+to the file. It moves whitespace and nothing else: the formatter re-emits the
+exact text of every token the tokenizer produced, in order, so no literal is
+rewritten and no clause is regenerated from an understanding of SQL it does not
+have. The suite checks that by re-tokenizing the output of every sample and
+requiring an identical token stream, and by running a query before and after
+formatting and comparing the rows.
+
+Applying a filter also updates the editor, as long as it is still showing the
+view's query — anything typed is left alone.
 
 Filter popovers pick their controls by sampling a column's distinct values *when
 the popover opens* — probing every column on file select would mean a scan per
@@ -150,6 +194,18 @@ It covers SQL generation and quoting, filter compilation, type classification,
 a bridge round-trip over every DuckDB type, hive datasets, error paths, query
 cancellation, concurrent cursors, export, and the `TableModel` logic the UI
 drives (sort cycling, paging, filters, SQL mode, error recovery).
+
+The formatter is tested against its own invariant rather than against expected
+output: format a sample, re-tokenize it, and require the same token stream —
+which catches a split `<=`, a mangled literal, or a dropped clause. It is also
+checked for idempotence, and one query is run before and after formatting with
+every cell compared.
+
+The cache is tested against a real rewrite: write a parquet file, fingerprint it,
+write different contents to the same path, and require a different fingerprint.
+The `TableModel` half checks that a second open is served from memory and that
+scrolling past the remembered page resumes the stream *after* those rows rather
+than repeating them.
 
 The read-only policy is tested from both ends: reads that must be allowed
 (including `DESCRIBE`, `SUMMARIZE`, `SHOW`), writes that must be refused, and a

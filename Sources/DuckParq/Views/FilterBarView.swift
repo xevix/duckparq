@@ -157,6 +157,7 @@ struct FilterEditor: View {
         }
         .padding(12)
         .frame(width: 300)
+        .onSubmit { submit() }
         .task { await probe() }
     }
 
@@ -220,6 +221,16 @@ struct FilterEditor: View {
                 .textFieldStyle(.roundedBorder)
                 .font(.system(size: 11, design: .monospaced))
         }
+    }
+
+    /// Return in a value field applies the filter, the same as clicking Apply.
+    ///
+    /// The Apply button is already the default action, but a focused text field
+    /// swallows Return before the button ever hears about it — which is why
+    /// typing a value and hitting Return appeared to do nothing.
+    private func submit() {
+        guard isApplyEnabled else { return }
+        apply()
     }
 
     private func binding(for value: String) -> Binding<Bool> {

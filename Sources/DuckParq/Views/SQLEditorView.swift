@@ -17,6 +17,10 @@ struct SQLEditorView: View {
     /// the CLI makes by probing the terminal background.
     @Environment(\.colorScheme) private var colorScheme
 
+    private var isEmpty: Bool {
+        app.sqlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     var body: some View {
         @Bindable var app = app
 
@@ -48,7 +52,9 @@ struct SQLEditorView: View {
 
                 Spacer(minLength: 8)
 
-                queryFileMenu
+                fileControls
+
+                Divider().frame(height: 14)
 
                 if app.table.currentSource != nil, !app.sqlMatchesView {
                     Button("View SQL") { app.seedSQLFromView(force: true) }
@@ -78,11 +84,11 @@ struct SQLEditorView: View {
                     Label("Run", systemImage: "play.fill")
                 }
                 .keyboardShortcut(.return, modifiers: .command)
-                .disabled(app.sqlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(isEmpty)
                 .help("Run the query (⌘↩)")
             }
             .padding(.horizontal, 10)
-            .frame(height: 26)
+            .frame(height: 28)
 
             Divider()
 
@@ -116,17 +122,49 @@ struct SQLEditorView: View {
         // The library is a directory, so it can change outside the app; re-read
         // it whenever the panel appears rather than trusting a launch-time list.
         .task { app.refreshSavedQueries() }
+        // Filters and sorts change the query behind the view, so the editor
+        // follows them — but only while it is still showing that query. Text
+        // you typed is never replaced; see `seedSQLFromView`.
+        .onChange(of: app.table.viewSignature) { _, _ in app.seedSQLFromView() }
     }
 
-    /// Save, open, and the library of previously saved queries.
-    private var queryFileMenu: some View {
-        Menu {
-            Button("Save Query…") { app.saveQuery() }
-                .disabled(app.sqlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            Button("Open Query…") { app.openQuery() }
+    /// Format, save and open — each one click, with the library of previously
+    /// saved queries behind a small chevron rather than in front of them.
+    @ViewBuilder
+    private var fileControls: some View {
+        @Bindable var app = app
 
-            if !app.savedQueries.isEmpty {
-                Divider()
+        Button {
+            app.formatSQL()
+        } label: {
+            Label("Format", systemImage: "text.alignleft")
+        }
+        .buttonStyle(.borderless)
+        .font(.caption)
+        .disabled(isEmpty)
+        .help("Re-indent the query. Only whitespace changes — the query still does exactly what it did.")
+
+        Button {
+            app.saveQuery()
+        } label: {
+            Label("Save", systemImage: "square.and.arrow.down")
+        }
+        .buttonStyle(.borderless)
+        .font(.caption)
+        .disabled(isEmpty)
+        .help("Save this query as a .sql file (⌘S)")
+
+        Button {
+            app.openQuery()
+        } label: {
+            Label("Open", systemImage: "square.and.arrow.up")
+        }
+        .buttonStyle(.borderless)
+        .font(.caption)
+        .help("Load a .sql file into the editor (⇧⌘O)")
+
+        if !app.savedQueries.isEmpty {
+            Menu {
                 Section("Saved") {
                     ForEach(app.savedQueries) { query in
                         Button(query.name) { app.loadQuery(from: query.url) }
@@ -136,12 +174,18 @@ struct SQLEditorView: View {
                 Button("Show in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting(app.savedQueries.map(\.url))
                 }
+            } label: {
+                Image(systemName: "chevron.down").font(.caption2)
             }
-        } label: {
-            Label("Queries", systemImage: "folder")
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Queries you have saved before")
         }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .help("Save this query, or load one you saved earlier")
+
+        Toggle("Format on save", isOn: $app.formatsOnSave)
+            .toggleStyle(.checkbox)
+            .font(.caption)
+            .help("Run the formatter over the query before writing the file")
     }
 }

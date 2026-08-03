@@ -14,6 +14,7 @@ import UniformTypeIdentifiers
 final class AppModel {
     private enum Defaults {
         static let roots = "dev.xevix.duckparq.roots"
+        static let formatOnSave = "dev.xevix.duckparq.formatOnSave"
     }
 
     let engine: DuckDBEngine
@@ -29,12 +30,23 @@ final class AppModel {
     var selection: FileNode?
     var searchQuery: String = ""
 
+    /// Folders the sidebar is showing the inside of. Held here rather than in
+    /// each row's `@State` so Collapse All and Expand All have something to act
+    /// on — per-row state is invisible to anything but that row.
+    var expandedFolders: Set<URL> = []
+    /// True while `expandAll()` is still walking the tree.
+    private(set) var isExpandingAll = false
+
     var showsInspector = false
     var showsSQLEditor = false
     var showsExportSheet = false
 
     var sqlText: String = ""
     var sqlError: String?
+    /// Run the formatter over the editor before writing a `.sql` file.
+    var formatsOnSave: Bool {
+        didSet { UserDefaults.standard.set(formatsOnSave, forKey: Defaults.formatOnSave) }
+    }
     /// Queries in the library directory, refreshed when the menu needs them.
     var savedQueries: [SavedQuery] = []
     /// Name of the `.sql` file currently loaded, shown in the editor header.
@@ -50,6 +62,16 @@ final class AppModel {
     /// Creation of the `t` view, awaited before running SQL that may use it.
     private var sqlContextTask: Task<Void, Never>?
 
+    /// Held for the app's lifetime to keep macOS from putting DuckParq to sleep
+    /// while it is in the background.
+    ///
+    /// App Nap throttles a fully occluded app's timers and drops its threads to
+    /// background QoS; coming back from that is a plausible part of the pause on
+    /// ⌘-Tab into a window that has been sitting behind others. `idleSystemSleep`
+    /// is still allowed — this asks not to be throttled, not to keep the Mac
+    /// awake.
+    private var backgroundActivity: NSObjectProtocol?
+
     init() {
         // DuckDB is statically linked and opened in memory, with no files or
         // network involved -- if this fails the binary itself is broken, so
@@ -63,6 +85,12 @@ final class AppModel {
         self.exportSession = try! DuckDBSession(engine: engine, label: "export")
         self.probe = Probe(session: metaSession)
         self.table = TableModel(gridSession: gridSession, metaSession: metaSession)
+        self.formatsOnSave = UserDefaults.standard.bool(forKey: Defaults.formatOnSave)
+
+        self.backgroundActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep],
+            reason: "Keeping browsed files and query state warm between activations"
+        )
 
         loadRoots()
         refreshSavedQueries()
@@ -84,6 +112,9 @@ final class AppModel {
         let paths = UserDefaults.standard.stringArray(forKey: Defaults.roots) ?? []
         roots = paths.map { URL(fileURLWithPath: $0) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
+        // A folder you just added should show its contents; nested folders stay
+        // shut until asked for, which is what keeps adding a big tree instant.
+        expandedFolders.formUnion(roots)
     }
 
     private func persistRoots() {
@@ -102,6 +133,50 @@ final class AppModel {
         guard panel.runModal() == .OK else { return }
         for url in panel.urls where !roots.contains(url) {
             roots.append(url)
+            expandedFolders.insert(url)
+        }
+    }
+
+    // MARK: - Sidebar expansion
+
+    func isExpanded(_ url: URL) -> Bool { expandedFolders.contains(url) }
+
+    func setExpanded(_ url: URL, _ expanded: Bool) {
+        if expanded { expandedFolders.insert(url) } else { expandedFolders.remove(url) }
+    }
+
+    func toggleExpanded(_ url: URL) { setExpanded(url, !isExpanded(url)) }
+
+    func collapseAll() {
+        expandedFolders = []
+    }
+
+    /// Open every folder under every root.
+    ///
+    /// This is the one place the sidebar reads the whole tree rather than one
+    /// level at a time, so it is bounded and runs off the main actor. Hive
+    /// partitions are skipped: `FileTree` does not list them as folders, so
+    /// expanding into them would only produce rows that cannot be drawn.
+    func expandAll(limit: Int = 5_000) {
+        guard !isExpandingAll else { return }
+        isExpandingAll = true
+        let roots = self.roots
+        Task { [weak self] in
+            let found = await Task.detached(priority: .userInitiated) { () -> Set<URL> in
+                var expanded = Set(roots)
+                var queue = roots
+                while !queue.isEmpty, expanded.count < limit {
+                    let directory = queue.removeFirst()
+                    for node in FileTree.children(of: directory) where node.isDirectory {
+                        expanded.insert(node.url)
+                        queue.append(node.url)
+                    }
+                }
+                return expanded
+            }.value
+            guard let self else { return }
+            self.expandedFolders.formUnion(found)
+            self.isExpandingAll = false
         }
     }
 
@@ -199,6 +274,22 @@ final class AppModel {
         sqlText.trimmingCharacters(in: .whitespacesAndNewlines) == seededSQL
     }
 
+    /// Re-indent the editor's contents.
+    ///
+    /// `SQLFormatter` only moves whitespace, so this cannot change what the
+    /// query does — which is what makes it safe to offer next to a Run button.
+    func formatSQL() {
+        let trimmed = sqlText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let formatted = SQLFormatter.format(sqlText)
+        guard formatted != sqlText else { return }
+        // Formatting untouched seeded text leaves it untouched in the sense that
+        // matters: a filter change should still be free to replace it.
+        let wasSeed = trimmed == seededSQL
+        sqlText = formatted
+        if wasSeed { seededSQL = formatted }
+    }
+
     func runSQL() {
         let trimmed = sqlText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -230,8 +321,11 @@ final class AppModel {
     /// The save panel starts in the library directory but is not confined to
     /// it — a query is an ordinary file and belongs wherever the user wants it.
     func saveQuery() {
+        guard !sqlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        // Formatting before the panel opens, not after it is dismissed, so what
+        // gets written is what the editor is showing.
+        if formatsOnSave { formatSQL() }
         let text = sqlText
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.init(filenameExtension: QueryLibrary.fileExtension) ?? .plainText]
@@ -282,5 +376,16 @@ final class AppModel {
         } catch {
             sqlError = error.localizedDescription
         }
+    }
+
+    // MARK: - Cache
+
+    /// Forget every remembered preview.
+    ///
+    /// The cache keys on file size and modification time, which misses a rewrite
+    /// that preserved both. This is the way out of that, and the reason it is a
+    /// visible button rather than an internal detail.
+    func clearCache() {
+        table.clearCache()
     }
 }

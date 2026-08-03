@@ -5,7 +5,8 @@ import SwiftUI
 /// The file browser.
 ///
 /// Children are read when a folder is first expanded rather than up front, so
-/// adding a large directory tree stays instant.
+/// adding a large directory tree stays instant. Which folders are open lives in
+/// `AppModel`, not in each row — Collapse All has to be able to reach it.
 struct SidebarView: View {
     @Environment(AppModel.self) private var app
     @State private var searchResults: [FileNode] = []
@@ -18,26 +19,17 @@ struct SidebarView: View {
                 if app.searchQuery.isEmpty {
                     ForEach(app.roots, id: \.self) { root in
                         Section {
-                            // A folder you added is often the dataset itself, so
-                            // offer it directly rather than making you find a
-                            // file inside it first.
-                            if FileTree.looksLikeDataset(root) {
-                                RootDatasetRow(url: root)
-                            }
-                            DirectoryContents(url: root, depth: 0)
-                        } header: {
-                            HStack {
-                                Text(root.lastPathComponent)
-                                Spacer()
-                                Button {
-                                    app.removeRoot(root)
-                                } label: {
-                                    Image(systemName: "xmark.circle.fill")
+                            if app.isExpanded(root) {
+                                // A folder you added is often the dataset
+                                // itself, so offer it directly rather than
+                                // making you find a file inside it first.
+                                if FileTree.looksLikeDataset(root) {
+                                    RootDatasetRow(url: root)
                                 }
-                                .buttonStyle(.plain)
-                                .foregroundStyle(.tertiary)
-                                .help("Remove \(root.lastPathComponent) from the sidebar")
+                                DirectoryContents(url: root, depth: 0)
                             }
+                        } header: {
+                            RootHeader(url: root)
                         }
                     }
                 } else {
@@ -67,10 +59,75 @@ struct SidebarView: View {
             searchResults = app.roots.flatMap { FileTree.search(root: $0, query: query) }
         }
         .toolbar {
-            ToolbarItem {
+            ToolbarItemGroup {
                 Button { app.addRoot() } label: { Image(systemName: "plus") }
                     .help("Add a folder to browse (⌘O)")
+
+                Button { app.collapseAll() } label: {
+                    Image(systemName: "arrow.down.right.and.arrow.up.left")
+                }
+                .disabled(app.expandedFolders.isEmpty)
+                .help("Collapse every folder")
+
+                Button { app.expandAll() } label: {
+                    if app.isExpandingAll {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    }
+                }
+                .disabled(app.roots.isEmpty || app.isExpandingAll)
+                .help("Open every folder under the added roots")
             }
+        }
+    }
+
+}
+
+/// An added folder's header: its disclosure control, its name, and — kept well
+/// away from both — the button that removes it.
+///
+/// The expansion is drawn here rather than left to `Section(isExpanded:)`,
+/// which macOS puts at the *trailing* edge of a section header. That placed
+/// "show me what's inside" immediately beside "remove this folder", so the two
+/// adjacent controls were the most and the least recoverable actions in the
+/// sidebar. The chevron now sits with the name it opens.
+private struct RootHeader: View {
+    let url: URL
+    @Environment(AppModel.self) private var app
+
+    private var isExpanded: Bool { app.isExpanded(url) }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            // Chevron and name are one target, so the name is clickable the way
+            // a disclosure row's label normally is.
+            HStack(spacing: 4) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    .animation(.easeInOut(duration: 0.15), value: isExpanded)
+                    .frame(width: 10)
+
+                Text(url.lastPathComponent).lineLimit(1)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { app.toggleExpanded(url) }
+            .help(isExpanded ? "Collapse \(url.lastPathComponent)" : "Expand \(url.lastPathComponent)")
+
+            // Nothing is clickable in between, so a miss on either control does
+            // nothing rather than doing the other one.
+            Spacer(minLength: 12)
+
+            Button {
+                app.removeRoot(url)
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.tertiary)
+            .help("Remove \(url.lastPathComponent) from the sidebar")
         }
     }
 }
@@ -117,6 +174,11 @@ private struct DirectoryContents: View {
             Text(message)
                 .font(.caption)
                 .foregroundStyle(.red)
+        } else if outcome == .hivePartitioned {
+            // The `key=value` folders under a hive layout are partitions of one
+            // table. Listing them would invite opening a slice of a dataset as
+            // though it were a file, so they are not offered at all.
+            hiveNote
         } else if children.isEmpty {
             Text("No parquet files")
                 .font(.callout)
@@ -130,6 +192,19 @@ private struct DirectoryContents: View {
                 }
             }
         }
+    }
+
+    private var hiveNote: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Label("Hive-partitioned", systemImage: "square.grid.3x3")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Partitions are columns of one table — open the folder itself.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 2)
     }
 
     private func reload() {
@@ -182,11 +257,14 @@ private struct DirectoryRow: View {
     let depth: Int
 
     @Environment(AppModel.self) private var app
-    @State private var isExpanded = false
+
+    private var isExpanded: Binding<Bool> {
+        Binding(get: { app.isExpanded(node.url) }, set: { app.setExpanded(node.url, $0) })
+    }
 
     var body: some View {
-        DisclosureGroup(isExpanded: $isExpanded) {
-            if isExpanded {
+        DisclosureGroup(isExpanded: isExpanded) {
+            if isExpanded.wrappedValue {
                 DirectoryContents(url: node.url, depth: depth + 1)
             }
         } label: {
@@ -211,7 +289,7 @@ private struct DirectoryRow: View {
                 if node.isDataset {
                     app.select(node)
                 } else {
-                    isExpanded.toggle()
+                    app.toggleExpanded(node.url)
                 }
             }
             .help(node.isDataset

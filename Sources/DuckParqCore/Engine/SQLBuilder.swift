@@ -316,8 +316,22 @@ public enum SQLBuilder {
 
     // MARK: - Metadata
 
+    /// One row summarising the source, whether it is a file or a thousand of
+    /// them.
+    ///
+    /// Aggregated in DuckDB rather than in the inspector: a dataset's
+    /// `parquet_file_metadata` returns a row per file, and summing a truncated
+    /// read of those rows would quietly under-report the row count of exactly
+    /// the datasets big enough to care about. All of it comes from parquet
+    /// footers, so it stays cheap.
     public static func fileMetadata(source: DataSource) -> BoundSQL {
-        BoundSQL(sql: "SELECT * FROM parquet_file_metadata($1)", params: [source.readPath])
+        let sql = """
+            SELECT count(*) AS files, sum(num_rows) AS num_rows, \
+            sum(num_row_groups) AS num_row_groups, sum(file_size_bytes) AS file_size_bytes, \
+            any_value(format_version) AS format_version, any_value(created_by) AS created_by \
+            FROM parquet_file_metadata($1)
+            """
+        return BoundSQL(sql: sql, params: [source.readPath])
     }
 
     public static func rowGroupMetadata(source: DataSource) -> BoundSQL {

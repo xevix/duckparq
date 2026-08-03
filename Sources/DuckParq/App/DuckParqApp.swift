@@ -34,6 +34,9 @@ struct DuckParqApp: App {
         CommandGroup(after: .toolbar) {
             Button("Refresh") { app.table.reload() }
                 .keyboardShortcut("r", modifiers: .command)
+            Button("Cancel Query") { app.table.cancel() }
+                .keyboardShortcut(".", modifiers: .command)
+                .disabled(!app.table.isBusy)
             Divider()
             Button(app.showsSQLEditor ? "Hide SQL Editor" : "Show SQL Editor") {
                 app.toggleSQLEditor()
@@ -44,10 +47,20 @@ struct DuckParqApp: App {
             }
             .keyboardShortcut("i", modifiers: [.command, .option])
             Divider()
+            Button("Format SQL") { app.formatSQL() }
+                .keyboardShortcut("f", modifiers: [.command, .shift])
+                .disabled(app.sqlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            Divider()
+            Button("Collapse All Folders") { app.collapseAll() }
+                .disabled(app.expandedFolders.isEmpty)
+            Button("Expand All Folders") { app.expandAll() }
+                .disabled(app.roots.isEmpty)
+            Divider()
             Button("Clear Sort") { app.table.clearSort() }
                 .disabled(app.table.sort.isEmpty)
             Button("Clear Filters") { app.table.clearFilters() }
                 .disabled(app.table.filters.isEmpty)
+            Button("Clear Cache") { app.clearCache() }
         }
     }
 

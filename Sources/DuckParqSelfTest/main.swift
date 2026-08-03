@@ -169,6 +169,27 @@ do {
     expect(FileTree.looksLikeDataset(fixtures), "a folder holding parquet files reads as a dataset")
     expect(FileTree.looksLikeDataset(hiveDirectory), "a hive-partitioned folder reads as a dataset")
 
+    // A hive layout is one table whose partitions are columns. Listing
+    // `year=2024/` as a folder invites opening a slice of a dataset as though
+    // it were a thing in its own right, so the partitions are withheld and the
+    // folder is offered whole.
+    let hiveListing = FileTree.listing(of: hiveDirectory)
+    expectEqual(hiveListing.outcome, .hivePartitioned, "a hive folder says why it lists no sub-folders")
+    expect(!hiveListing.nodes.contains { $0.isDirectory }, "partition directories are withheld")
+    expect(FileTree.isHivePartitioned(hiveDirectory), "the hive layout is detected")
+    expect(!FileTree.isHivePartitioned(fixtures),
+           "a plain folder of parquet files is not hive-partitioned")
+    expect(FileTree.children(of: hiveDirectory).isEmpty,
+           "nothing under a hive folder is offered for browsing")
+    expect(FileTree.isHivePartitionName("year=2024"), "key=value is a partition name")
+    expect(!FileTree.isHivePartitionName("=2024"), "a value with no key is not a partition name")
+    expect(!FileTree.isHivePartitionName("plain"), "a folder without = is not a partition")
+
+    // Search must not descend into partitions either, or a hive dataset floods
+    // the results with a file per partition.
+    expect(FileTree.search(root: hiveDirectory, query: "data").isEmpty,
+           "search does not reach into hive partitions")
+
     let datasetSource = DataSource.dataset(hiveDirectory)
     expect(datasetSource.readPath.hasSuffix("/**/*.parquet"), "datasets read recursively")
 }
@@ -866,6 +887,154 @@ do {
     expectEqual(withBootstrap, withEngine, "generated SQL highlights identically before and after load")
 }
 
+// MARK: - SQL formatting
+
+section("SQL formatting")
+
+do {
+    let keywords = SQLKeywords.shared.all
+
+    /// The formatter's whole contract, checked rather than asserted in a
+    /// comment: the token stream out is the token stream in. Anything that
+    /// changed a literal, dropped a clause or split `<=` fails here.
+    func tokenStream(_ text: String) -> [String] {
+        SQLSyntax.tokenize(text, keywords: keywords).map { token in
+            let range = NSRange(location: token.location, length: token.length)
+            return "\(token.kind):\((text as NSString).substring(with: range))"
+        }
+    }
+
+    let samples = [
+        "select a,b from t where x>1 and y<2 order by a desc",
+        "SELECT * FROM read_parquet('/tmp/it''s.parquet') AS t WHERE t.\"a b\" <= 1.5",
+        "SELECT a FROM t WHERE x BETWEEN 1 AND 10 AND y = 2",
+        "SELECT CASE WHEN a > 1 THEN 'big' ELSE 'small' END AS size FROM t",
+        "SELECT * FROM (SELECT id FROM t WHERE id > 5) ORDER BY id",
+        "SELECT count(*) FROM t LEFT OUTER JOIN u ON t.id = u.id WHERE t.x <> 1",
+        "SELECT 'a -- not a comment', 1 -- but this is\nFROM t",
+        "SELECT /* a /* nested */ b */ 1",
+        "SELECT $1, x$1 FROM t",
+        "SELECT a-1, -1, a - -1, a::VARCHAR FROM t",
+        "SELECT left('abc', 1), a[1] FROM t",
+        "SELECT 1;",
+        "",
+        "   \n\t ",
+        "SELECT 'unterminated",
+        "--",
+    ]
+
+    for sample in samples {
+        let formatted = SQLFormatter.format(sample, keywords: keywords)
+        expectEqual(tokenStream(formatted), tokenStream(sample),
+                    "formatting only moves whitespace: \(sample.prefix(46))")
+        // A second pass must be a no-op, or the button's effect depends on how
+        // many times it was pressed.
+        expectEqual(SQLFormatter.format(formatted, keywords: keywords), formatted,
+                    "formatting is idempotent: \(sample.prefix(46))")
+    }
+
+    // Layout, on the case the Format button actually gets pressed on.
+    do {
+        let formatted = SQLFormatter.format(
+            "select a,b from t where x>1 and y<2 order by a desc", keywords: keywords)
+        let lines = formatted.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        expectEqual(lines, [
+            "select",
+            "  a,",
+            "  b",
+            "from t",
+            "where x > 1",
+            "  and y < 2",
+            "order by a desc",
+        ], "clauses start lines, list items and conjunctions are indented under them")
+    }
+
+    // `BETWEEN x AND y` reads as one condition, so its AND must not be broken
+    // out as though it were a second predicate.
+    do {
+        let formatted = SQLFormatter.format("SELECT a FROM t WHERE x BETWEEN 1 AND 10 AND y = 2",
+                                            keywords: keywords)
+        expect(formatted.contains("BETWEEN 1 AND 10"), "BETWEEN keeps its AND on the line")
+        expect(formatted.contains("\n  AND y = 2"), "the real conjunction still breaks")
+    }
+
+    // A single-item SELECT stays on its line; only a list gets a heading.
+    expect(SQLFormatter.format("SELECT * FROM t", keywords: keywords).hasPrefix("SELECT *"),
+           "a one-item select list is not split from its keyword")
+
+    // The one that matters most: formatting a query does not change what it
+    // returns. Checked by running both, not by comparing strings.
+    do {
+        let original = SQLBuilder.editableRows(
+            source: .file(smallParquet),
+            filters: [Filter(column: scoreColumn, mode: .comparison(.greaterThan, ["900"]))],
+            sort: [SortKey(column: "id", direction: .descending)]
+        )
+        let formatted = SQLFormatter.format(original, keywords: keywords)
+        expect(formatted != original, "the generated query is actually reformatted")
+
+        let before = try await session.queryAll(original)
+        let after = try await session.queryAll(formatted)
+        expectEqual(after.columns, before.columns, "formatting preserves the result's columns")
+        expectEqual(after.rowCount, before.rowCount, "formatting preserves the row count")
+        expectEqual(after.cells, before.cells, "formatting preserves every cell")
+    }
+
+    // Formatted output has to survive the read-only check, since Format sits
+    // next to Run and people will press them in that order.
+    do {
+        let formatted = SQLFormatter.format(
+            "select id from read_parquet('\(smallParquet.path)') where id>1", keywords: keywords)
+        try await session.validateReadOnly(formatted)
+        expect(true, "formatted SQL still parses as a single read-only statement")
+    }
+}
+
+// MARK: - Preview cache
+
+section("Preview cache")
+
+do {
+    let fingerprint = SourceFingerprint.compute(for: .file(smallParquet))
+    expect(fingerprint != nil, "a real file can be fingerprinted")
+    expectEqual(SourceFingerprint.compute(for: .file(smallParquet)), fingerprint,
+                "an unchanged file fingerprints the same twice")
+    expect(SourceFingerprint.compute(for: .file(fixtures.appendingPathComponent("nope.parquet"))) == nil,
+           "a missing file has no fingerprint, so nothing can be served for it")
+
+    let datasetPrint = SourceFingerprint.compute(for: .dataset(hiveDirectory))
+    expect(datasetPrint != nil, "a dataset fingerprints from the files under it")
+    expect((datasetPrint?.fileCount ?? 0) > 1, "the dataset fingerprint counts every file it found")
+    expect(datasetPrint != fingerprint, "a dataset and a file do not share a fingerprint")
+
+    // A rewritten file must not be served from the old entry. This is the whole
+    // correctness question for the cache, so it is tested against a real write
+    // rather than by trusting the key's fields.
+    let scratch = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("duckparq-cache-\(UUID().uuidString).parquet")
+    defer { try? FileManager.default.removeItem(at: scratch) }
+    try await session.execute(
+        "COPY (SELECT * FROM range(10) t(i)) TO '\(scratch.path)' (FORMAT parquet)")
+    let firstPrint = SourceFingerprint.compute(for: .file(scratch))
+    try await session.execute(
+        "COPY (SELECT * FROM range(5000) t(i)) TO '\(scratch.path)' (FORMAT parquet)")
+    let secondPrint = SourceFingerprint.compute(for: .file(scratch))
+    expect(firstPrint != nil && secondPrint != nil, "both writes are fingerprintable")
+    expect(firstPrint != secondPrint, "rewriting a file changes its fingerprint")
+
+    // Storage behaviour.
+    let cache = PreviewCache(capacity: 2)
+    let preview = CachedPreview(columns: [scoreColumn], rows: [["1"]], totalRowCount: 1, reachedEnd: true)
+    cache.store(preview, for: firstPrint!)
+    expect(cache.preview(for: firstPrint!) != nil, "a stored preview comes back")
+    expect(cache.preview(for: secondPrint!) == nil, "a different fingerprint is a miss")
+    cache.store(preview, for: secondPrint!)
+    cache.store(preview, for: datasetPrint!)
+    expectEqual(cache.count, 2, "the cache stays at its capacity")
+    cache.clear()
+    expectEqual(cache.count, 0, "clearing empties it")
+}
+
 // MARK: - Saved queries
 
 section("Query library")
@@ -959,9 +1128,13 @@ func settle(_ model: TableModel, timeout: TimeInterval = 30) async {
 }
 
 do {
+    // Its own cache, so these assertions describe this model rather than
+    // whatever an earlier section happened to leave in the shared one.
+    let modelCache = PreviewCache()
     let model = TableModel(
         gridSession: try DuckDBSession(engine: engine, label: "model-grid"),
-        metaSession: try DuckDBSession(engine: engine, label: "model-meta")
+        metaSession: try DuckDBSession(engine: engine, label: "model-meta"),
+        cache: modelCache
     )
 
     model.open(.file(smallParquet))
@@ -991,9 +1164,19 @@ do {
 
     expectEqual(firstID(), "0", "unsorted starts at the file's first row")
 
+    // Re-sorting must not blank the grid while the new query runs. The rows on
+    // screen are the same rows in a different order, so clearing them says
+    // something untrue about the data for as long as the sort takes — which is
+    // what the flicker was.
+    let rowsBeforeSort = model.rows.count
     model.toggleSort(column: "id")
+    expectEqual(model.rows.count, rowsBeforeSort, "a sort keeps the current rows until new ones arrive")
+    expectEqual(model.sortDirection(for: "id"), .ascending,
+                "the header shows the new sort immediately, so nothing is misrepresented")
     await settle(model)
     expectEqual(model.sortDirection(for: "id"), .ascending, "first click sorts ascending")
+    expectEqual(model.rows.count, TableModel.pageSize,
+                "the first page of the new sort replaces the old rows outright")
     expectEqual(firstID(), "0", "ascending starts at the lowest id")
 
     model.toggleSort(column: "id")
@@ -1088,6 +1271,51 @@ do {
     expectEqual(model.sort.map(\.column), ["score"], "rapid sort changes leave only the last one")
     let settled = model.rows.prefix(6).map { Int($0.cells[scoreIndex] ?? "") ?? -1 }
     expect(settled == settled.sorted(), "the surviving result matches the final sort, not a stale one")
+
+    // Timing. Every completed load leaves a duration behind and stops the
+    // running clock, which is what the status bar switches between.
+    expect(model.lastQueryDuration != nil, "a finished load records how long it took")
+    expect(model.queryStartedAt == nil, "the running clock stops when the load finishes")
+
+    // Cancelling. The state machine is the part that can be wrong on a small
+    // file — the interrupt itself is exercised against the 10M-row fixture.
+    model.reload()
+    expect(model.isBusy, "a reload is immediately busy, so there is something to cancel")
+    model.cancel()
+    expect(!model.isBusy, "cancelling stops reporting work in progress")
+    expect(model.wasCancelled, "the status bar can say the load was stopped, not that it failed")
+    expectEqual(model.errorMessage, String?.none, "cancelling is not an error")
+
+    model.open(.file(smallParquet))
+    await settle(model)
+    expect(!model.wasCancelled, "the next load clears the cancelled state")
+
+    // Second open of an unchanged file comes from memory. Paging past the
+    // remembered page still has to work, which means opening the stream at that
+    // point and reading past what was already shown.
+    model.clear()
+    model.open(.file(smallParquet))
+    await settle(model)
+    expect(model.servedFromCache, "re-opening an unchanged file is served from the cache")
+    expectEqual(model.rows.count, TableModel.pageSize, "the cached page is a page, not the file")
+    expectEqual(model.totalRowCount, 1000, "the row count is remembered alongside the rows")
+    expectEqual(model.columns.count, 6, "the schema is remembered too")
+
+    model.loadMore()
+    await settle(model)
+    expectEqual(model.rows.count, 1000, "scrolling past the cached page opens the stream and continues")
+    expectEqual(model.rows.map(\.id), Array(0..<1000), "ids stay contiguous across the cache boundary")
+    // The real risk here is re-serving the first page instead of continuing
+    // past it, which contiguous ids alone would not catch.
+    expectEqual(model.rows[500].cells[idIndex], "500",
+                "the stream resumes after the cached rows rather than repeating them")
+
+    modelCache.clear()
+    model.clear()
+    model.open(.file(smallParquet))
+    await settle(model)
+    expect(!model.servedFromCache, "clearing the cache forces a fresh read")
+    expectEqual(model.rows.count, TableModel.pageSize, "and the fresh read still works")
 }
 
 // MARK: - Scale
@@ -1157,6 +1385,25 @@ if FileManager.default.fileExists(atPath: bigParquet.path) {
     expectEqual(model.sort.map(\.column), ["bucket"], "only the final sort survives")
     expect(model.rows.count > 0, "the surviving sort produced rows")
     print("  superseded re-sort settled in: \(String(format: "%.2f", cancelElapsed))s")
+
+    // The Cancel button, against a query long enough for the word to mean
+    // something. It must stop promptly rather than waiting for a 10M-row sort
+    // to finish into a result nobody asked for.
+    model.clearSort()
+    await settle(model)
+    let stopAt = Date()
+    model.toggleSort(column: "key")
+    model.cancel()
+    let stopElapsed = Date().timeIntervalSince(stopAt)
+    expect(!model.isBusy, "cancelling a 10M-row sort returns immediately")
+    expect(model.wasCancelled, "and says it was stopped rather than that it failed")
+    expect(stopElapsed < 1, "cancel does not block on the running query (took \(String(format: "%.2f", stopElapsed))s)")
+    expectEqual(model.errorMessage, String?.none, "an interrupted query is not reported as an error")
+
+    // And the model still works afterwards.
+    model.reload()
+    await settle(model)
+    expectEqual(model.rows.count, TableModel.pageSize, "the grid recovers after a cancel")
 } else {
     print("\n— Scale: skipped (run `BIG=1 make fixtures` for the 10M-row file)")
 }

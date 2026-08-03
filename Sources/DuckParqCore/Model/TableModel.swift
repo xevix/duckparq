@@ -49,18 +49,44 @@ public final class TableModel {
     public private(set) var totalRowCount: Int?
     public private(set) var isCountingRows = false
 
+    /// When the query now on screen started, while it is still running. The
+    /// status bar renders the elapsed time from this rather than the model
+    /// publishing a tick, so a running query costs no redraws of its own.
+    public private(set) var queryStartedAt: Date?
+    /// How long the last completed load took, kept so the number stays visible
+    /// after the query finishes.
+    public private(set) var lastQueryDuration: TimeInterval?
+    /// The last load ended because the user stopped it, not because it finished.
+    public private(set) var wasCancelled = false
+    /// The rows on screen came from `PreviewCache` rather than a fresh read.
+    public private(set) var servedFromCache = false
+
     private let gridSession: DuckDBSession
     private let probe: Probe
+    private let cache: PreviewCache
 
     private var cursor: QueryCursor?
     /// Bumped on every reload; results from an older generation are discarded.
     private var generation = 0
     private var loadTask: Task<Void, Never>?
     private var countTask: Task<Void, Never>?
+    private var schemaTask: Task<Void, Never>?
 
-    public init(gridSession: DuckDBSession, metaSession: DuckDBSession) {
+    /// The query whose cursor has not been opened yet, because the first page
+    /// came from the cache. Opened if the user scrolls past it.
+    private var deferredQuery: BoundSQL?
+    /// Where to file this result once it has both a page and a count.
+    private var pendingCacheKey: SourceFingerprint?
+    private var loadedSource: DataSource?
+
+    public init(
+        gridSession: DuckDBSession,
+        metaSession: DuckDBSession,
+        cache: PreviewCache = .shared
+    ) {
         self.gridSession = gridSession
         self.probe = Probe(session: metaSession)
+        self.cache = cache
     }
 
     // MARK: - Column metadata
@@ -95,9 +121,29 @@ public final class TableModel {
         return index + 1
     }
 
+    /// Changes with anything that alters the SQL behind the view, so the editor
+    /// can re-seed itself when a filter or sort moves under it.
+    public var viewSignature: String {
+        var parts: [String]
+        switch mode {
+        case .empty: parts = ["empty"]
+        case .source(let source): parts = ["src", source.readPath]
+        case .sql(let text): parts = ["sql", text]
+        }
+        parts += filters.filter { $0.isEnabled && $0.isComplete }.map(\.summary).sorted()
+        parts += sort.map { "\($0.column) \($0.direction.rawValue)" }
+        return parts.joined(separator: "\u{1F}")
+    }
+
     // MARK: - Actions
 
     public func open(_ source: DataSource) {
+        // A different file means the old schema no longer describes the cells,
+        // so it has to go before the new result can borrow column names.
+        if loadedSource != source {
+            columns = []
+            loadedSource = nil
+        }
         mode = .source(source)
         filters = []
         sort = []
@@ -138,6 +184,7 @@ public final class TableModel {
             self.mode = .sql(trimmed)
             self.filters = []
             self.sort = []
+            self.columns = []
             self.reload()
         }
     }
@@ -150,6 +197,14 @@ public final class TableModel {
         sort = []
         errorMessage = nil
         totalRowCount = nil
+        loadedSource = nil
+        deferredQuery = nil
+        pendingCacheKey = nil
+        isLoading = false
+        isLoadingMore = false
+        isCountingRows = false
+        rowsAreStale = false
+        queryStartedAt = nil
         cancelInFlight()
     }
 
@@ -172,13 +227,13 @@ public final class TableModel {
             let key = SortKey(column: column, direction: .ascending)
             sort = additive ? sort + [key] : [key]
         }
-        reload()
+        reload(keepingRows: true)
     }
 
     public func clearSort() {
         guard !sort.isEmpty else { return }
         sort = []
-        reload()
+        reload(keepingRows: true)
     }
 
     public func upsert(filter: Filter) {
@@ -187,19 +242,19 @@ public final class TableModel {
         } else {
             filters.append(filter)
         }
-        reload()
+        reload(keepingRows: true)
     }
 
     public func removeFilter(id: Filter.ID) {
         guard filters.contains(where: { $0.id == id }) else { return }
         filters.removeAll { $0.id == id }
-        reload()
+        reload(keepingRows: true)
     }
 
     public func clearFilters() {
         guard !filters.isEmpty else { return }
         filters = []
-        reload()
+        reload(keepingRows: true)
     }
 
     public func filterAffordance(for column: ColumnInfo) async throws -> FilterAffordance {
@@ -239,11 +294,38 @@ public final class TableModel {
         }
     }
 
+    /// Anything is in flight that the user could reasonably want to stop.
+    public var isBusy: Bool { isLoading || isLoadingMore || isCountingRows }
+
+    /// Stop everything in flight, keeping whatever is already on screen.
+    ///
+    /// This interrupts the query inside DuckDB rather than just abandoning the
+    /// Swift task — otherwise a cancelled sort of a huge file would keep a core
+    /// busy producing a result nobody is going to read.
+    public func cancel() {
+        guard isBusy else { return }
+        generation += 1
+        cancelInFlight()
+        stopTiming()
+        isLoading = false
+        isLoadingMore = false
+        isCountingRows = false
+        wasCancelled = true
+        // Paging deliberately stops here rather than resuming on the next
+        // scroll. Re-opening the stream would re-run the query the user just
+        // stopped, and skip its way back to where they were to do it.
+        deferredQuery = nil
+        pendingCacheKey = nil
+        rowsAreStale = false
+    }
+
     private func cancelInFlight() {
         loadTask?.cancel()
         loadTask = nil
         countTask?.cancel()
         countTask = nil
+        schemaTask?.cancel()
+        schemaTask = nil
         // Stop the query that is actually running rather than letting it finish
         // into a result nobody will read.
         gridSession.interrupt()
@@ -253,37 +335,74 @@ public final class TableModel {
         cursor = nil
     }
 
-    public func reload() {
+    /// Re-run the current query.
+    ///
+    /// `keepingRows` leaves the rows on screen in place until the replacements
+    /// arrive. Clearing them first is what made a header click flash the grid
+    /// empty and then repopulate: re-sorting shows the same rows in a different
+    /// order, so blanking the view says something untrue about the data for as
+    /// long as the query takes. New rows replace the old ones the moment the
+    /// first page lands, and the header still shows the new sort immediately, so
+    /// nothing is misrepresented in the meantime — the status bar says the query
+    /// is running.
+    public func reload(keepingRows: Bool = false) {
         generation += 1
         let generation = self.generation
         cancelInFlight()
 
-        rows = []
+        if !keepingRows { rows = [] }
+        rowsAreStale = keepingRows && !rows.isEmpty
         reachedEnd = false
         hitRowCap = false
         errorMessage = nil
         isLoading = true
         isLoadingMore = false
+        wasCancelled = false
+        servedFromCache = false
+        deferredQuery = nil
+        pendingCacheKey = nil
+        totalRowCount = nil
+        queryStartedAt = Date()
+        lastQueryDuration = nil
 
         guard let query = currentQuery else {
             isLoading = false
+            isCountingRows = false
+            stopTiming()
             return
         }
 
+        isCountingRows = true
         loadTask = Task { [weak self] in
             await self?.performInitialLoad(query: query, generation: generation)
         }
-        refreshRowCount(generation: generation)
     }
 
-    private func performInitialLoad(query: BoundSQL, generation: Int) async {
-        do {
-            if case .source(let source) = mode, columns.isEmpty || !sameSource(source) {
-                columns = try await probe.columns(of: source)
-                loadedSource = source
-            }
-            guard generation == self.generation else { return }
+    /// Rows on screen belong to the previous query and are replaced, not
+    /// appended to, when the next page arrives.
+    private var rowsAreStale = false
 
+    private func performInitialLoad(query: BoundSQL, generation: Int) async {
+        // A cache hit has to be settled before anything is issued, or the work
+        // it is meant to avoid is already underway.
+        if let key = await fingerprintForCaching() {
+            guard generation == self.generation else { return }
+            if let cached = cache.preview(for: key) {
+                apply(cached, query: query, generation: generation)
+                return
+            }
+            pendingCacheKey = key
+        }
+        guard generation == self.generation else { return }
+
+        // Schema, preview and total row count are three independent questions.
+        // They used to be asked in a chain, so a DESCRIBE across a thousand-file
+        // dataset held up rows that DuckDB could already have streamed. Each now
+        // renders the moment it can.
+        startSchemaLoad(generation: generation)
+        startRowCount(generation: generation)
+
+        do {
             let cursor = try await gridSession.openCursor(query.sql, params: query.params)
             guard generation == self.generation else {
                 await cursor.close()
@@ -291,9 +410,10 @@ public final class TableModel {
             }
             self.cursor = cursor
 
-            // In SQL mode there is no DESCRIBE to lean on, so column identity
-            // comes from the result itself. Types are unknown, hence VARCHAR.
-            if case .sql = mode {
+            // Until DESCRIBE lands — and always in SQL mode, where there is no
+            // DESCRIBE to lean on — column identity comes from the result
+            // itself. Types are unknown at that point, hence VARCHAR.
+            if columns.isEmpty {
                 columns = cursor.columnNames.map { ColumnInfo(name: $0, typeName: "VARCHAR") }
             }
 
@@ -304,24 +424,49 @@ public final class TableModel {
             guard generation == self.generation else { return }
             report(error)
         }
-        if generation == self.generation { isLoading = false }
+        guard generation == self.generation else { return }
+        isLoading = false
+        stopTiming()
+        storePreviewIfReady()
     }
 
-    private var loadedSource: DataSource?
+    /// DESCRIBE for the current source, if its schema isn't already known.
+    private func startSchemaLoad(generation: Int) {
+        guard case .source(let source) = mode else { return }
+        if loadedSource == source, !columns.isEmpty { return }
 
-    private func sameSource(_ source: DataSource) -> Bool { loadedSource == source }
+        schemaTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let described = try await self.probe.columns(of: source)
+                guard generation == self.generation, !described.isEmpty else { return }
+                self.columns = described
+                self.loadedSource = source
+                self.storePreviewIfReady()
+            } catch {
+                // The preview may be perfectly fine without types — alignment
+                // and filter widgets degrade, the rows do not. If the file is
+                // genuinely unreadable the cursor reports it.
+            }
+        }
+    }
 
     /// Called by the grid as it approaches the end of the loaded rows.
     public func loadMoreIfNeeded(displayedIndex: Int) {
-        guard !isLoading, !isLoadingMore, !reachedEnd, !hitRowCap, cursor != nil else { return }
+        guard !isLoading, !isLoadingMore, !reachedEnd, !hitRowCap else { return }
+        guard cursor != nil || deferredQuery != nil else { return }
         guard displayedIndex >= rows.count - Self.prefetchDistance else { return }
         loadMore()
     }
 
     public func loadMore() {
-        guard !isLoadingMore, !reachedEnd, let cursor else { return }
+        guard !isLoadingMore, !reachedEnd else { return }
         if rows.count >= Self.loadedRowCap {
             hitRowCap = true
+            return
+        }
+        guard let cursor else {
+            openDeferredCursor()
             return
         }
         isLoadingMore = true
@@ -341,6 +486,55 @@ public final class TableModel {
         }
     }
 
+    /// Open the stream that a cache hit let us skip.
+    ///
+    /// The rows on screen came from memory, so no cursor exists yet. A stream
+    /// always starts at the first row, so the cached page has to be read past
+    /// before appending — one page of work, paid only if the user scrolls.
+    private func openDeferredCursor() {
+        guard let query = deferredQuery else { return }
+        deferredQuery = nil
+        isLoadingMore = true
+        let generation = self.generation
+        let alreadyShown = rows.count
+
+        loadTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let cursor = try await self.gridSession.openCursor(query.sql, params: query.params)
+                guard generation == self.generation else {
+                    await cursor.close()
+                    return
+                }
+                self.cursor = cursor
+
+                var skipped = 0
+                var exhausted = false
+                while skipped < alreadyShown {
+                    let page = try await cursor.fetch(maxRows: min(Self.pageSize, alreadyShown - skipped))
+                    guard generation == self.generation else { return }
+                    guard let page, page.rowCount > 0 else {
+                        exhausted = true
+                        break
+                    }
+                    skipped += page.rowCount
+                }
+
+                if exhausted {
+                    self.reachedEnd = true
+                } else {
+                    let page = try await cursor.fetch(maxRows: Self.pageSize)
+                    guard generation == self.generation else { return }
+                    self.append(page, cursor: cursor)
+                }
+            } catch {
+                guard generation == self.generation else { return }
+                self.report(error)
+            }
+            if generation == self.generation { self.isLoadingMore = false }
+        }
+    }
+
     /// Continue past the loaded-row cap at the user's request.
     public func continuePastCap() {
         guard hitRowCap else { return }
@@ -349,6 +543,12 @@ public final class TableModel {
     }
 
     private func append(_ page: RowPage?, cursor: QueryCursor) {
+        if rowsAreStale {
+            // The first page of the new query displaces the previous result in
+            // one step, so the grid never shows a mixture of the two.
+            rows = []
+            rowsAreStale = false
+        }
         guard let page, page.rowCount > 0 else {
             reachedEnd = true
             return
@@ -376,7 +576,19 @@ public final class TableModel {
             // Expected whenever the user moves on mid-query.
             return
         }
+        // A query that failed replaced nothing, so stale rows would now be
+        // labelled by an error about a result that never arrived.
+        if rowsAreStale {
+            rows = []
+            rowsAreStale = false
+        }
         errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+    }
+
+    private func stopTiming() {
+        guard let started = queryStartedAt else { return }
+        lastQueryDuration = Date().timeIntervalSince(started)
+        queryStartedAt = nil
     }
 
     /// Total matching rows, counted alongside the first page so the status bar
@@ -387,9 +599,9 @@ public final class TableModel {
     /// something derived from the grid's cursor — the whole point is to report
     /// rows that have *not* been fetched. On parquet it is answered largely from
     /// file metadata, so it is cheap even when the file is far too big to load.
-    private func refreshRowCount(generation: Int) {
-        totalRowCount = nil
-
+    /// It runs concurrently with the preview, so a slow count over a large
+    /// dataset never delays the rows.
+    private func startRowCount(generation: Int) {
         let countQuery: BoundSQL
         switch mode {
         case .empty:
@@ -411,6 +623,70 @@ public final class TableModel {
             guard generation == self.generation else { return }
             self.totalRowCount = count
             self.isCountingRows = false
+            if let count, self.rows.count >= count, !self.rowsAreStale { self.reachedEnd = true }
+            self.storePreviewIfReady()
         }
+    }
+
+    // MARK: - Cache
+
+    /// The fingerprint this result may be filed under, or nil when it must not
+    /// be cached at all.
+    ///
+    /// Only a plain file or dataset view qualifies. A filtered, sorted or
+    /// SQL-driven result is deliberately excluded: those are the answers a user
+    /// is actively composing, where serving a remembered one would be
+    /// indistinguishable from a fresh one and wrong in a way they could not see.
+    private func fingerprintForCaching() async -> SourceFingerprint? {
+        guard case .source(let source) = mode, filters.isEmpty, sort.isEmpty else { return nil }
+        return await Task.detached(priority: .userInitiated) {
+            SourceFingerprint.compute(for: source)
+        }.value
+    }
+
+    private func apply(_ cached: CachedPreview, query: BoundSQL, generation: Int) {
+        columns = cached.columns
+        if case .source(let source) = mode { loadedSource = source }
+        rows = cached.rows.enumerated().map { GridRow(id: $0.offset, cells: $0.element) }
+        rowsAreStale = false
+        totalRowCount = cached.totalRowCount
+        isCountingRows = false
+        reachedEnd = cached.reachedEnd
+        isLoading = false
+        servedFromCache = true
+        // Nothing has been queried, so there is no stream. One is opened only if
+        // the user scrolls past what was remembered.
+        deferredQuery = cached.reachedEnd ? nil : query
+        stopTiming()
+    }
+
+    /// File the opening view once it is complete — page, schema and count.
+    private func storePreviewIfReady() {
+        guard let key = pendingCacheKey,
+              !isLoading, !isCountingRows,
+              case .source = mode, filters.isEmpty, sort.isEmpty,
+              errorMessage == nil,
+              !columns.isEmpty, !rows.isEmpty
+        else { return }
+
+        pendingCacheKey = nil
+        let firstPage = rows.prefix(Self.pageSize).map(\.cells)
+        cache.store(
+            CachedPreview(
+                columns: columns,
+                rows: Array(firstPage),
+                totalRowCount: totalRowCount,
+                // `reachedEnd` describes everything loaded so far; it only says
+                // something about the first page when that is all there is.
+                reachedEnd: reachedEnd && rows.count <= Self.pageSize
+            ),
+            for: key
+        )
+    }
+
+    /// Forget every remembered preview and re-read what is on screen.
+    public func clearCache() {
+        cache.clear()
+        if case .source = mode { reload(keepingRows: true) }
     }
 }

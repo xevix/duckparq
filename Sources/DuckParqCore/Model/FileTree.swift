@@ -40,6 +40,10 @@ public enum FileTree {
         /// macOS denied access — Downloads, Desktop and Documents are
         /// TCC-protected, and re-picking the folder in an open panel grants it.
         case permissionDenied
+        /// A hive layout, whose `key=value` sub-directories were withheld
+        /// deliberately. They are partitions of one table, not folders worth
+        /// browsing — see `isHivePartitioned`.
+        case hivePartitioned
         case failed(String)
     }
 
@@ -59,7 +63,15 @@ public enum FileTree {
             let entries = try FileManager.default.contentsOfDirectory(
                 at: url, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]
             )
-            return Listing(nodes: nodes(from: entries, keys: keys), outcome: .ok)
+            // A hive layout is one table. Listing `year=2024/month=01/…` invites
+            // opening a partition as though it were a file of its own, which is
+            // never what you want from a partitioned dataset — so the partitions
+            // are withheld and the folder is offered whole.
+            let hive = containsHivePartitions(entries)
+            return Listing(
+                nodes: nodes(from: entries, keys: keys, includingDirectories: !hive),
+                outcome: hive ? .hivePartitioned : .ok
+            )
         } catch let error as NSError {
             let denied = error.domain == NSCocoaErrorDomain
                 && (error.code == NSFileReadNoPermissionError || error.code == NSFileReadUnknownError)
@@ -74,7 +86,11 @@ public enum FileTree {
         listing(of: url).nodes
     }
 
-    private static func nodes(from entries: [URL], keys: [URLResourceKey]) -> [FileNode] {
+    private static func nodes(
+        from entries: [URL],
+        keys: [URLResourceKey],
+        includingDirectories: Bool = true
+    ) -> [FileNode] {
 
         var nodes: [FileNode] = []
         nodes.reserveCapacity(entries.count)
@@ -82,6 +98,7 @@ public enum FileTree {
             let values = try? entry.resourceValues(forKeys: Set(keys))
             let isDirectory = values?.isDirectory ?? false
             if isDirectory {
+                guard includingDirectories else { continue }
                 nodes.append(FileNode(
                     url: entry,
                     isDirectory: true,
@@ -119,9 +136,38 @@ public enum FileTree {
 
         for entry in entries.prefix(64) {
             if parquetExtensions.contains(entry.pathExtension.lowercased()) { return true }
-            let name = entry.lastPathComponent
-            if name.contains("="),
+            if isHivePartitionName(entry.lastPathComponent),
                (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// A `key=value` directory name — the shape DuckDB's `hive_partitioning`
+    /// reads as a partition column, so it is the shape we treat as one too.
+    ///
+    /// The `=` may not be first: `=2024` names no key, and a file called
+    /// `report=final.parquet` is a file, which is why the caller also checks it
+    /// is a directory.
+    public static func isHivePartitionName(_ name: String) -> Bool {
+        guard let separator = name.firstIndex(of: "=") else { return false }
+        return separator != name.startIndex
+    }
+
+    /// Whether a directory's children are hive partitions rather than folders
+    /// worth browsing.
+    public static func isHivePartitioned(_ url: URL) -> Bool {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
+        ) else { return false }
+        return containsHivePartitions(entries)
+    }
+
+    private static func containsHivePartitions(_ entries: [URL]) -> Bool {
+        for entry in entries.prefix(256) {
+            guard isHivePartitionName(entry.lastPathComponent) else { continue }
+            if (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
                 return true
             }
         }

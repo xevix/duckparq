@@ -41,13 +41,19 @@ struct ContentView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup {
-            Button {
-                app.table.reload()
+            // Click re-runs; the menu holds the rarer, heavier action rather
+            // than spending another toolbar slot on it.
+            Menu {
+                Button("Refresh") { app.table.reload() }
+                Divider()
+                Button("Clear Cache and Reload") { app.clearCache() }
             } label: {
                 Image(systemName: "arrow.clockwise")
+            } primaryAction: {
+                app.table.reload()
             }
             .disabled(app.table.currentQuery == nil)
-            .help("Re-run the current query (⌘R)")
+            .help("Re-run the current query (⌘R). Hold for cache options.")
 
             Button {
                 app.showsExportSheet = true

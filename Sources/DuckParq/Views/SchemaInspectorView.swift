@@ -10,6 +10,10 @@ struct SchemaInspectorView: View {
     @State private var keyValueMetadata: RowBatch?
     @State private var loadError: String?
     @State private var isLoading = false
+    /// Set a second into a load. A dataset of many files takes long enough to
+    /// be worth saying so; a single file almost never does, and a spinner that
+    /// appears and vanishes is just a flash.
+    @State private var showsProgress = false
 
     private var source: DataSource? { app.table.currentSource }
 
@@ -32,7 +36,7 @@ struct SchemaInspectorView: View {
             VStack(alignment: .leading, spacing: 14) {
                 header(source)
 
-                if isLoading {
+                if isLoading && showsProgress {
                     HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
                         Text("Reading metadata…").font(.callout).foregroundStyle(.secondary)
@@ -93,14 +97,16 @@ struct SchemaInspectorView: View {
         if let fileMetadata, fileMetadata.rowCount > 0 {
             Section {
                 VStack(alignment: .leading, spacing: 3) {
-                    metadataRow("Rows", fileMetadata.value(row: 0, named: "num_rows"))
-                    metadataRow("Row groups", fileMetadata.value(row: 0, named: "num_row_groups"))
-                    metadataRow("File size", formattedBytes(fileMetadata.value(row: 0, named: "file_size_bytes")))
+                    // Totals across the whole selection: for a dataset these are
+                    // the sum over every file, computed in DuckDB.
+                    if let files = fileMetadata.value(row: 0, named: "files"), files != "1" {
+                        metadataRow("Files", files)
+                    }
+                    metadataRow("Rows", formattedCount(fileMetadata.value(row: 0, named: "num_rows")))
+                    metadataRow("Row groups", formattedCount(fileMetadata.value(row: 0, named: "num_row_groups")))
+                    metadataRow("Size", formattedBytes(fileMetadata.value(row: 0, named: "file_size_bytes")))
                     metadataRow("Format version", fileMetadata.value(row: 0, named: "format_version"))
                     metadataRow("Created by", fileMetadata.value(row: 0, named: "created_by"))
-                    if fileMetadata.rowCount > 1 {
-                        metadataRow("Files", "\(fileMetadata.rowCount)")
-                    }
                 }
             } header: {
                 sectionHeader("File", subtitle: nil)
@@ -202,6 +208,17 @@ struct SchemaInspectorView: View {
         return ByteCountFormatter.string(fromByteCount: value, countStyle: .file)
     }
 
+    private func formattedCount(_ raw: String?) -> String? {
+        guard let raw, let value = Int(raw) else { return raw }
+        return value.formatted()
+    }
+
+    /// The three metadata queries are independent, so they run at once and each
+    /// section appears as its own answer arrives.
+    ///
+    /// They used to be awaited in a chain, which meant the file summary — the
+    /// cheapest of the three and the one people actually look at — waited behind
+    /// a per-column statistics scan of every row group in the dataset.
     private func load() async {
         guard let source else { return }
         isLoading = true
@@ -210,13 +227,39 @@ struct SchemaInspectorView: View {
         columnMetadata = nil
         keyValueMetadata = nil
 
-        do {
-            fileMetadata = try await app.probe.fileMetadata(of: source)
-            columnMetadata = try await app.probe.columnMetadata(of: source)
-            keyValueMetadata = try await app.probe.keyValueMetadata(of: source)
-        } catch {
-            loadError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        showsProgress = false
+        let delayedSpinner = Task {
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            showsProgress = true
         }
+
+        async let file: Void = loadFileMetadata(source)
+        async let columns: Void = loadColumnMetadata(source)
+        async let keyValues: Void = loadKeyValueMetadata(source)
+        _ = await (file, columns, keyValues)
+
+        delayedSpinner.cancel()
+        showsProgress = false
         isLoading = false
+    }
+
+    private func loadFileMetadata(_ source: DataSource) async {
+        do { fileMetadata = try await app.probe.fileMetadata(of: source) } catch { record(error) }
+    }
+
+    private func loadColumnMetadata(_ source: DataSource) async {
+        do { columnMetadata = try await app.probe.columnMetadata(of: source) } catch { record(error) }
+    }
+
+    private func loadKeyValueMetadata(_ source: DataSource) async {
+        do { keyValueMetadata = try await app.probe.keyValueMetadata(of: source) } catch { record(error) }
+    }
+
+    /// First failure wins. Three concurrent reads of the same broken file would
+    /// otherwise overwrite each other with the same message.
+    private func record(_ error: Error) {
+        guard loadError == nil else { return }
+        loadError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
 }

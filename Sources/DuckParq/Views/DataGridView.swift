@@ -8,12 +8,14 @@ import SwiftUI
 /// things `Table` doesn't offer together: three-state sorting, columns that are
 /// only known at runtime, and paging driven by scroll position.
 ///
-/// Header and rows share **one** horizontal scroll view and **one** array of
-/// column widths, so they cannot drift apart. An earlier version kept the header
-/// outside the scroll view and mirrored the scroll offset onto it; header and
-/// body were then two independent layouts, and the columns did not line up.
-/// Nesting a vertical scroll view inside the horizontal one keeps the header
-/// fixed while rows scroll, without anything needing to be kept in sync by hand.
+/// **One scroll view, both axes.** Header and rows share a single layout and a
+/// single array of column widths, so they cannot drift apart; the header is a
+/// pinned section header, which keeps it fixed vertically while it still scrolls
+/// sideways with the columns it labels. Two earlier arrangements were worse: a
+/// header outside the scroll view with a mirrored offset made header and body
+/// independent layouts that did not line up, and nesting a vertical scroll view
+/// inside a horizontal one put the vertical scrollbar against the last column
+/// instead of against the window.
 struct DataGridView: View {
     @Environment(AppModel.self) private var app
 
@@ -31,17 +33,7 @@ struct DataGridView: View {
             if table.columns.isEmpty && !table.isLoading {
                 emptyState
             } else {
-                let widths = columnWidths
-                ScrollView(.horizontal) {
-                    VStack(alignment: .leading, spacing: 0) {
-                        headerRow(widths: widths)
-                        Divider()
-                        rowsList(widths: widths)
-                    }
-                    // At least as wide as the columns, but filling the viewport
-                    // when they are narrower so row striping spans the window.
-                    .frame(minWidth: widths.reduce(0, +), maxWidth: .infinity, alignment: .leading)
-                }
+                grid
             }
             Divider()
             StatusBar()
@@ -56,6 +48,47 @@ struct DataGridView: View {
             }
         }
         .onCopyCommand { copyPayload() }
+    }
+
+    private var grid: some View {
+        let widths = columnWidths
+        let contentWidth = widths.reduce(0, +)
+        return GeometryReader { proxy in
+            // At least as wide as the columns, and never narrower than the
+            // window. Header and rows are both given this exact width and
+            // `.leading`, so neither one's origin is left to a container's
+            // default alignment. That is what knocked the header out of line
+            // before: a VStack centres its children, so once the pinned header
+            // was proposed the full window width its row of cells sat centred
+            // in it while the data rows stayed left, offset by half the slack.
+            let rowWidth = max(contentWidth, proxy.size.width)
+            ScrollView([.horizontal, .vertical]) {
+                LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
+                    Section {
+                        ForEach(table.rows) { row in
+                            RowView(
+                                row: row,
+                                columns: table.columns,
+                                widths: widths,
+                                width: rowWidth,
+                                isSelected: selectedRow == row.id
+                            )
+                            .onTapGesture { selectedRow = row.id }
+                            .onAppear { table.loadMoreIfNeeded(displayedIndex: row.id) }
+                        }
+                        footer
+                    } header: {
+                        VStack(alignment: .leading, spacing: 0) {
+                            headerRow(widths: widths)
+                            Divider()
+                        }
+                        .frame(width: rowWidth, alignment: .leading)
+                        .background(Color(nsColor: .windowBackgroundColor))
+                    }
+                }
+                .frame(width: rowWidth, alignment: .leading)
+            }
+        }
     }
 
     // MARK: - Header
@@ -77,28 +110,9 @@ struct DataGridView: View {
             }
         }
         .frame(height: 26)
-        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     // MARK: - Rows
-
-    private func rowsList(widths: [CGFloat]) -> some View {
-        ScrollView(.vertical) {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(table.rows) { row in
-                    RowView(
-                        row: row,
-                        columns: table.columns,
-                        widths: widths,
-                        isSelected: selectedRow == row.id
-                    )
-                    .onTapGesture { selectedRow = row.id }
-                    .onAppear { table.loadMoreIfNeeded(displayedIndex: row.id) }
-                }
-                footer
-            }
-        }
-    }
 
     @ViewBuilder
     private var footer: some View {
@@ -279,7 +293,14 @@ private struct RowView: View {
     let row: TableModel.GridRow
     let columns: [ColumnInfo]
     let widths: [CGFloat]
+    /// The full width of a row, which is the columns' total or the window,
+    /// whichever is larger. The same value the header uses.
+    let width: CGFloat
     let isSelected: Bool
+
+    /// Roughly how wide one character of the 11pt monospaced cell font is.
+    /// Used only to decide whether a value can already be read in full.
+    private static let characterWidth: CGFloat = 6.6
 
     var body: some View {
         HStack(spacing: 0) {
@@ -289,13 +310,14 @@ private struct RowView: View {
                 cell(at: index, column: column)
             }
         }
-        .frame(height: 20)
+        .frame(width: width, height: 20, alignment: .leading)
         .background(background)
     }
 
     @ViewBuilder
     private func cell(at index: Int, column: ColumnInfo) -> some View {
         let value = index < row.cells.count ? row.cells[index] : nil
+        let width = index < widths.count ? widths[index] : 100
         Group {
             if let value {
                 Text(value)
@@ -311,11 +333,17 @@ private struct RowView: View {
         .font(.system(size: 11, design: .monospaced))
         .monospacedDigit()
         .padding(.horizontal, 6)
-        .frame(
-            width: index < widths.count ? widths[index] : 100,
-            alignment: column.kind.prefersTrailingAlignment ? .trailing : .leading
-        )
-        .help(value ?? "NULL")
+        .frame(width: width, alignment: column.kind.prefersTrailingAlignment ? .trailing : .leading)
+        // A tooltip is only worth a tracking rectangle when the cell is actually
+        // cut off. Attaching one to every cell put thousands of them in the
+        // window, which AppKit revisits whenever the window becomes key — part
+        // of what made switching back to the app feel slow.
+        .help(isTruncated(value, width: width) ? (value ?? "") : "")
+    }
+
+    private func isTruncated(_ value: String?, width: CGFloat) -> Bool {
+        guard let value else { return false }
+        return CGFloat(value.count) * Self.characterWidth > width - 12
     }
 
     private var background: some View {
@@ -338,20 +366,46 @@ private struct StatusBar: View {
 
     var body: some View {
         let table = app.table
-        HStack(spacing: 10) {
-            if table.isLoading {
+        HStack(spacing: 8) {
+            if table.isBusy {
                 ProgressView().controlSize(.small)
-                Text("Querying…")
+                Text(busyLabel(table))
+                if let started = table.queryStartedAt {
+                    // Driven by the clock rather than by the model publishing a
+                    // tick, so a long query costs no redraws of the grid.
+                    TimelineView(.periodic(from: .now, by: 0.1)) { context in
+                        Text(Self.duration(context.date.timeIntervalSince(started)))
+                            .monospacedDigit()
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                Button("Cancel") { table.cancel() }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                    .help("Stop the running query in DuckDB")
             } else if let error = table.errorMessage {
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
                 Text(error).lineLimit(1).truncationMode(.middle).help(error)
             } else if !table.columns.isEmpty {
                 Text(rowSummary(table))
-                Text("·").foregroundStyle(.tertiary)
+                separator
                 Text("\(table.columns.count) columns")
                 if !table.sort.isEmpty {
-                    Text("·").foregroundStyle(.tertiary)
+                    separator
                     Text(sortSummary(table))
+                }
+                if table.wasCancelled {
+                    separator
+                    Text("cancelled").foregroundStyle(.orange)
+                } else if table.servedFromCache {
+                    separator
+                    Text("cached")
+                        .help("Shown from the last read of this file — it has not changed since. Use Clear Cache to force a re-read.")
+                } else if let duration = table.lastQueryDuration {
+                    separator
+                    Text(Self.duration(duration))
+                        .monospacedDigit()
+                        .help("How long the query took to return its first page")
                 }
             }
             Spacer()
@@ -364,13 +418,23 @@ private struct StatusBar: View {
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
+    private var separator: some View {
+        Text("·").foregroundStyle(.tertiary)
+    }
+
+    private func busyLabel(_ table: TableModel) -> String {
+        if table.isLoading { return "Querying…" }
+        if table.isLoadingMore { return "Loading more rows…" }
+        return "Counting rows…"
+    }
+
     /// Always reports the total, not just what has been fetched — the grid only
     /// ever holds a preview, so "500 rows" alone would misrepresent the file.
     private func rowSummary(_ table: TableModel) -> String {
         let loaded = table.rows.count.formatted()
         guard let total = table.totalRowCount else {
             // The count is still running, or the statement has no row count.
-            return table.isCountingRows ? "\(loaded) rows loaded · counting…" : "\(loaded) rows loaded"
+            return "\(loaded) rows loaded"
         }
         if table.rows.count >= total {
             return "\(total.formatted()) rows"
@@ -381,5 +445,13 @@ private struct StatusBar: View {
     private func sortSummary(_ table: TableModel) -> String {
         let parts = table.sort.map { "\($0.column) \($0.direction == .ascending ? "↑" : "↓")" }
         return "sorted by " + parts.joined(separator: ", ")
+    }
+
+    /// Sub-second queries are the normal case here, so the short end gets the
+    /// precision and anything slow enough to notice gets rounded.
+    static func duration(_ seconds: TimeInterval) -> String {
+        if seconds < 10 { return String(format: "%.2fs", seconds) }
+        if seconds < 60 { return String(format: "%.1fs", seconds) }
+        return String(format: "%dm %02ds", Int(seconds) / 60, Int(seconds) % 60)
     }
 }
