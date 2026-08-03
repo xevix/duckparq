@@ -312,20 +312,6 @@ public enum SQLBuilder {
         return BoundSQL(sql: "SELECT count(*) AS row_count FROM (\(trimmed))", params: [])
     }
 
-    /// A column's distinct values, bounded to `maxDistinct + 1`.
-    ///
-    /// `SELECT DISTINCT` rather than a `GROUP BY` with counts: the caller needs
-    /// the values and how many there are, nothing else. The counts it used to
-    /// compute were aggregated over the whole input and then discarded, since
-    /// the values get sorted alphabetically for display anyway.
-    ///
-    /// `sampleRows` reads only the head of the source. That is **not** a way to
-    /// approximate the answer — a head sample is badly biased, and on a column
-    /// whose early rows are all NULL it reports one value where the column has
-    /// twenty. It is only ever used to *rule a column out*: more than
-    /// `maxDistinct` values in any subset proves more than `maxDistinct` values
-    /// overall, so a bounded read can reject a column but can never wrongly
-    /// admit one. Pass nil to ask the real question.
     /// A column's distinct values with how many rows carry each, bounded to
     /// `maxDistinct + 1`.
     ///
@@ -336,7 +322,7 @@ public enum SQLBuilder {
     public static func valueCounts(
         source: DataSource,
         column: ColumnInfo,
-        maxDistinct: Int = 50
+        maxDistinct: Int = Probe.defaultMaxDistinct
     ) -> BoundSQL {
         let reference = quote(column.name)
         let sql = """
@@ -347,11 +333,23 @@ public enum SQLBuilder {
         return BoundSQL(sql: sql, params: [source.readPath])
     }
 
+    /// A column's distinct values, bounded to `maxDistinct + 1`.
+    ///
+    /// `SELECT DISTINCT` rather than a `GROUP BY` with counts: this one is only
+    /// ever asked how *many* values there are, so there is nothing to count.
+    ///
+    /// `sampleRows` reads only the head of the source. That is **not** a way to
+    /// approximate the answer — a head sample is badly biased, and on a column
+    /// whose early rows are all NULL it reports one value where the column has
+    /// twenty. It is only ever used to *rule a column out*: more than
+    /// `maxDistinct` values in any subset proves more than `maxDistinct` values
+    /// overall, so a bounded read can reject a column but can never wrongly
+    /// admit one. Pass nil to ask the real question.
     public static func distinctValues(
         source: DataSource,
         column: ColumnInfo,
         sampleRows: Int? = nil,
-        maxDistinct: Int = 50
+        maxDistinct: Int = Probe.defaultMaxDistinct
     ) -> BoundSQL {
         let reference = quote(column.name)
         let from: String

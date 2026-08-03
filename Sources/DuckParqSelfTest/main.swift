@@ -1114,6 +1114,30 @@ do {
     expectEqual(try await probe.filterAffordance(for: idColumn, in: .file(smallParquet)), .comparison,
                 "a column with a thousand values gets comparison operators instead")
 
+    // The cap itself, from both sides. A boundary this arbitrary is exactly the
+    // kind that drifts by one between the SQL `LIMIT` and the Swift comparison.
+    expectEqual(Probe.defaultMaxDistinct, 500, "checkboxes are offered up to five hundred values")
+    let boundary = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("duckparq-boundary-\(UUID().uuidString).parquet")
+    defer { try? FileManager.default.removeItem(at: boundary) }
+    try await session.execute("""
+        COPY (
+            SELECT (i % 500)::VARCHAR AS at_cap, (i % 501)::VARCHAR AS past_cap
+            FROM range(20000) t(i)
+        ) TO '\(boundary.path)' (FORMAT parquet)
+        """)
+    if case .dropdown(let values, let nullCount) = try await probe.filterAffordance(
+        for: ColumnInfo(name: "at_cap", typeName: "VARCHAR"), in: .file(boundary)) {
+        expectEqual(values.count, 500, "a column with exactly the cap still gets a list")
+        expectEqual(nullCount, 0, "and no NULLs to account for")
+        expectEqual(values.map(\.count).reduce(0, +), 20000, "with counts covering every row")
+    } else {
+        expect(false, "500 distinct values is at the cap, not past it")
+    }
+    expectEqual(try await probe.filterAffordance(
+        for: ColumnInfo(name: "past_cap", typeName: "VARCHAR"), in: .file(boundary)),
+        .comparison, "one value past the cap falls back to comparison operators")
+
     // The case that made this wrong: a low-cardinality column whose leading
     // rows are all NULL. Reading the head and showing what it found reported an
     // empty list — a caveat where the answer should have been. Real parquet is

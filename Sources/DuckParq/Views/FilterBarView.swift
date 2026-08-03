@@ -114,6 +114,7 @@ struct FilterEditor: View {
 
     @State private var selectedValues: Set<String> = []
     @State private var includeNull = false
+    @State private var search = ""
     @State private var op: FilterOperator = .equal
     @State private var argument = ""
     @State private var secondArgument = ""
@@ -207,23 +208,55 @@ struct FilterEditor: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// Above this many choices the list gets a search field. Scrolling five
+    /// hundred station codes to find one is not picking from a list.
+    private static let searchableChoiceLimit = 30
+
+    private func matches(_ value: String) -> Bool {
+        search.isEmpty || value.localizedCaseInsensitiveContains(search)
+    }
+
     @ViewBuilder
     private func dropdownControls(values: [DistinctValue], nullCount: Int) -> some View {
         Text("Show rows where \(column.name) is any of:")
             .font(.callout)
             .foregroundStyle(.secondary)
 
+        let choiceCount = values.count + (nullCount > 0 ? 1 : 0)
+        if choiceCount > Self.searchableChoiceLimit {
+            TextField("Search \(choiceCount.formatted()) values", text: $search)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11))
+        }
+
+        // Values already ticked stay visible while searching. Hiding them would
+        // let a search leave selections in place that the list no longer shows,
+        // which reads as the filter having lost them.
+        let shown = values.filter { matches($0.value) || selectedValues.contains($0.value) }
+        let showsNull = nullCount > 0 && (matches("NULL") || includeNull)
+
         // A `ScrollView` has no height of its own — it takes what it is offered,
         // and inside a popover sized to its content that is nothing, so the list
         // rendered as a zero-height gap between the heading and the link below
         // it. A short list is laid out directly; only a long one is scrolled,
         // and then with an explicit height rather than a hopeful maximum.
-        let choiceCount = values.count + (nullCount > 0 ? 1 : 0)
-        if choiceCount <= Self.inlineChoiceLimit {
-            VStack(alignment: .leading, spacing: 3) { choices(values, nullCount: nullCount) }
+        let shownCount = shown.count + (showsNull ? 1 : 0)
+        if shownCount <= Self.inlineChoiceLimit {
+            VStack(alignment: .leading, spacing: 3) {
+                choices(shown, nullCount: showsNull ? nullCount : 0)
+                if shownCount == 0 {
+                    Text("No values match “\(search)”")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
         } else {
             ScrollView {
-                VStack(alignment: .leading, spacing: 3) { choices(values, nullCount: nullCount) }
+                // Lazy, because five hundred rows is a plausible list now and
+                // only a dozen of them are ever on screen.
+                LazyVStack(alignment: .leading, spacing: 3) {
+                    choices(shown, nullCount: showsNull ? nullCount : 0)
+                }
             }
             .frame(height: 220)
         }

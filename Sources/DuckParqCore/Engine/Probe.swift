@@ -26,6 +26,17 @@ public enum FilterAffordance: Sendable, Equatable {
 /// Schema, counts and cardinality lookups. These run on their own session so a
 /// slow grid query never delays a schema panel, and vice versa.
 public struct Probe: Sendable {
+    /// How many distinct values a column may have and still be picked from a
+    /// list rather than typed against.
+    ///
+    /// The ceiling is about what a person can usefully scan, not about what the
+    /// query costs: five hundred station codes or airport identifiers are still
+    /// a set you pick from, and the alternative is typing one exactly. The
+    /// probe's cost barely moves — the hash table is five hundred groups
+    /// instead of fifty — so the screening read is what keeps genuinely
+    /// high-cardinality columns from ever reaching the exact question.
+    public static let defaultMaxDistinct = 500
+
     private let session: DuckDBSession
 
     public init(session: DuckDBSession) {
@@ -80,7 +91,7 @@ public struct Probe: Sendable {
     public func filterAffordance(
         for column: ColumnInfo,
         in source: DataSource,
-        maxDistinct: Int = 50,
+        maxDistinct: Int = Probe.defaultMaxDistinct,
         screenRows: Int = 200_000
     ) async throws -> FilterAffordance {
         guard column.kind != .nested, column.kind != .binary else { return .comparison }

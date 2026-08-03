@@ -213,8 +213,8 @@ actually has**, asked *when the popover opens* — probing every column on file
 select would mean a scan per column, which is what this app exists to avoid.
 
 Two queries, in cost order, and the answer is exact either way. First a bounded
-read of the head: more than 50 distinct values in *any* subset proves more than
-50 in the column, so this can rule a column out cheaply, and can never wrongly
+read of the head: more than 500 distinct values in *any* subset proves more than
+500 in the column, so this can rule a column out cheaply, and can never wrongly
 rule one in. Whatever survives gets the real question — `SELECT DISTINCT` over
 the whole column. `DISTINCT` is a blocking hash aggregate, so it does read the
 column; it is only ever reached for columns that look enumerable, where the hash
@@ -222,6 +222,12 @@ table stays small and parquet's dictionary encoding makes the scan cheap. Asking
 for one more value than the cap is what separates "too many to list" from
 "exactly the cap". The result is cached against the source's fingerprint, so a
 popover is answered once per file version.
+
+The cap is 500, which is about what a person can scan rather than what the query
+costs — five hundred station codes are still a set you pick from, and the
+alternative is typing one exactly. Past 30 values the list gets a search field,
+and values already ticked stay visible while searching, so a search can never
+quietly hide a selection the filter is still applying.
 
 Each value is listed with how many rows carry it, NULL included. That is free:
 `DISTINCT` *is* a group-by, so DuckDB builds the same hash table either way and
