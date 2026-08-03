@@ -1148,6 +1148,45 @@ do {
     expectEqual(try await probe.filterAffordance(for: ColumnInfo(name: "id", typeName: "BIGINT"),
                                                  in: .file(sparse)),
                 .comparison, "a column with 420,000 values is still rejected cheaply")
+
+    // The same shape on the path a real dataset takes: many files, read through
+    // hive_partitioning and union_by_name rather than as one file. The early
+    // partitions hold nothing but NULL, exactly as a year-partitioned archive
+    // does for a flag column that older records never carried.
+    let partitioned = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("duckparq-partitioned-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: partitioned) }
+    try await session.execute("""
+        COPY (
+            SELECT i AS id,
+                   1750 + (i / 60000)::INTEGER AS year,
+                   CASE WHEN i < 300000 THEN NULL
+                        ELSE ['T', 'B', 'D', 'H'][(i % 4) + 1] END AS m_flag
+            FROM range(420000) t(i)
+        ) TO '\(partitioned.path)' (FORMAT parquet, PARTITION_BY (year))
+        """)
+
+    let dataset = DataSource.dataset(partitioned)
+    let flagInDataset = ColumnInfo(name: "m_flag", typeName: "VARCHAR")
+    if case .dropdown(let values, let hasNull) =
+        try await probe.filterAffordance(for: flagInDataset, in: dataset) {
+        expectEqual(values, ["B", "D", "H", "T"],
+                    "a sparse flag column across many partitions lists all its values")
+        expect(hasNull, "including that most of the archive has none")
+    } else {
+        expect(false, "a four-value column in a hive dataset gets a dropdown")
+    }
+
+    // A dropdown must never be empty — an empty list is indistinguishable from
+    // a broken popover, which is what this looked like on screen.
+    let empty = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("duckparq-empty-\(UUID().uuidString).parquet")
+    defer { try? FileManager.default.removeItem(at: empty) }
+    try await session.execute(
+        "COPY (SELECT NULL::VARCHAR AS flag WHERE false) TO '\(empty.path)' (FORMAT parquet)")
+    expectEqual(try await probe.filterAffordance(for: ColumnInfo(name: "flag", typeName: "VARCHAR"),
+                                                 in: .file(empty)),
+                .comparison, "a column with no values at all offers comparison, not an empty list")
 }
 
 // MARK: - Preview cache

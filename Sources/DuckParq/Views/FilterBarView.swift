@@ -163,28 +163,45 @@ struct FilterEditor: View {
 
     // MARK: - Controls
 
+    /// Above this many choices the list scrolls; at or below it, it is drawn in
+    /// full. Twelve rows is about as tall as a popover should get on its own.
+    private static let inlineChoiceLimit = 12
+
+    @ViewBuilder
+    private func choices(_ values: [String], hasNull: Bool) -> some View {
+        ForEach(values, id: \.self) { value in
+            Toggle(isOn: binding(for: value)) {
+                Text(value.isEmpty ? "(empty)" : value)
+                    .lineLimit(1)
+                    .font(.system(size: 11, design: .monospaced))
+            }
+            .toggleStyle(.checkbox)
+        }
+        if hasNull {
+            Toggle("NULL", isOn: $includeNull).toggleStyle(.checkbox).italic()
+        }
+    }
+
     @ViewBuilder
     private func dropdownControls(values: [String], hasNull: Bool) -> some View {
         Text("Show rows where \(column.name) is any of:")
             .font(.callout)
             .foregroundStyle(.secondary)
 
-        ScrollView {
-            VStack(alignment: .leading, spacing: 3) {
-                ForEach(values, id: \.self) { value in
-                    Toggle(isOn: binding(for: value)) {
-                        Text(value.isEmpty ? "(empty)" : value)
-                            .lineLimit(1)
-                            .font(.system(size: 11, design: .monospaced))
-                    }
-                    .toggleStyle(.checkbox)
-                }
-                if hasNull {
-                    Toggle("NULL", isOn: $includeNull).toggleStyle(.checkbox).italic()
-                }
+        // A `ScrollView` has no height of its own — it takes what it is offered,
+        // and inside a popover sized to its content that is nothing, so the list
+        // rendered as a zero-height gap between the heading and the link below
+        // it. A short list is laid out directly; only a long one is scrolled,
+        // and then with an explicit height rather than a hopeful maximum.
+        let choiceCount = values.count + (hasNull ? 1 : 0)
+        if choiceCount <= Self.inlineChoiceLimit {
+            VStack(alignment: .leading, spacing: 3) { choices(values, hasNull: hasNull) }
+        } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 3) { choices(values, hasNull: hasNull) }
             }
+            .frame(height: 220)
         }
-        .frame(maxHeight: 220)
 
         // No caveat: these are the column's distinct values, all of them.
 

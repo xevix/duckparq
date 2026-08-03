@@ -98,6 +98,10 @@ public struct Probe: Sendable {
                 hasNull = true
             }
         }
+        // Nothing to choose from is not a dropdown. A column with no values at
+        // all is an empty source, and offering an empty list would look exactly
+        // like a broken one.
+        guard !values.isEmpty || hasNull else { return .comparison }
         return .dropdown(values: values.sorted(), hasNull: hasNull)
     }
 
