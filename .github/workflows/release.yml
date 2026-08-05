@@ -1,0 +1,100 @@
+name: Release
+
+# Push a tag to cut a release:
+#
+#     git tag -a v1.0.0 -m "…" && git push origin v1.0.0
+#
+# workflow_dispatch is here to re-run one that failed part way; pick the tag
+# as the ref in the Actions tab. Either way the job refuses to run on anything
+# that is not a tag, so a release can never be cut from a branch by accident.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # to create the release and upload its asset
+
+# Never cancel a release mid-flight: a half-created release is worse than a
+# duplicate run finishing.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish
+    if: github.ref_type == 'tag'
+    # Standard runner, which is free on public repositories with no minute cap.
+    # The -xlarge labels are billed even on public repos — do not "upgrade".
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/build-app
+        id: build
+        with:
+          zip-name: DuckParq-${{ github.ref_name }}-macos-arm64.zip
+
+      # The quarantine note is the difference between a download that works and
+      # one that looks broken, so it goes above the generated changelog rather
+      # than in a linked file nobody opens.
+      - name: Write the release notes preamble
+        run: |
+          cat > "$RUNNER_TEMP/notes.md" <<'NOTES'
+          ## Install
+
+          Download the zip below, unzip it, and move `DuckParq.app` to
+          `/Applications`.
+
+          The app is **ad-hoc signed** — not Developer ID signed, not notarised
+          — so macOS quarantines it as a download and it will refuse to open on
+          a first double-click. Clear the flag once:
+
+          ```bash
+          xattr -dr com.apple.quarantine /Applications/DuckParq.app
+          ```
+
+          Or build it yourself, which is quarantined by nothing:
+
+          ```bash
+          make run
+          ```
+
+          Requires macOS 15 or later on Apple silicon. DuckDB is linked
+          statically, so the app has no external dependencies — `otool -L` on
+          the executable shows no `libduckdb`, and CI asserts that on every
+          build.
+          NOTES
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+
+          # A hyphen in the tag is the semver spelling of a pre-release —
+          # v1.1.0-rc.1 — and should not become the "Latest" download.
+          flags=()
+          if [[ "$tag" == *-* ]]; then
+            flags+=(--prerelease)
+            echo "$tag looks like a pre-release"
+          fi
+
+          # ${flags[@]+"${flags[@]}"} rather than "${flags[@]}": the runners
+          # have bash 3.2, where expanding an empty array under `set -u` is an
+          # unbound-variable error — which is every release that is not a
+          # pre-release.
+          gh release create "$tag" \
+            "${{ steps.build.outputs.zip-path }}#DuckParq.app (macOS, Apple silicon)" \
+            --title "$tag" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --generate-notes \
+            --verify-tag \
+            ${flags[@]+"${flags[@]}"}
+
+          echo "released $tag" >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$tag" --json url --jq .url >> "$GITHUB_STEP_SUMMARY"

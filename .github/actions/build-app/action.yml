@@ -1,0 +1,125 @@
+name: Build DuckParq.app
+description: >
+  Fetch and verify DuckDB, run the suite, build the bundle, check the three
+  things only a linked product can be checked for, and zip it.
+
+# A composite action rather than a reusable workflow: the steps run inside the
+# caller's job, so the release job has the zip on disk and needs no artifact
+# round trip to get at it.
+
+inputs:
+  big:
+    description: "Generate the 10M-row fixture and run the scale section"
+    default: "false"
+  zip-name:
+    description: "Filename for the packaged bundle"
+    default: DuckParq.zip
+
+outputs:
+  zip-path:
+    description: "Absolute path to the packaged bundle"
+    value: ${{ steps.package.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Report the toolchain
+      shell: bash
+      run: |
+        sw_vers
+        swift --version
+
+    # Pinned to whatever scripts/fetch-duckdb.sh vendors, so the fixtures are
+    # written by the same DuckDB that reads them. Reading the version out of
+    # the script keeps one pin rather than two that can drift apart.
+    - name: Install the duckdb CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        version="$(sed -n 's/^DUCKDB_VERSION="\(.*\)"$/\1/p' scripts/fetch-duckdb.sh)"
+        if [[ -z "$version" ]]; then
+          echo "could not read DUCKDB_VERSION from scripts/fetch-duckdb.sh" >&2
+          exit 1
+        fi
+        echo "duckdb CLI $version (matching the vendored libraries)"
+        curl -fL --retry 3 -o "$RUNNER_TEMP/duckdb_cli.zip" \
+          "https://github.com/duckdb/duckdb/releases/download/${version}/duckdb_cli-osx-arm64.zip"
+        mkdir -p "$RUNNER_TEMP/bin"
+        unzip -q -o "$RUNNER_TEMP/duckdb_cli.zip" -d "$RUNNER_TEMP/bin"
+        chmod +x "$RUNNER_TEMP/bin/duckdb"
+        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+    - name: duckdb CLI version
+      shell: bash
+      run: duckdb --version
+
+    # Before `make smoke`, which builds the ordinary fixtures itself: the
+    # fixtures target keys off small.parquet existing, so asking for the big
+    # one afterwards would find the target already satisfied and do nothing.
+    - name: Generate the 10M-row fixture
+      if: inputs.big == 'true'
+      shell: bash
+      run: BIG=1 make fixtures
+
+    # Vendor/ is deliberately not cached. The download is 25 MB and takes a
+    # second or two, and fetch-duckdb.sh short-circuits on its stamp file --
+    # so a restored cache would skip the SHA256 check entirely. Fetching every
+    # run keeps the checksum an assertion rather than a comment, and means CI
+    # notices if the pinned release asset ever moves.
+    - name: Smoke test the static link
+      shell: bash
+      run: make smoke
+
+    - name: Run the self-test suite
+      shell: bash
+      run: make test
+
+    - name: Build DuckParq.app
+      shell: bash
+      run: make app
+
+    # The three properties that make the bundle worth shipping, none of which
+    # the suite can check because they are about the linked product rather
+    # than the code.
+    - name: Verify the bundle
+      shell: bash
+      run: |
+        set -euo pipefail
+        app=.build/DuckParq.app
+        exe="$app/Contents/MacOS/DuckParq"
+
+        echo "::group::otool -L"
+        otool -L "$exe"
+        echo "::endgroup::"
+
+        if otool -L "$exe" | grep -q duckdb; then
+          echo "FAIL: the executable links DuckDB dynamically; it must be static" >&2
+          exit 1
+        fi
+        echo "ok: no external duckdb references"
+
+        codesign --verify --deep --strict --verbose=2 "$app"
+        echo "ok: ad-hoc signature verifies"
+
+        for f in LICENSE THIRD_PARTY_LICENSES.md; do
+          if [[ ! -f "$app/Contents/Resources/$f" ]]; then
+            echo "FAIL: $f missing from the bundle -- notices must ship with the binary" >&2
+            exit 1
+          fi
+        done
+        echo "ok: licence notices are in the bundle"
+
+        /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$app/Contents/Info.plist"
+
+    # ditto rather than handing the bundle straight to upload-artifact, which
+    # drops the executable bit and breaks the code signature. ditto is also
+    # what preserves the signature across the round trip.
+    - name: Package the app
+      id: package
+      shell: bash
+      run: |
+        set -euo pipefail
+        path="$RUNNER_TEMP/${{ inputs.zip-name }}"
+        ditto -c -k --keepParent --sequesterRsrc .build/DuckParq.app "$path"
+        ls -lh "$path"
+        echo "path=$path" >> "$GITHUB_OUTPUT"
