@@ -16,6 +16,25 @@ import SwiftUI
 /// independent layouts that did not line up, and nesting a vertical scroll view
 /// inside a horizontal one put the vertical scrollbar against the last column
 /// instead of against the window.
+/// Layout numbers that cannot be asked about from outside the app.
+///
+/// `DUCKPARQ_TRACE=1` prints one line per distinct grid geometry. A scrollbar
+/// for content that fits is not diagnosable from a screenshot — the interesting
+/// quantity is the few points between the viewport and the content, and this
+/// prints them rather than inferring them from the width of a thumb.
+enum GridTrace {
+    static let isEnabled = ProcessInfo.processInfo.environment["DUCKPARQ_TRACE"] != nil
+    nonisolated(unsafe) private static var last = ""
+
+    static func log(_ line: @autoclosure () -> String) {
+        guard isEnabled else { return }
+        let text = line()
+        guard text != last else { return }
+        last = text
+        FileHandle.standardError.write(Data("[grid] \(text)\n".utf8))
+    }
+}
+
 struct DataGridView: View {
     @Environment(AppModel.self) private var app
 
@@ -96,6 +115,13 @@ struct DataGridView: View {
                 + Self.chromeHeight > proxy.size.height
             let viewport = proxy.size.width - (scrolls ? verticalScrollerInset : 0)
             let rowWidth = max(contentWidth, viewport)
+            let _ = GridTrace.log("""
+                frame \(proxy.size.width.rounded()) viewport \(viewport.rounded()) \
+                content \(contentWidth.rounded()) row \(rowWidth.rounded()) \
+                inset \(verticalScrollerInset) \
+                scrollers \(NSScroller.preferredScrollerStyle == .legacy ? "legacy" : "overlay") \
+                columns \(widths.count)
+                """)
             ScrollView([.horizontal, .vertical]) {
                 LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
                     Section {
@@ -128,7 +154,12 @@ struct DataGridView: View {
             // rather than switching the axis set, which would rebuild the scroll
             // view and drop the scroll position every time a resize crossed the
             // point where the columns stop fitting.
-            .scrollIndicators(contentWidth > viewport ? .automatic : .hidden, axes: .horizontal)
+            //
+            // `.never`, not `.hidden`: `.hidden` is a preference the system is
+            // free to overrule, and it does exactly that for the always-visible
+            // scrollers this app draws — which is why hiding it the first time
+            // changed nothing on screen. `.never` is the one that means never.
+            .scrollIndicators(contentWidth > viewport ? .automatic : .never, axes: .horizontal)
         }
     }
 
