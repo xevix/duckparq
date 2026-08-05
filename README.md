@@ -187,6 +187,13 @@ and `DUCKPARQ_AUTOSCROLL=<points>` scrolls the grid on the same timer so paging
 can be watched frame by frame. They exist because every layout defect this grid
 has had was invisible to the tests and obvious in a picture.
 
+The rows scroll view declares `.defaultScrollAnchor(.topLeading)`. Rows arrive
+after the scroll view exists, so its content goes from zero-height to a whole
+page in one step, and with no anchor declared it came to rest in the middle of
+that new content — opening a file put you at row 250 of 500, halfway down a
+dataset you had not scrolled. The anchor also keeps the view still when a later
+page is appended below.
+
 The header's mirrored offset is clamped to what the rows can actually scroll.
 `contentOffset.x` drifts from `-leadingInset` toward zero as the grid scrolls
 vertically, so the raw sum crept up to a sidebar's width and slid the header left

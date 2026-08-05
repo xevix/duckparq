@@ -172,6 +172,13 @@ struct DataGridView: View {
                     }
                     .frame(width: rowWidth, alignment: .leading)
                 }
+                // Rows arrive after the scroll view exists, so its content goes
+                // from zero-height to the whole first page in one step. With no
+                // anchor declared it settled in the middle of that new content —
+                // opening a file put you at row 250 of 500, halfway down a
+                // dataset you had not scrolled. Anchoring to the top also keeps
+                // the view still when a later page is appended below.
+                .defaultScrollAnchor(.topLeading)
                 // `contentOffset.x` is measured from the *inset* origin, and
                 // this scroll view carries a leading inset the width of the
                 // sidebar — NavigationSplitView insets its detail content so it
@@ -196,12 +203,13 @@ struct DataGridView: View {
                     let scrollable = max(geometry.contentSize.width - geometry.containerSize.width, 0)
                     let clamped = min(max(raw, 0), scrollable)
                     GridTrace.log("""
-                        scroll offset \(geometry.contentOffset.x) \
-                        insets \(geometry.contentInsets.leading) \
-                        raw \(raw.rounded()) scrollable \(scrollable.rounded()) \
-                        clamped \(clamped.rounded()) \
-                        content \(geometry.contentSize.width.rounded()) \
-                        container \(geometry.containerSize.width.rounded())
+                        scroll x \(geometry.contentOffset.x) inset \(geometry.contentInsets.leading) \
+                        raw \(raw.rounded()) clamped \(clamped.rounded()) \
+                        | y \(geometry.contentOffset.y.rounded()) \
+                        topInset \(geometry.contentInsets.top) \
+                        contentH \(geometry.contentSize.height.rounded()) \
+                        containerH \(geometry.containerSize.height.rounded()) \
+                        rows \(table.rows.count)
                         """)
                     return clamped
                 } action: { _, x in
