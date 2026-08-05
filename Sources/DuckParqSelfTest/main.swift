@@ -740,8 +740,13 @@ do {
         for token in tokens {
             for offset in token.location..<token.end { covered[offset] = true }
         }
+        // Named rather than four inline literals: untyped integer literals in a
+        // chain of `||` make the solver try every integer type against every
+        // comparison, which Swift 6.1 gives up on. A typed Set is one concrete
+        // call, and says what the numbers are.
+        let blank: Set<UInt16> = [0x20, 0x09, 0x0A, 0x0D]  // space, tab, LF, CR
         let gapsAreBlank = zip(units, covered).allSatisfy { unit, isCovered in
-            isCovered || unit == 0x20 || unit == 0x09 || unit == 0x0A || unit == 0x0D
+            isCovered || blank.contains(unit)
         }
         expect(gapsAreBlank, "only whitespace falls between tokens: \(sample.prefix(40))")
     }
