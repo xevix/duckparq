@@ -15,6 +15,13 @@ Both need the `duckdb` CLI for fixtures (`brew install duckdb`). If you touched
 anything about grid geometry, `BIG=1 make fixtures && make test` adds the scale
 section on a 10M-row file.
 
+CI runs the same two commands on every pull request, then builds the `.app` and
+checks the things the suite cannot see: that the executable links no DuckDB
+dynamically, that the ad-hoc signature verifies, and that the licence notices
+made it into the bundle. It attaches the built app to the run as an artifact.
+Run the scale section there with **Run workflow** on the Actions tab, which
+takes a flag for the 10M-row fixture.
+
 ## What the code expects of a change
 
 **Queries go to DuckDB.** No client-side sorting, filtering or type formatting.

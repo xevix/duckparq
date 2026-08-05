@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      big:
+        description: "Also generate the 10M-row fixture and run the scale section"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# A newer push to the same branch makes an in-flight run redundant. main is
+# exempt: those runs produce the artifact people download.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    name: Build and test
+    # macos-14 and later are Apple silicon, which is the only architecture the
+    # vendored DuckDB bundle exists for. 15 also matches the deployment target.
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report the toolchain
+        run: |
+          sw_vers
+          swift --version
+
+      # Pinned to whatever scripts/fetch-duckdb.sh vendors, so the fixtures are
+      # written by the same DuckDB that reads them. Reading the version out of
+      # the script keeps one pin rather than two that can drift apart.
+      - name: Install the duckdb CLI
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^DUCKDB_VERSION="\(.*\)"$/\1/p' scripts/fetch-duckdb.sh)"
+          if [[ -z "$version" ]]; then
+            echo "could not read DUCKDB_VERSION from scripts/fetch-duckdb.sh" >&2
+            exit 1
+          fi
+          echo "duckdb CLI $version (matching the vendored libraries)"
+          curl -fL --retry 3 -o "$RUNNER_TEMP/duckdb_cli.zip" \
+            "https://github.com/duckdb/duckdb/releases/download/${version}/duckdb_cli-osx-arm64.zip"
+          mkdir -p "$RUNNER_TEMP/bin"
+          unzip -q -o "$RUNNER_TEMP/duckdb_cli.zip" -d "$RUNNER_TEMP/bin"
+          chmod +x "$RUNNER_TEMP/bin/duckdb"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: duckdb CLI version
+        run: duckdb --version
+
+      # Before `make smoke`, which builds the ordinary fixtures itself: the
+      # fixtures target keys off small.parquet existing, so asking for the big
+      # one afterwards would find the target already satisfied and do nothing.
+      - name: Generate the 10M-row fixture
+        if: inputs.big
+        run: BIG=1 make fixtures
+
+      # Vendor/ is deliberately not cached. The download is 25 MB and takes a
+      # second or two, and fetch-duckdb.sh short-circuits on its stamp file --
+      # so a restored cache would skip the SHA256 check entirely. Fetching every
+      # run keeps the checksum an assertion rather than a comment, and means CI
+      # notices if the pinned release asset ever moves.
+      - name: Smoke test the static link
+        run: make smoke
+
+      - name: Run the self-test suite
+        run: make test
+
+      - name: Build DuckParq.app
+        run: make app
+
+      # The three properties that make the bundle worth shipping, none of which
+      # the suite can check because they are about the linked product rather
+      # than the code.
+      - name: Verify the bundle
+        run: |
+          set -euo pipefail
+          app=.build/DuckParq.app
+          exe="$app/Contents/MacOS/DuckParq"
+
+          echo "::group::otool -L"
+          otool -L "$exe"
+          echo "::endgroup::"
+
+          if otool -L "$exe" | grep -q duckdb; then
+            echo "FAIL: the executable links DuckDB dynamically; it must be static" >&2
+            exit 1
+          fi
+          echo "ok: no external duckdb references"
+
+          codesign --verify --deep --strict --verbose=2 "$app"
+          echo "ok: ad-hoc signature verifies"
+
+          for f in LICENSE THIRD_PARTY_LICENSES.md; do
+            if [[ ! -f "$app/Contents/Resources/$f" ]]; then
+              echo "FAIL: $f missing from the bundle -- notices must ship with the binary" >&2
+              exit 1
+            fi
+          done
+          echo "ok: licence notices are in the bundle"
+
+          /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$app/Contents/Info.plist"
+
+      # upload-artifact drops the executable bit and would break the code
+      # signature, so the bundle is zipped with ditto first -- which is also
+      # what preserves the signature's resource fork. The download is therefore
+      # a zip inside a zip.
+      - name: Package the app
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent --sequesterRsrc .build/DuckParq.app "$RUNNER_TEMP/DuckParq.zip"
+          ls -lh "$RUNNER_TEMP/DuckParq.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DuckParq-${{ github.sha }}
+          path: ${{ runner.temp }}/DuckParq.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      # No `if: always()` — a summary describing a downloadable app would be
+      # untrue on a run that failed before building one.
+      - name: Summary
+        run: |
+          {
+            echo "## DuckParq.app"
+            echo
+            echo "Built from \`${GITHUB_SHA:0:7}\` on \`$(sw_vers -productVersion)\`, Apple silicon."
+            echo
+            echo "The app is **ad-hoc signed**, not Developer ID signed or notarised."
+            echo "macOS quarantines anything downloaded from the internet, so an"
+            echo "artifact from this run will refuse to open on a first double-click."
+            echo "Clear the quarantine flag after unzipping:"
+            echo
+            echo '```bash'
+            echo 'xattr -dr com.apple.quarantine DuckParq.app'
+            echo '```'
+            echo
+            echo "Building it yourself with \`make run\` avoids this entirely --"
+            echo "nothing locally built is quarantined."
+          } >> "$GITHUB_STEP_SUMMARY"
