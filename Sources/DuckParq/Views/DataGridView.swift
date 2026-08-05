@@ -25,8 +25,29 @@ struct DataGridView: View {
     @State private var selectedRow: Int?
     /// Rebuilt whenever a fresh result arrives, so widths re-measure per query.
     @State private var measuredSignature: String = ""
+    /// Bumped when the system switches between overlay and legacy scrollers,
+    /// which happens the moment a mouse is plugged in. Without it the grid would
+    /// keep the width it computed under the old style until something else
+    /// invalidated it.
+    @State private var scrollerStyleGeneration = 0
 
     private var table: TableModel { app.table }
+
+    /// How much width an always-visible vertical scroller takes out of the
+    /// scroll view's viewport.
+    ///
+    /// Overlay scrollers float above the content and take nothing; legacy ones
+    /// are laid out beside it, so the content is offered ~15pt less than the
+    /// scroll view's own frame.
+    private var verticalScrollerInset: CGFloat {
+        _ = scrollerStyleGeneration
+        guard NSScroller.preferredScrollerStyle == .legacy else { return 0 }
+        return NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+    }
+
+    /// Height of one data row, and of everything the rows are not.
+    private static let rowHeight: CGFloat = 20
+    private static let chromeHeight: CGFloat = 44
 
     var body: some View {
         VStack(spacing: 0) {
@@ -48,6 +69,10 @@ struct DataGridView: View {
             }
         }
         .onCopyCommand { copyPayload() }
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSScroller.preferredScrollerStyleDidChangeNotification)) { _ in
+            scrollerStyleGeneration += 1
+        }
     }
 
     private var grid: some View {
@@ -61,7 +86,16 @@ struct DataGridView: View {
             // before: a VStack centres its children, so once the pinned header
             // was proposed the full window width its row of cells sat centred
             // in it while the data rows stayed left, offset by half the slack.
-            let rowWidth = max(contentWidth, proxy.size.width)
+            //
+            // "The window" is the scroll view's *viewport*, not its frame. With
+            // legacy scrollers the vertical one is laid out beside the content
+            // rather than over it, so filling the frame overflows the viewport
+            // by exactly a scroller's width — and the grid grew a horizontal
+            // scrollbar for columns that fit comfortably.
+            let scrolls = CGFloat(table.rows.count) * Self.rowHeight
+                + Self.chromeHeight > proxy.size.height
+            let viewport = proxy.size.width - (scrolls ? verticalScrollerInset : 0)
+            let rowWidth = max(contentWidth, viewport)
             ScrollView([.horizontal, .vertical]) {
                 LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
                     Section {
@@ -88,6 +122,13 @@ struct DataGridView: View {
                 }
                 .frame(width: rowWidth, alignment: .leading)
             }
+            // A two-axis scroll view flashes both indicators together, so
+            // scrolling down drew a horizontal bar whose thumb filled the whole
+            // track — an indicator for an axis with nothing to scroll. Hidden
+            // rather than switching the axis set, which would rebuild the scroll
+            // view and drop the scroll position every time a resize crossed the
+            // point where the columns stop fitting.
+            .scrollIndicators(contentWidth > viewport ? .automatic : .hidden, axes: .horizontal)
         }
     }
 
