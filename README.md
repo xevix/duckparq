@@ -181,10 +181,18 @@ drifting apart.
 
 `DUCKPARQ_TRACE=1` prints the grid's geometry — viewport, content width, scroll
 offsets, header cell spans, and every sort click with the column it resolved to.
-`DUCKPARQ_SNAPSHOT=<path>` writes a PNG of the window every couple of seconds,
-which the app can do to itself without any screen recording permission. Both
-exist because every layout defect this grid has had was invisible to the tests
-and obvious in a picture.
+`DUCKPARQ_SNAPSHOT=<path>` writes a numbered PNG of the window every couple of
+seconds, which the app can do to itself without any screen recording permission,
+and `DUCKPARQ_AUTOSCROLL=<points>` scrolls the grid on the same timer so paging
+can be watched frame by frame. They exist because every layout defect this grid
+has had was invisible to the tests and obvious in a picture.
+
+The header's mirrored offset is clamped to what the rows can actually scroll.
+`contentOffset.x` drifts from `-leadingInset` toward zero as the grid scrolls
+vertically, so the raw sum crept up to a sidebar's width and slid the header left
+on every page that loaded, while the columns — with nowhere to go — stayed where
+they were. The header mirrors where the rows *are*, and the rows stop at the ends
+of the content.
 
 The status bar counts up while a query runs and keeps the final figure
 afterwards, with **Cancel** beside it — that interrupts the query inside DuckDB

@@ -183,13 +183,27 @@ struct DataGridView: View {
                 // is laid out in content space, so its hit region sat a sidebar's
                 // width to the right of where it was drawn, and clicking a column
                 // sorted the one about four places over.
+                //
+                // Clamped to what the rows can actually scroll. The header
+                // mirrors where the rows *are*, and the rows stop at the ends of
+                // the content — so an offset outside that range describes a
+                // position no row is in. Unclamped, the raw geometry drifts as
+                // the content grows underneath it, and the header slid left on
+                // every page that loaded while the columns themselves, having
+                // nowhere to go, stayed put.
                 .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                    let raw = geometry.contentOffset.x + geometry.contentInsets.leading
+                    let scrollable = max(geometry.contentSize.width - geometry.containerSize.width, 0)
+                    let clamped = min(max(raw, 0), scrollable)
                     GridTrace.log("""
                         scroll offset \(geometry.contentOffset.x) \
                         insets \(geometry.contentInsets.leading) \
-                        resolved \(geometry.contentOffset.x + geometry.contentInsets.leading)
+                        raw \(raw.rounded()) scrollable \(scrollable.rounded()) \
+                        clamped \(clamped.rounded()) \
+                        content \(geometry.contentSize.width.rounded()) \
+                        container \(geometry.containerSize.width.rounded())
                         """)
-                    return geometry.contentOffset.x + geometry.contentInsets.leading
+                    return clamped
                 } action: { _, x in
                     scrollX = x
                 }

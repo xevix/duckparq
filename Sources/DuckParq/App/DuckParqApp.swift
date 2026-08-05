@@ -101,10 +101,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// were all invisible to the tests and obvious in a picture.
 enum WindowCapture {
     static func startIfRequested() {
-        guard let path = ProcessInfo.processInfo.environment["DUCKPARQ_SNAPSHOT"] else { return }
+        let environment = ProcessInfo.processInfo.environment
+        guard let path = environment["DUCKPARQ_SNAPSHOT"] else { return }
+        let autoScroll = environment["DUCKPARQ_AUTOSCROLL"].flatMap(Double.init)
+        var frame = 0
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
-            MainActor.assumeIsolated { write(to: path) }
+            MainActor.assumeIsolated {
+                if let autoScroll { scrollDown(by: autoScroll) }
+                let url = URL(fileURLWithPath: path)
+                let numbered = url.deletingPathExtension()
+                    .appendingPathExtension("\(frame)")
+                    .appendingPathExtension(url.pathExtension)
+                write(to: numbered.path)
+                frame += 1
+            }
         }
+    }
+
+    /// Scrolls the grid without a trackpad, so paging behaviour can be checked
+    /// from a series of snapshots. Posting real scroll events would need
+    /// accessibility permission; asking the view directly needs nothing.
+    @MainActor
+    private static func scrollDown(by points: Double) {
+        guard let window = NSApp.windows.first(where: { $0.isVisible }),
+              let view = window.contentView,
+              let scroller = tallestScrollView(in: view)
+        else { return }
+        var origin = scroller.contentView.bounds.origin
+        origin.y += points
+        scroller.contentView.scroll(to: origin)
+        scroller.reflectScrolledClipView(scroller.contentView)
+    }
+
+    /// The grid's scroll view is the one with the most to scroll — the sidebar
+    /// and the editor both have far less.
+    @MainActor
+    private static func tallestScrollView(in view: NSView) -> NSScrollView? {
+        var found: [NSScrollView] = []
+        func walk(_ node: NSView) {
+            if let scroller = node as? NSScrollView { found.append(scroller) }
+            node.subviews.forEach(walk)
+        }
+        walk(view)
+        return found.max { $0.documentView?.frame.height ?? 0 < $1.documentView?.frame.height ?? 0 }
     }
 
     @MainActor
