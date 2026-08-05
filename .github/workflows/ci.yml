@@ -33,7 +33,13 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # Full history rather than the default shallow clone, so make-app.sh can
+      # derive a version from the nearest tag. Without it CI stamps 0.0.0 while
+      # a developer building the same commit gets the tag — the two should not
+      # disagree. The repo is small enough that the clone costs nothing.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - uses: ./.github/actions/build-app
         id: build

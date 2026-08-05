@@ -31,7 +31,12 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # Full history for the same reason as CI, though the version passed below
+      # makes it belt-and-braces here: the two workflows should not derive
+      # versions differently.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - uses: ./.github/actions/build-app
         id: build
