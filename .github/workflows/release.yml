@@ -37,6 +37,23 @@ jobs:
         id: build
         with:
           zip-name: DuckParq-${{ github.ref_name }}-macos-arm64.zip
+          version: ${{ github.ref_name }}
+
+      # The bug this guards against is the one that produced it: a version
+      # written down in make-app.sh rather than derived, so every release after
+      # the first shipped a bundle claiming to be the first.
+      - name: Check the bundle carries the tag's version
+        run: |
+          set -euo pipefail
+          want="${GITHUB_REF_NAME#v}"
+          want="${want%%-*}"
+          got="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
+            .build/DuckParq.app/Contents/Info.plist)"
+          if [[ "$got" != "$want" ]]; then
+            echo "FAIL: bundle says $got, tag $GITHUB_REF_NAME wants $want" >&2
+            exit 1
+          fi
+          echo "ok: bundle version $got matches $GITHUB_REF_NAME"
 
       # The quarantine note is the difference between a download that works and
       # one that looks broken, so it goes above the generated changelog rather

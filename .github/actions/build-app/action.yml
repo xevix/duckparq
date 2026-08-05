@@ -14,6 +14,13 @@ inputs:
   zip-name:
     description: "Filename for the packaged bundle"
     default: DuckParq.zip
+  version:
+    description: >
+      Version to stamp into the bundle. Empty lets make-app.sh derive one from
+      the nearest git tag, which is right for CI on a branch; the release
+      workflow passes the tag it is building so a shallow clone cannot get it
+      wrong.
+    default: ""
 
 outputs:
   zip-path:
@@ -76,6 +83,8 @@ runs:
 
     - name: Build DuckParq.app
       shell: bash
+      env:
+        DUCKPARQ_VERSION: ${{ inputs.version }}
       run: make app
 
     # The three properties that make the bundle worth shipping, none of which
