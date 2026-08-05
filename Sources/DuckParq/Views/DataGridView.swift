@@ -54,6 +54,9 @@ struct DataGridView: View {
     /// keep the width it computed under the old style until something else
     /// invalidated it.
     @State private var scrollerStyleGeneration = 0
+    /// Horizontal scroll offset, mirrored onto the header so it tracks the
+    /// columns it labels.
+    @State private var scrollX: CGFloat = 0
 
     private var table: TableModel { app.table }
 
@@ -127,9 +130,32 @@ struct DataGridView: View {
                 scrollers \(NSScroller.preferredScrollerStyle == .legacy ? "legacy" : "overlay") \
                 columns \(widths.count)
                 """)
-            ScrollView([.horizontal, .vertical]) {
-                LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
-                    Section {
+            VStack(spacing: 0) {
+                // The header is a sibling of the scroll view, not a pinned
+                // section header inside it.
+                //
+                // Pinned works visually and is wrong where it counts: the pinned
+                // header's hit region was placed as though the grid began at the
+                // window's left edge, so every click landed a sidebar's width to
+                // the right of where the header was drawn — about four columns
+                // over, and off the end entirely for the last few. The header
+                // renders in the right place and answers clicks in the wrong
+                // one, which is why it looked like a sorting bug rather than a
+                // layout one.
+                //
+                // Mirroring the scroll offset by hand costs a state variable and
+                // keeps hit testing ordinary. Header and rows still derive from
+                // one `widths` array and one `rowWidth`, both `.leading`, which
+                // is what stops them drifting apart.
+                headerRow(widths: widths)
+                    .frame(width: rowWidth, alignment: .leading)
+                    .offset(x: -scrollX)
+                    .frame(width: viewport, alignment: .leading)
+                    .clipped()
+                    .background(Color(nsColor: .windowBackgroundColor))
+                Divider()
+                ScrollView([.horizontal, .vertical]) {
+                    LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(table.rows) { row in
                             RowView(
                                 row: row,
@@ -143,29 +169,45 @@ struct DataGridView: View {
                             .onAppear { table.loadMoreIfNeeded(displayedIndex: row.id) }
                         }
                         footer
-                    } header: {
-                        VStack(alignment: .leading, spacing: 0) {
-                            headerRow(widths: widths)
-                            Divider()
-                        }
-                        .frame(width: rowWidth, alignment: .leading)
-                        .background(Color(nsColor: .windowBackgroundColor))
                     }
+                    .frame(width: rowWidth, alignment: .leading)
                 }
-                .frame(width: rowWidth, alignment: .leading)
+                // `contentOffset.x` is measured from the *inset* origin, and
+                // this scroll view carries a leading inset the width of the
+                // sidebar — NavigationSplitView insets its detail content so it
+                // underlaps the translucent sidebar. At rest the offset is
+                // therefore -327, not 0, and the sum with the inset is the
+                // scroll position actually wanted.
+                //
+                // That inset is the whole original bug. A pinned section header
+                // is laid out in content space, so its hit region sat a sidebar's
+                // width to the right of where it was drawn, and clicking a column
+                // sorted the one about four places over.
+                .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                    GridTrace.log("""
+                        scroll offset \(geometry.contentOffset.x) \
+                        insets \(geometry.contentInsets.leading) \
+                        resolved \(geometry.contentOffset.x + geometry.contentInsets.leading)
+                        """)
+                    return geometry.contentOffset.x + geometry.contentInsets.leading
+                } action: { _, x in
+                    scrollX = x
+                }
+                // A two-axis scroll view flashes both indicators together, so
+                // scrolling down drew a horizontal bar whose thumb filled the
+                // whole track — an indicator for an axis with nothing to scroll.
+                // Hidden rather than switching the axis set, which would rebuild
+                // the scroll view and drop the scroll position every time a
+                // resize crossed the point where the columns stop fitting.
+                //
+                // `.never`, not `.hidden`: `.hidden` is a preference the system
+                // is free to overrule, and it does exactly that for the
+                // always-visible scrollers this app draws — which is why hiding
+                // it the first time changed nothing on screen. `.never` is the
+                // one that means never.
+                .scrollIndicators(contentWidth > viewport ? .automatic : .never,
+                                  axes: .horizontal)
             }
-            // A two-axis scroll view flashes both indicators together, so
-            // scrolling down drew a horizontal bar whose thumb filled the whole
-            // track — an indicator for an axis with nothing to scroll. Hidden
-            // rather than switching the axis set, which would rebuild the scroll
-            // view and drop the scroll position every time a resize crossed the
-            // point where the columns stop fitting.
-            //
-            // `.never`, not `.hidden`: `.hidden` is a preference the system is
-            // free to overrule, and it does exactly that for the always-visible
-            // scrollers this app draws — which is why hiding it the first time
-            // changed nothing on screen. `.never` is the one that means never.
-            .scrollIndicators(contentWidth > viewport ? .automatic : .never, axes: .horizontal)
         }
     }
 

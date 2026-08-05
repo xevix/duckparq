@@ -84,4 +84,37 @@ struct DuckParqApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        WindowCapture.startIfRequested()
+    }
+}
+
+/// Periodically writes a PNG of the app's own window.
+///
+/// The app draws itself, so it can photograph itself — no screen recording
+/// permission, no capture of anything but this window. Enabled only by
+/// `DUCKPARQ_SNAPSHOT=<path>`.
+///
+/// This exists because several layout defects — a centred header, a
+/// zero-height list, a header whose hit region sat a sidebar's width off —
+/// were all invisible to the tests and obvious in a picture.
+enum WindowCapture {
+    static func startIfRequested() {
+        guard let path = ProcessInfo.processInfo.environment["DUCKPARQ_SNAPSHOT"] else { return }
+        Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+            MainActor.assumeIsolated { write(to: path) }
+        }
+    }
+
+    @MainActor
+    private static func write(to path: String) {
+        guard let window = NSApp.windows.first(where: { $0.isVisible }),
+              let view = window.contentView,
+              let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)
+        else { return }
+        view.cacheDisplay(in: view.bounds, to: rep)
+        guard let png = rep.representation(using: .png, properties: [:]) else { return }
+        try? png.write(to: URL(fileURLWithPath: path))
+    }
 }

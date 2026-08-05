@@ -164,9 +164,27 @@ Sidebar folders collapse and expand individually, and the two toolbar buttons do
 it wholesale. Expand All is the one place the sidebar reads the whole tree rather
 than a level at a time, so it is bounded and runs off the main thread.
 
-The grid scrolls on both axes in one scroll view, so the vertical scrollbar sits
-against the window rather than against the last column, and the header pins to
-the top while still scrolling sideways with the columns it labels.
+The grid's rows scroll on both axes in one scroll view, so the vertical scrollbar
+sits against the window rather than against the last column. The header is a
+sibling of that scroll view and mirrors its horizontal offset, which keeps it
+fixed vertically while it tracks the columns it labels.
+
+It was a pinned section header until it wasn't. Pinned looked right and answered
+clicks in the wrong place: `NavigationSplitView` gives its detail content a
+leading inset the width of the sidebar, so the header's hit region sat that far
+to the right of where it was drawn, and clicking a column sorted the one about
+four places over — with the last few columns landing off the end and doing
+nothing at all. Mirroring the offset by hand costs one state variable and keeps
+hit testing ordinary. Header and rows still come from a single array of column
+widths and a single row width, both leading-aligned, which is what stops them
+drifting apart.
+
+`DUCKPARQ_TRACE=1` prints the grid's geometry — viewport, content width, scroll
+offsets, header cell spans, and every sort click with the column it resolved to.
+`DUCKPARQ_SNAPSHOT=<path>` writes a PNG of the window every couple of seconds,
+which the app can do to itself without any screen recording permission. Both
+exist because every layout defect this grid has had was invisible to the tests
+and obvious in a picture.
 
 The status bar counts up while a query runs and keeps the final figure
 afterwards, with **Cancel** beside it — that interrupts the query inside DuckDB
