@@ -26,11 +26,16 @@ enum GridTrace {
     static let isEnabled = ProcessInfo.processInfo.environment["DUCKPARQ_TRACE"] != nil
     nonisolated(unsafe) private static var last = ""
 
-    static func log(_ line: @autoclosure () -> String) {
+    /// `dedupe` suppresses a line identical to the previous one, which is what
+    /// keeps a geometry that is recomputed on every render to one line. Events
+    /// pass false: two identical clicks are two facts, not one.
+    static func log(_ line: @autoclosure () -> String, dedupe: Bool = true) {
         guard isEnabled else { return }
         let text = line()
-        guard text != last else { return }
-        last = text
+        if dedupe {
+            guard text != last else { return }
+            last = text
+        }
         FileHandle.standardError.write(Data("[grid] \(text)\n".utf8))
     }
 }
@@ -133,6 +138,7 @@ struct DataGridView: View {
                                 width: rowWidth,
                                 isSelected: selectedRow == row.id
                             )
+                            .equatable()
                             .onTapGesture { selectedRow = row.id }
                             .onAppear { table.loadMoreIfNeeded(displayedIndex: row.id) }
                         }
@@ -176,12 +182,33 @@ struct DataGridView: View {
                     width: widths[index],
                     direction: table.sortDirection(for: column.name),
                     ordinal: table.sortOrdinal(for: column.name),
-                    onToggle: { additive in table.toggleSort(column: column.name, additive: additive) },
+                    onToggle: { additive in
+                        GridTrace.log("tap column \(index) \(column.name) additive \(additive)",
+                                      dedupe: false)
+                        table.toggleSort(column: column.name, additive: additive)
+                        GridTrace.log("sort now [" + table.sort.map {
+                            "\($0.column) \($0.direction.rawValue)"
+                        }.joined(separator: ", ") + "]", dedupe: false)
+                    },
                     onResize: { delta in resize(column, currentWidth: widths[index], by: delta) }
                 )
             }
         }
         .frame(height: 26)
+        .onAppear { traceHeaderLayout(widths) }
+        .onChange(of: widths) { _, new in traceHeaderLayout(new) }
+    }
+
+    /// Where each header cell actually is, so a click that sorts the wrong
+    /// column can be checked against the geometry instead of guessed at.
+    private func traceHeaderLayout(_ widths: [CGFloat]) {
+        guard GridTrace.isEnabled else { return }
+        var x: CGFloat = 0
+        let spans = zip(table.columns, widths).map { column, width -> String in
+            defer { x += width }
+            return "\(column.name)@\(Int(x))-\(Int(x + width))"
+        }
+        GridTrace.log("header " + spans.joined(separator: " "))
     }
 
     // MARK: - Rows
@@ -335,6 +362,17 @@ private struct HeaderCell: View {
         .overlay(alignment: .trailing) { resizeHandle }
     }
 
+    /// The divider between columns, and the strip you grab to resize.
+    ///
+    /// The strip used to be centred on the divider, so half of it hung over the
+    /// *next* column, and it swallowed clicks that never became drags. Between
+    /// them that made an eight-point dead band on every boundary where a click
+    /// sorted the wrong column or nothing at all — and on the last column, whose
+    /// divider is the grid's right edge, there was no neighbour to fall back to,
+    /// so it just did nothing.
+    ///
+    /// Now the strip sits entirely inside its own cell, and a click on it sorts
+    /// that cell like any other part of the header. Only a drag resizes.
     private var resizeHandle: some View {
         Rectangle()
             .fill(Color(nsColor: .separatorColor))
@@ -342,11 +380,13 @@ private struct HeaderCell: View {
             .overlay {
                 Rectangle()
                     .fill(.clear)
-                    .frame(width: 8)
+                    .frame(width: Self.resizeGrabWidth)
+                    .offset(x: -Self.resizeGrabWidth / 2)
                     .contentShape(Rectangle())
                     .onHover { inside in
                         if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
                     }
+                    .onTapGesture { onToggle(NSEvent.modifierFlags.contains(.shift)) }
                     .gesture(
                         DragGesture(minimumDistance: 1)
                             .onChanged { value in
@@ -357,11 +397,36 @@ private struct HeaderCell: View {
                     )
             }
     }
+
+    private static let resizeGrabWidth: CGFloat = 8
 }
 
 // MARK: - Row
 
-private struct RowView: View {
+private struct CellTooltip: ViewModifier {
+    let text: String?
+
+    func body(content: Content) -> some View {
+        if let text { content.help(text) } else { content }
+    }
+}
+
+/// A row of cells.
+///
+/// `Equatable` on purpose, and used via `.equatable()`: selecting a row changes
+/// one `@State` in the grid, which re-evaluates every row's body. With five
+/// hundred rows of nine cells that is thousands of `Text`s rebuilt to highlight
+/// one line, which is what made clicking a row lag.
+private struct RowView: View, Equatable {
+    nonisolated static func == (lhs: RowView, rhs: RowView) -> Bool {
+        lhs.row.id == rhs.row.id
+            && lhs.isSelected == rhs.isSelected
+            && lhs.width == rhs.width
+            && lhs.widths == rhs.widths
+            && lhs.row.cells == rhs.row.cells
+            && lhs.columns.count == rhs.columns.count
+    }
+
     let row: TableModel.GridRow
     let columns: [ColumnInfo]
     let widths: [CGFloat]
@@ -409,8 +474,9 @@ private struct RowView: View {
         // A tooltip is only worth a tracking rectangle when the cell is actually
         // cut off. Attaching one to every cell put thousands of them in the
         // window, which AppKit revisits whenever the window becomes key — part
-        // of what made switching back to the app feel slow.
-        .help(isTruncated(value, width: width) ? (value ?? "") : "")
+        // of what made switching back to the app feel slow. `.help("")` is
+        // still a `.help`, so the modifier has to be absent, not empty.
+        .modifier(CellTooltip(text: isTruncated(value, width: width) ? value : nil))
     }
 
     private func isTruncated(_ value: String?, width: CGFloat) -> Bool {
