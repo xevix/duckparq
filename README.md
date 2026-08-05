@@ -6,28 +6,54 @@ filter, or drop into SQL when you need to. DuckDB does the querying.
 
 Not intended for the App Store — the app is unsandboxed and ad-hoc signed.
 
-## Requirements
+MIT licensed; see [License](#license).
 
-macOS 15+, Apple silicon, and a Swift toolchain. **Xcode is not required** —
-Command Line Tools are enough, which is why the app is a SwiftPM executable
-assembled into a `.app` by a script rather than an Xcode project.
+![DuckParq showing a hive-partitioned dataset of 3.1 billion rows](docs/screenshot.png)
 
-The `duckdb` CLI is needed only to generate test fixtures, never at runtime.
+That is a hive-partitioned folder opened as one table — 3,131,875,121 rows, the
+first 500 of them on screen in 3.59 seconds. The rest of this file is mostly
+about why that number is small.
 
-## Build
+## Build and run
 
 ```bash
-make smoke   # fetch + verify DuckDB, then prove the static link works
-make app     # build DuckParq.app
-make run     # build and launch
-make install # copy to /Applications
-make test    # run the self-test suite
+make run
 ```
 
-`make smoke` is worth running first on a fresh checkout: it downloads the pinned
-DuckDB static libraries, verifies their SHA256, and runs a real
+That is the whole thing on a clean checkout: it downloads the pinned DuckDB
+static libraries, builds in release, assembles `DuckParq.app`, and launches it.
+About a minute, plus a 25 MB download the first time.
+
+You need **macOS 15 or later on Apple silicon** and a **Swift 6 toolchain**.
+Xcode is not required — Command Line Tools are enough (`xcode-select
+--install`), which is why the app is a SwiftPM executable assembled into a
+`.app` by a script rather than an Xcode project. Nothing else is needed to
+build or run: there are no SwiftPM dependencies and nothing to install from
+Homebrew.
+
+The other targets:
+
+```bash
+make app     # build DuckParq.app without launching it
+make install # copy it to /Applications
+make smoke   # prove the static link works (see below)
+make test    # run the self-test suite
+make clean   # remove .build
+```
+
+`make smoke` and `make test` additionally need the **`duckdb` CLI** and
+**python3** — but only to generate the parquet fixtures they read
+(`brew install duckdb`; python3 comes with Command Line Tools). The app itself
+never shells out to `duckdb`, at build time or at runtime.
+
+`make smoke` is the one worth running first if a build ever misbehaves: it
+downloads and SHA256-verifies the DuckDB static libraries, then runs a real
 `SELECT * FROM read_parquet(...)` through the C bridge. If static extension
-registration ever breaks, it fails there in seconds instead of at runtime.
+registration breaks, it fails there in seconds instead of at runtime.
+
+`Vendor/duckdb` is about 99 MB unpacked and is not committed; `make distclean`
+removes it along with the fixtures. Dropping an `AppIcon.icns` into
+`Resources/` gets it bundled — the build works fine without one.
 
 ## How it works
 
@@ -288,6 +314,7 @@ Sources/DuckParqCore/  Engine (sessions, cursors, SQL building) + models
 Sources/DuckParq/      SwiftUI app
 Sources/DuckParqSelfTest/  Test suite (see below)
 scripts/               fetch-duckdb.sh, smoke.c, make-fixtures.sh, make-app.sh
+Resources/             AppIcon.icns, if you have one
 ```
 
 ## Tests
@@ -329,3 +356,23 @@ bound query the grid runs must return identical rows.
 verifying that a large file still previews instantly and that sorting is really
 pushed down — it cross-checks the grid's first sorted row against DuckDB's own
 `ORDER BY`.
+
+## License
+
+DuckParq is [MIT licensed](LICENSE).
+
+The app statically links DuckDB, which is MIT licensed too, and through it a
+set of compression, parsing and Unicode libraries — all permissive: MIT,
+BSD-2/3-Clause, Apache-2.0, Boost, zlib, Unicode. Nothing in the binary is
+copyleft, so shipping a build under MIT is straightforward: the only obligation
+is to carry the notices, which
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) collects in full and
+`make app` copies into `DuckParq.app/Contents/Resources/`.
+
+Two of those libraries offer a copyleft alternative — Mbed TLS is Apache-2.0 or
+GPL-2.0-or-later, Zstandard is BSD-3-Clause or GPL-2.0 — and both leave the
+choice to the user, so they are taken under the permissive option.
+
+Nothing here interacts badly with a macOS app. The App Store's terms are what
+GPL code collides with, and there is none; MIT is fine either way, and the app
+is not aimed at the store regardless.

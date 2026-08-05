@@ -72,6 +72,10 @@ if [[ -f "$ROOT/Resources/AppIcon.icns" ]]; then
   cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 fi
 
+# DuckDB and the libraries it vendors are compiled into the executable, so
+# their notices have to travel with the bundle rather than with the repo.
+cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_LICENSES.md" "$APP/Contents/Resources/"
+
 # Ad-hoc signature: enough for local use, and macOS refuses to launch an
 # unsigned arm64 binary from a bundle.
 codesign --force --sign - --timestamp=none "$APP" >/dev/null 2>&1 || {
