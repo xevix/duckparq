@@ -274,6 +274,35 @@ public final class TableModel {
         reload(keepingRows: true)
     }
 
+    /// Narrow to a value seen in the grid — what right-clicking a cell does.
+    ///
+    /// It adds to the column's existing value filter rather than replacing it,
+    /// so picking a second value from a second row widens the selection the way
+    /// ticking a second box in the popover does. A comparison filter on the same
+    /// column is replaced, since there is nothing to add a value to.
+    ///
+    /// `nil` means the cell was NULL, which is a value to filter by like any
+    /// other and not the absence of one.
+    public func filter(column: ColumnInfo, matching value: String?) {
+        let existing = filters.first { $0.column.name == column.name }
+        var values: Set<String> = []
+        var includeNull = false
+        if let existing, case .anyOf(let current, let currentNull) = existing.mode {
+            values = current
+            includeNull = currentNull
+        }
+        if let value {
+            values.insert(value)
+        } else {
+            includeNull = true
+        }
+        upsert(filter: Filter(
+            id: existing?.id ?? UUID(),
+            column: column,
+            mode: .anyOf(values, includeNull: includeNull)
+        ))
+    }
+
     public func upsert(filter: Filter) {
         if let index = filters.firstIndex(where: { $0.id == filter.id }) {
             filters[index] = filter

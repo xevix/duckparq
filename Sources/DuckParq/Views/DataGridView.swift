@@ -491,6 +491,8 @@ private struct RowView: View, Equatable {
             && lhs.columns.count == rhs.columns.count
     }
 
+    @Environment(AppModel.self) private var app
+
     let row: TableModel.GridRow
     let columns: [ColumnInfo]
     let widths: [CGFloat]
@@ -541,6 +543,30 @@ private struct RowView: View, Equatable {
         // of what made switching back to the app feel slow. `.help("")` is
         // still a `.help`, so the modifier has to be absent, not empty.
         .modifier(CellTooltip(text: isTruncated(value, width: width) ? value : nil))
+        .contextMenu { cellMenu(column: column, value: value) }
+    }
+
+    @ViewBuilder
+    private func cellMenu(column: ColumnInfo, value: String?) -> some View {
+        // Nested and binary columns are left out for the same reason the filter
+        // popover leaves them out: their rendered text is a display of the
+        // value, not something to compare against.
+        if !app.table.isSQLMode, column.kind != .nested, column.kind != .binary {
+            Button(filterLabel(column: column, value: value)) {
+                app.table.filter(column: column, matching: value)
+            }
+            Divider()
+        }
+        Button("Copy Value") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(value ?? "NULL", forType: .string)
+        }
+    }
+
+    private func filterLabel(column: ColumnInfo, value: String?) -> String {
+        guard let value else { return "Filter \(column.name) is NULL" }
+        let shown = value.count > 32 ? value.prefix(32) + "…" : value[...]
+        return "Filter \(column.name) = \(shown)"
     }
 
     private func isTruncated(_ value: String?, width: CGFloat) -> Bool {

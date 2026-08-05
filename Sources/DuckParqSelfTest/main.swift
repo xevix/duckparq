@@ -1483,6 +1483,37 @@ do {
     await settle(model)
     expectEqual(model.totalRowCount, 1000, "clearing filters restores the full count")
 
+    // Right-clicking a cell filters by the value in it.
+    model.filter(column: categoryColumn, matching: "alpha")
+    await settle(model)
+    expectEqual(model.totalRowCount, 250, "filtering by a cell's value reaches DuckDB")
+    expectEqual(model.filters.count, 1, "one filter, on the column that was clicked")
+
+    // A second value on the same column widens the selection rather than
+    // stacking a second filter that no row could satisfy — two ANDed equality
+    // filters on one column always match nothing.
+    model.filter(column: categoryColumn, matching: "beta")
+    await settle(model)
+    expectEqual(model.filters.count, 1, "a second value joins the existing filter")
+    expectEqual(model.totalRowCount, 500, "and widens it rather than contradicting it")
+
+    // NULL is a value to filter by, not the absence of one.
+    let sparseColumn = ColumnInfo(name: "flag", typeName: "VARCHAR")
+    let nullFilter = TableModel(
+        gridSession: session, metaSession: session, countSession: session,
+        filterSession: session, cache: PreviewCache()
+    )
+    nullFilter.filter(column: sparseColumn, matching: nil)
+    if case .anyOf(let values, let includeNull) = nullFilter.filters[0].mode {
+        expect(values.isEmpty, "a NULL cell contributes no literal value")
+        expect(includeNull, "it asks for NULL rows")
+    } else {
+        expect(false, "filtering a cell always produces a value filter")
+    }
+
+    model.clearFilters()
+    await settle(model)
+
     // SQL mode.
     model.runSQL("SELECT category, count(*) AS n FROM read_parquet('\(smallParquet.path)') GROUP BY 1 ORDER BY 1")
     await settle(model)

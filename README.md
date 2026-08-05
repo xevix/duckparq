@@ -187,6 +187,12 @@ and `DUCKPARQ_AUTOSCROLL=<points>` scrolls the grid on the same timer so paging
 can be watched frame by frame. They exist because every layout defect this grid
 has had was invisible to the tests and obvious in a picture.
 
+Right-clicking a cell offers to filter the column by the value in it, and to
+copy the value. Picking a second value on the same column widens that filter
+instead of adding another — two ANDed equality filters on one column would match
+nothing, which is not what asking for a second value means. A NULL cell filters
+for NULL rows, since NULL is a value to narrow to and not the absence of one.
+
 The rows scroll view declares `.defaultScrollAnchor(.topLeading)`. Rows arrive
 after the scroll view exists, so its content goes from zero-height to a whole
 page in one step, and with no anchor declared it came to rest in the middle of
