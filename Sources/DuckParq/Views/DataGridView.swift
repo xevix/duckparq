@@ -57,6 +57,15 @@ struct DataGridView: View {
     /// Horizontal scroll offset, mirrored onto the header so it tracks the
     /// columns it labels.
     @State private var scrollX: CGFloat = 0
+    /// Measured column widths, and the prefix sums used to find which columns
+    /// the viewport is over.
+    ///
+    /// Held in state rather than recomputed per render because measuring means
+    /// walking eighty rows of every column — a few milliseconds on a wide file,
+    /// and the grid re-renders on every scroll tick. The measurement only
+    /// depends on the columns and the first page of rows, so it is redone when
+    /// those change and not otherwise.
+    @State private var layout = GridLayout()
 
     private var table: TableModel { app.table }
 
@@ -94,7 +103,13 @@ struct DataGridView: View {
                 selectedRow = nil
                 measuredSignature = signature
             }
+            remeasure()
         }
+        // Measuring reads the first eighty rows, so it is redone when the rows
+        // are replaced — and only then. Re-deriving it per render, which is
+        // what a computed property amounted to, meant walking every column of
+        // eighty rows on every scroll tick.
+        .onChange(of: table.rowsGeneration) { _, _ in remeasure() }
         .onCopyCommand { copyPayload() }
         .onReceive(NotificationCenter.default.publisher(
             for: NSScroller.preferredScrollerStyleDidChangeNotification)) { _ in
@@ -103,8 +118,15 @@ struct DataGridView: View {
     }
 
     private var grid: some View {
-        let widths = columnWidths
-        let contentWidth = widths.reduce(0, +)
+        // `remeasure()` runs from `onChange`, which lands a cycle after the
+        // render that saw the new rows. Falling back to a fresh measurement for
+        // that one frame is what keeps the grid from flashing empty; in the
+        // steady state the counts match and nothing is computed here.
+        let layout = self.layout.matches(table.columns)
+            ? self.layout
+            : GridLayout(columns: table.columns, rows: table.rows, overrides: widthOverrides)
+        let widths = layout.widths
+        let contentWidth = layout.contentWidth
         return GeometryReader { proxy in
             // At least as wide as the columns, and never narrower than the
             // window. Header and rows are both given this exact width and
@@ -123,12 +145,21 @@ struct DataGridView: View {
                 + Self.chromeHeight > proxy.size.height
             let viewport = proxy.size.width - (scrolls ? verticalScrollerInset : 0)
             let rowWidth = max(contentWidth, viewport)
+            // Which columns the viewport is over. `LazyVStack` virtualizes down
+            // the grid; this is the same idea across it, and on a wide file it
+            // is the more important of the two. Without it every row builds a
+            // cell for every column in the file — a two-thousand-column parquet
+            // spent nineteen seconds on the main thread producing a screenful
+            // in which a dozen columns were visible.
+            let visibleColumns = ColumnLayout.visibleRange(
+                offsets: layout.offsets, x: scrollX, width: viewport
+            )
             let _ = GridTrace.log("""
                 frame \(proxy.size.width.rounded()) viewport \(viewport.rounded()) \
                 content \(contentWidth.rounded()) row \(rowWidth.rounded()) \
                 inset \(verticalScrollerInset) \
                 scrollers \(NSScroller.preferredScrollerStyle == .legacy ? "legacy" : "overlay") \
-                columns \(widths.count)
+                columns \(widths.count) visible \(visibleColumns.lowerBound)..<\(visibleColumns.upperBound)
                 """)
             VStack(spacing: 0) {
                 // The header is a sibling of the scroll view, not a pinned
@@ -147,7 +178,7 @@ struct DataGridView: View {
                 // keeps hit testing ordinary. Header and rows still derive from
                 // one `widths` array and one `rowWidth`, both `.leading`, which
                 // is what stops them drifting apart.
-                headerRow(widths: widths)
+                headerRow(layout: layout, visible: visibleColumns)
                     .frame(width: rowWidth, alignment: .leading)
                     .offset(x: -scrollX)
                     .frame(width: viewport, alignment: .leading)
@@ -159,8 +190,10 @@ struct DataGridView: View {
                         ForEach(table.rows) { row in
                             RowView(
                                 row: row,
+                                generation: table.rowsGeneration,
                                 columns: table.columns,
-                                widths: widths,
+                                layout: layout,
+                                visible: visibleColumns,
                                 width: rowWidth,
                                 isSelected: selectedRow == row.id
                             )
@@ -235,12 +268,19 @@ struct DataGridView: View {
 
     // MARK: - Header
 
-    private func headerRow(widths: [CGFloat]) -> some View {
-        HStack(spacing: 0) {
+    private func headerRow(layout: GridLayout, visible: Range<Int>) -> some View {
+        let widths = layout.widths
+        return HStack(spacing: 0) {
+            // A spacer standing in for the columns scrolled off to the left, so
+            // the cells that are drawn land where the rows put theirs.
+            if visible.lowerBound > 0 {
+                Color.clear.frame(width: layout.offsets[visible.lowerBound], height: 26)
+            }
             // Keyed by position, not by column name: parquet files can carry
             // duplicate or empty column names, and identical ForEach ids would
             // drop cells and shift every column after them.
-            ForEach(Array(table.columns.enumerated()), id: \.offset) { index, column in
+            ForEach(visible, id: \.self) { index in
+                let column = table.columns[index]
                 HeaderCell(
                     column: column,
                     width: widths[index],
@@ -260,7 +300,7 @@ struct DataGridView: View {
         }
         .frame(height: 26)
         .onAppear { traceHeaderLayout(widths) }
-        .onChange(of: widths) { _, new in traceHeaderLayout(new) }
+        .onChange(of: layout.version) { _, _ in traceHeaderLayout(layout.widths) }
     }
 
     /// Where each header cell actually is, so a click that sorts the wrong
@@ -345,14 +385,15 @@ struct DataGridView: View {
         return mode + "|" + table.columns.map(\.name).joined(separator: ",")
     }
 
-    /// One width per column, computed once per render and handed to both the
-    /// header and every row. Deriving these twice is what let them disagree.
-    private var columnWidths: [CGFloat] {
-        ColumnLayout.widths(for: table.columns, rows: table.rows, overrides: widthOverrides)
+    /// Re-derive the one width array the header and every row render from.
+    /// Deriving these twice is what let them disagree.
+    private func remeasure() {
+        layout.update(columns: table.columns, rows: table.rows, overrides: widthOverrides)
     }
 
     private func resize(_ column: ColumnInfo, currentWidth: CGFloat, by delta: CGFloat) {
         widthOverrides[column.name] = ColumnLayout.clamp(currentWidth + delta)
+        remeasure()
     }
 
     // MARK: - Copy
@@ -368,6 +409,54 @@ struct DataGridView: View {
         }
         return [NSItemProvider(object: text as NSString)]
     }
+}
+
+// MARK: - Layout
+
+/// The measured column widths, plus the running x positions derived from them.
+///
+/// One value rather than two so they cannot be updated separately, and a
+/// `version` rather than the arrays themselves for equality: every row on
+/// screen compares against this, and on a wide file comparing two thousand
+/// floats per row *is* the frame budget.
+struct GridLayout: Equatable {
+    private(set) var widths: [CGFloat] = []
+    /// `offsets[i]` is where column `i` starts; the last entry is the total.
+    private(set) var offsets: [CGFloat] = [0]
+    /// Whether each column reads better right-aligned. Precomputed because
+    /// `ColumnInfo.kind` uppercases the type name and walks a chain of prefix
+    /// tests, and a cell would otherwise ask that question every time it was
+    /// built.
+    private(set) var trailingAligned: [Bool] = []
+    /// Moves only when the widths actually change, so a re-measure that lands
+    /// on the same numbers rebuilds nothing.
+    private(set) var version = 0
+
+    var contentWidth: CGFloat { offsets.last ?? 0 }
+
+    init() {}
+
+    init(columns: [ColumnInfo], rows: [TableModel.GridRow], overrides: [String: CGFloat]) {
+        update(columns: columns, rows: rows, overrides: overrides)
+    }
+
+    /// Whether these widths still describe `columns`.
+    func matches(_ columns: [ColumnInfo]) -> Bool { widths.count == columns.count }
+
+    mutating func update(
+        columns: [ColumnInfo],
+        rows: [TableModel.GridRow],
+        overrides: [String: CGFloat]
+    ) {
+        let measured = ColumnLayout.widths(for: columns, rows: rows, overrides: overrides)
+        guard measured != widths else { return }
+        widths = measured
+        offsets = ColumnLayout.offsets(for: measured)
+        trailingAligned = columns.map(\.kind.prefersTrailingAlignment)
+        version += 1
+    }
+
+    static func == (lhs: GridLayout, rhs: GridLayout) -> Bool { lhs.version == rhs.version }
 }
 
 // MARK: - Header cell
@@ -475,91 +564,140 @@ private struct CellTooltip: ViewModifier {
     }
 }
 
-/// A row of cells.
+/// A row of cells: the drawing, plus the one place it answers the pointer.
 ///
-/// `Equatable` on purpose, and used via `.equatable()`: selecting a row changes
-/// one `@State` in the grid, which re-evaluates every row's body. With five
-/// hundred rows of nine cells that is thousands of `Text`s rebuilt to highlight
-/// one line, which is what made clicking a row lag.
+/// The cells are drawn rather than built as views. A `Text` with the modifiers a
+/// cell needs costs about 135µs to materialise, and a row of a dozen of them
+/// about 2ms — so a scroll that reveals ten rows in a frame blew a 16ms budget
+/// on its own, however few columns were on screen. Drawing the same row costs
+/// about a tenth of that, because it is one view rather than a dozen.
+///
+/// What views gave for free has to be put back by hand, and is: the pointer's
+/// column is found from the same offsets the drawing uses, and the tooltip and
+/// the context menu hang off the row rather than off each cell — one of each
+/// instead of a dozen, which is a saving in its own right. The cost is
+/// VoiceOver, which cannot see into a drawing; the row carries a spoken
+/// description of its cells so it is not silent.
 private struct RowView: View, Equatable {
+    /// Same O(1) comparison as `RowCanvas`, so a change elsewhere in the grid —
+    /// a selection, a scroll — does not re-evaluate every row's menu and
+    /// tooltip. The row's own hover state still updates it; `@State` is not
+    /// gated by this.
     nonisolated static func == (lhs: RowView, rhs: RowView) -> Bool {
         lhs.row.id == rhs.row.id
+            && lhs.generation == rhs.generation
             && lhs.isSelected == rhs.isSelected
             && lhs.width == rhs.width
-            && lhs.widths == rhs.widths
-            && lhs.row.cells == rhs.row.cells
+            && lhs.layout == rhs.layout
+            && lhs.visible == rhs.visible
             && lhs.columns.count == rhs.columns.count
     }
 
     @Environment(AppModel.self) private var app
 
     let row: TableModel.GridRow
+    /// Which result the cells came from — see `RowCanvas.==`.
+    let generation: Int
     let columns: [ColumnInfo]
-    let widths: [CGFloat]
+    let layout: GridLayout
+    /// The columns to actually draw. Everything outside this range is skipped,
+    /// so a thousand-column file costs a dozen cells per row.
+    let visible: Range<Int>
     /// The full width of a row, which is the columns' total or the window,
     /// whichever is larger. The same value the header uses.
     let width: CGFloat
     let isSelected: Bool
+
+    /// The column the pointer is over, which is what the menu and the tooltip
+    /// are about.
+    ///
+    /// Held here rather than inside the canvas so that moving the mouse across
+    /// the row re-evaluates only this wrapper: `RowCanvas` is `Equatable` and
+    /// does not depend on the hover, so it compares equal and is not redrawn.
+    @State private var hovered: Int?
 
     /// Roughly how wide one character of the 11pt monospaced cell font is.
     /// Used only to decide whether a value can already be read in full.
     private static let characterWidth: CGFloat = 6.6
 
     var body: some View {
-        HStack(spacing: 0) {
-            // Position-keyed for the same reason as the header, and so cell N
-            // always lines up with header N.
-            ForEach(Array(columns.enumerated()), id: \.offset) { index, column in
-                cell(at: index, column: column)
+        RowCanvas(
+            row: row,
+            generation: generation,
+            layout: layout,
+            visible: visible,
+            width: width,
+            isSelected: isSelected
+        )
+        .equatable()
+        .onContinuousHover { phase in
+            switch phase {
+            case .active(let point):
+                // `point` arrives in the row's own coordinate space, which is
+                // content space — the same space `layout.offsets` is in — so it
+                // is used as-is.
+                //
+                // It is tempting to subtract the scroll view's leading content
+                // inset here, because `NavigationSplitView` insets the detail
+                // pane and the resting `contentOffset.x` really is -268 rather
+                // than 0. Doing so is wrong, and wrong by about four columns:
+                // the inset moves where the row is drawn, not where its own
+                // origin is. Checking that against a *scrolled* grid cannot
+                // tell you — set the clip origin to 0 and it is already 268
+                // points from rest, so both formulas agree.
+                hovered = ColumnLayout.columnIndex(offsets: layout.offsets, at: point.x)
+            case .ended:
+                hovered = nil
             }
         }
-        .frame(width: width, height: 20, alignment: .leading)
-        .background(background)
+        // A tooltip is only worth showing when the cell is actually cut off.
+        // One `.help` for the row, not one per cell: thousands of tracking
+        // rectangles in a window is part of what made switching back to the app
+        // feel slow. `.help("")` is still a `.help`, so the modifier has to be
+        // absent, not empty.
+        .modifier(CellTooltip(text: tooltip))
+        .contextMenu { cellMenu() }
+        // A drawing is opaque to VoiceOver, so the row says what it holds.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(spokenDescription)
+    }
+
+    /// The cell the pointer is over, if there is one.
+    private var hoveredCell: (column: ColumnInfo, value: String?)? {
+        guard let hovered, hovered < columns.count else { return nil }
+        return (columns[hovered], hovered < row.cells.count ? row.cells[hovered] : nil)
+    }
+
+    private var tooltip: String? {
+        guard let hovered, let cell = hoveredCell, let value = cell.value,
+              hovered < layout.widths.count,
+              CGFloat(value.count) * Self.characterWidth > layout.widths[hovered] - 12
+        else { return nil }
+        return value
     }
 
     @ViewBuilder
-    private func cell(at index: Int, column: ColumnInfo) -> some View {
-        let value = index < row.cells.count ? row.cells[index] : nil
-        let width = index < widths.count ? widths[index] : 100
-        Group {
-            if let value {
-                Text(value)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            } else {
-                // NULL is a value, not blank — but it shouldn't shout.
-                Text("NULL")
-                    .foregroundStyle(.tertiary)
-                    .italic()
+    private func cellMenu() -> some View {
+        if let cell = hoveredCell {
+            // Nested and binary columns are left out for the same reason the
+            // filter popover leaves them out: their rendered text is a display
+            // of the value, not something to compare against.
+            if !app.table.isSQLMode, cell.column.kind != .nested, cell.column.kind != .binary {
+                Button(filterLabel(column: cell.column, value: cell.value)) {
+                    app.table.filter(column: cell.column, matching: cell.value)
+                }
+                Divider()
             }
-        }
-        .font(.system(size: 11, design: .monospaced))
-        .monospacedDigit()
-        .padding(.horizontal, 6)
-        .frame(width: width, alignment: column.kind.prefersTrailingAlignment ? .trailing : .leading)
-        // A tooltip is only worth a tracking rectangle when the cell is actually
-        // cut off. Attaching one to every cell put thousands of them in the
-        // window, which AppKit revisits whenever the window becomes key — part
-        // of what made switching back to the app feel slow. `.help("")` is
-        // still a `.help`, so the modifier has to be absent, not empty.
-        .modifier(CellTooltip(text: isTruncated(value, width: width) ? value : nil))
-        .contextMenu { cellMenu(column: column, value: value) }
-    }
-
-    @ViewBuilder
-    private func cellMenu(column: ColumnInfo, value: String?) -> some View {
-        // Nested and binary columns are left out for the same reason the filter
-        // popover leaves them out: their rendered text is a display of the
-        // value, not something to compare against.
-        if !app.table.isSQLMode, column.kind != .nested, column.kind != .binary {
-            Button(filterLabel(column: column, value: value)) {
-                app.table.filter(column: column, matching: value)
+            Button("Copy Value") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(cell.value ?? "NULL", forType: .string)
             }
             Divider()
         }
-        Button("Copy Value") {
+        Button("Copy Row") {
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(value ?? "NULL", forType: .string)
+            NSPasteboard.general.setString(row.cells.map { $0 ?? "" }.joined(separator: "\t"),
+                                           forType: .string)
         }
     }
 
@@ -569,9 +707,110 @@ private struct RowView: View, Equatable {
         return "Filter \(column.name) = \(shown)"
     }
 
-    private func isTruncated(_ value: String?, width: CGFloat) -> Bool {
-        guard let value else { return false }
-        return CGFloat(value.count) * Self.characterWidth > width - 12
+    /// Only the columns on screen, and only their names and values — reading a
+    /// thousand-column row aloud in full helps nobody.
+    private var spokenDescription: String {
+        visible.prefix(24).compactMap { index -> String? in
+            guard index < columns.count else { return nil }
+            let value = index < row.cells.count ? row.cells[index] : nil
+            return "\(columns[index].name): \(value ?? "null")"
+        }
+        .joined(separator: ", ")
+    }
+}
+
+/// The drawn cells of one row.
+private struct RowCanvas: View, Equatable {
+    /// Deliberately O(1). Comparing `row.cells` and the width array elementwise
+    /// is O(columns) *per row on screen*, which on a wide file costs more than
+    /// the drawing does. `generation` stands in for the cells — row ids are
+    /// ordinals, so a re-sort hands back the same ids with different contents,
+    /// and that is the only way a row's cells ever change.
+    nonisolated static func == (lhs: RowCanvas, rhs: RowCanvas) -> Bool {
+        lhs.row.id == rhs.row.id
+            && lhs.generation == rhs.generation
+            && lhs.isSelected == rhs.isSelected
+            && lhs.width == rhs.width
+            && lhs.layout == rhs.layout
+            && lhs.visible == rhs.visible
+    }
+
+    let row: TableModel.GridRow
+    let generation: Int
+    let layout: GridLayout
+    let visible: Range<Int>
+    let width: CGFloat
+    let isSelected: Bool
+
+    static let height: CGFloat = 20
+    /// Matches the padding the header cells use, so the two line up.
+    private static let padding: CGFloat = 6
+
+    var body: some View {
+        Canvas(opaque: false, rendersAsynchronously: false) { context, _ in
+            for index in visible where index < layout.widths.count {
+                draw(index, in: context)
+            }
+        }
+        .frame(width: width, height: Self.height, alignment: .leading)
+        .background(background)
+    }
+
+    private func draw(_ index: Int, in context: GraphicsContext) {
+        let value = index < row.cells.count ? row.cells[index] : nil
+        let x = layout.offsets[index]
+        let cellWidth = layout.widths[index]
+
+        let string = value ?? "NULL"
+        let inner = CGRect(x: x + Self.padding, y: 0,
+                           width: max(cellWidth - Self.padding * 2, 0), height: Self.height)
+
+        var resolved = resolve(string, isNull: value == nil, in: context)
+        var size = resolved.measure(in: Self.unbounded)
+
+        // `.truncationMode(.tail)` is a `Text` affordance, and there is no
+        // `Text` here — so the tail is cut by hand. The cell font is
+        // monospaced, which is what makes "how many characters fit" a division
+        // rather than a search: one measurement gives the character width, and
+        // the prefix that fits follows from it.
+        if size.width > inner.width, string.count > 1 {
+            let characterWidth = size.width / CGFloat(string.count)
+            let fits = max(Int((inner.width - characterWidth) / characterWidth), 1)
+            if fits < string.count {
+                resolved = resolve(String(string.prefix(fits)) + "…", isNull: value == nil, in: context)
+                size = resolved.measure(in: Self.unbounded)
+            }
+        }
+
+        let trailing = index < layout.trailingAligned.count && layout.trailingAligned[index]
+        let originX = trailing ? inner.maxX - size.width : inner.minX
+        let at = CGPoint(x: originX, y: (Self.height - size.height) / 2)
+
+        // The clip is the backstop: the character-width estimate is exact for
+        // the ASCII this grid mostly shows and approximate for anything wider,
+        // and a value must never spill into its neighbour's column. Only worth
+        // a layer when it can actually overflow.
+        guard size.width > inner.width else {
+            context.draw(resolved, at: at, anchor: .topLeading)
+            return
+        }
+        context.drawLayer { layer in
+            layer.clip(to: Path(inner))
+            layer.draw(resolved, at: at, anchor: .topLeading)
+        }
+    }
+
+    private static let unbounded = CGSize(width: CGFloat.greatestFiniteMagnitude, height: height)
+
+    private func resolve(
+        _ string: String,
+        isNull: Bool,
+        in context: GraphicsContext
+    ) -> GraphicsContext.ResolvedText {
+        var text = Text(string).font(.system(size: 11, design: .monospaced))
+        // NULL is a value, not blank — but it shouldn't shout.
+        if isNull { text = text.foregroundStyle(.tertiary).italic() }
+        return context.resolve(text)
     }
 
     private var background: some View {

@@ -28,7 +28,16 @@ struct SchemaInspectorView: View {
 
     var body: some View {
         Group {
-            if let source {
+            // A hidden inspector is not a free one. SwiftUI builds `.inspector`
+            // content whether or not the panel is open, so on a
+            // two-thousand-column file this read the file's metadata and laid
+            // out a row per column before anyone had asked to see either —
+            // about a second of main thread for every file clicked, spent on a
+            // panel that was not on screen. Nothing below is built, and no
+            // metadata is read, until it is shown.
+            if !app.showsInspector {
+                Color.clear
+            } else if let source {
                 content(for: source)
             } else {
                 Text("No file selected")
@@ -36,7 +45,12 @@ struct SchemaInspectorView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .task(id: source) { await load() }
+        // Keyed on the source *and* on being visible, so opening the panel
+        // reads what the selections made while it was shut deliberately did not.
+        .task(id: app.showsInspector ? source : nil) {
+            guard app.showsInspector else { return }
+            await load()
+        }
     }
 
     @ViewBuilder
@@ -79,7 +93,9 @@ struct SchemaInspectorView: View {
 
     private var schemaSection: some View {
         Section {
-            VStack(alignment: .leading, spacing: 3) {
+            // Lazy, because this is one row per column and a parquet file can
+            // carry thousands of them.
+            LazyVStack(alignment: .leading, spacing: 3) {
                 ForEach(app.table.columns) { column in
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(column.name)
@@ -149,7 +165,9 @@ struct SchemaInspectorView: View {
             }
         } else if let columnMetadata, columnMetadata.rowCount > 0 {
             Section {
-                VStack(alignment: .leading, spacing: 8) {
+                // One entry per row group per column, so lazy for the same
+                // reason as the schema list — more so, since this multiplies.
+                LazyVStack(alignment: .leading, spacing: 8) {
                     ForEach(0..<columnMetadata.rowCount, id: \.self) { row in
                         VStack(alignment: .leading, spacing: 2) {
                             Text(columnMetadata.value(row: row, named: "column_name") ?? "—")

@@ -87,6 +87,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         WindowCapture.startIfRequested()
+        StallMonitor.startIfRequested()
+    }
+}
+
+/// Reports when the main thread stops answering.
+///
+/// Enabled by `DUCKPARQ_HANGS=1`, which prints a line per stall longer than
+/// `threshold`. A beachball is not visible in a screenshot and not measurable
+/// from a query timing — the grid can be drawing a screenful for seconds while
+/// every DuckDB number stays in the milliseconds, which is exactly how a wide
+/// parquet file used to behave. This measures the thing the user actually
+/// feels: how late a message to the main queue runs.
+enum StallMonitor {
+    private static let threshold: Double = 0.1
+
+    static func startIfRequested() {
+        guard ProcessInfo.processInfo.environment["DUCKPARQ_HANGS"] != nil else { return }
+        // A dedicated thread, not a timer: a timer is scheduled on the run loop
+        // that is being measured, so it cannot observe that loop being stuck.
+        DispatchQueue(label: "dev.xevix.duckparq.stalls").async {
+            while true {
+                let sent = DispatchTime.now().uptimeNanoseconds
+                let arrived = DispatchSemaphore(value: 0)
+                DispatchQueue.main.async {
+                    let late = Double(DispatchTime.now().uptimeNanoseconds - sent) / 1_000_000_000
+                    if late > threshold {
+                        FileHandle.standardError.write(
+                            Data(String(format: "[stall] main thread blocked %.0fms\n", late * 1000).utf8)
+                        )
+                    }
+                    arrived.signal()
+                }
+                arrived.wait()
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+        }
     }
 }
 

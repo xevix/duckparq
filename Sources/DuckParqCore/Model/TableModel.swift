@@ -42,6 +42,14 @@ public final class TableModel {
     public private(set) var sort: [SortKey] = []
     public private(set) var filters: [Filter] = []
 
+    /// Bumped whenever `rows` is replaced by a different result.
+    ///
+    /// Row ids are ordinals, so a re-sort hands the grid the same ids carrying
+    /// different cells. The grid needs to know that without comparing the cells
+    /// themselves — on a two-thousand-column file that comparison is the diff,
+    /// repeated for every row on screen. Comparing this instead makes it O(1).
+    public private(set) var rowsGeneration = 0
+
     public private(set) var isLoading = false
     public private(set) var isLoadingMore = false
     public private(set) var reachedEnd = false
@@ -582,6 +590,7 @@ public final class TableModel {
     /// Replace the grid's rows with the window that was just read.
     private func commit(_ cells: [[String?]], requested: Int) {
         rows = cells.enumerated().map { GridRow(id: $0.offset, cells: $0.element) }
+        rowsGeneration += 1
         rowsAreStale = false
         // Fewer rows than asked for means the result really is exhausted; the
         // limit is what stopped it otherwise.
@@ -724,6 +733,7 @@ public final class TableModel {
         columns = cached.columns
         if case .source(let source) = mode { loadedSource = source }
         rows = cached.rows.enumerated().map { GridRow(id: $0.offset, cells: $0.element) }
+        rowsGeneration += 1
         rowsAreStale = false
         totalRowCount = cached.totalRowCount
         isCountingRows = false

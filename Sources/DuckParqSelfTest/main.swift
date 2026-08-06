@@ -258,6 +258,98 @@ do {
     expectEqual(absurd[2], ColumnLayout.maxWidth, "an override is clamped to the maximum")
 }
 
+// MARK: - Horizontal virtualization
+//
+// The grid draws only the columns the viewport is over. Getting the range
+// wrong is not a slow grid but a wrong one: cells would sit under the wrong
+// headers, or scroll off before the edge of the window. The offsets are the
+// single source of truth for both, so they are what these check.
+
+do {
+    let widths: [CGFloat] = [100, 200, 50, 300, 75]
+    let offsets = ColumnLayout.offsets(for: widths)
+
+    expectEqual(offsets.count, widths.count + 1, "there is one offset per column plus the total")
+    expectEqual(offsets, [0, 100, 300, 350, 650, 725], "offsets are the running sum of the widths")
+    expectEqual(offsets.last, widths.reduce(0, +), "the last offset is the full content width")
+    expectEqual(ColumnLayout.offsets(for: []), [0], "no columns still yields a zero total")
+
+    // Without overscan the range is exactly the columns the viewport touches.
+    // Checked with overscan 0 because that is the property that has to hold;
+    // the overscan is padding around it, not part of the answer.
+    expectEqual(ColumnLayout.visibleRange(offsets: offsets, x: 0, width: 100, overscan: 0), 0..<1,
+                "a viewport over the first column shows only it")
+    expectEqual(ColumnLayout.visibleRange(offsets: offsets, x: 0, width: 350, overscan: 0), 0..<3,
+                "a viewport spanning three columns shows all three")
+    expectEqual(ColumnLayout.visibleRange(offsets: offsets, x: 310, width: 100, overscan: 0), 2..<4,
+                "scrolled past the start, the range begins at the column under the left edge")
+    expectEqual(ColumnLayout.visibleRange(offsets: offsets, x: 700, width: 100, overscan: 0), 4..<5,
+                "a viewport past the end of the content clamps to the last column")
+
+    // A column partly over the left edge is still on screen — dropping it would
+    // leave a blank strip where its remaining sliver should be.
+    let straddling = ColumnLayout.visibleRange(offsets: offsets, x: 150, width: 100, overscan: 0)
+    expect(straddling.contains(1), "a column straddling the left edge is included")
+
+    let padded = ColumnLayout.visibleRange(offsets: offsets, x: 310, width: 100, overscan: 2)
+    expectEqual(padded, 0..<5, "overscan widens the range and stays inside the columns that exist")
+
+    expectEqual(ColumnLayout.visibleRange(offsets: [0], x: 0, width: 500), 0..<0,
+                "a grid with no columns has nothing to show")
+    expectEqual(ColumnLayout.visibleRange(offsets: offsets, x: 0, width: 0), 0..<0,
+                "a viewport with no width has nothing to show")
+
+    // Whatever the scroll position, the drawn columns start exactly where the
+    // omitted ones end — that offset is the spacer the header and every row put
+    // in front of their cells, and it is what keeps the two aligned.
+    for x in stride(from: CGFloat(0), through: 725, by: 25) {
+        let range = ColumnLayout.visibleRange(offsets: offsets, x: x, width: 200)
+        expect(range.lowerBound >= 0 && range.upperBound <= widths.count,
+               "the visible range stays within the columns at x=\(Int(x))")
+        let drawn = widths[range].reduce(0, +)
+        expectEqual(offsets[range.lowerBound] + drawn, offsets[range.upperBound],
+                    "the leading spacer plus the drawn columns reach the end of the range at x=\(Int(x))")
+    }
+
+    // Turning a pointer position back into a cell. The cells are drawn rather
+    // than laid out as views, so this is the only thing standing between a
+    // right-click and the wrong column's filter.
+    expectEqual(ColumnLayout.columnIndex(offsets: offsets, at: 0), 0,
+                "the left edge is the first column")
+    expectEqual(ColumnLayout.columnIndex(offsets: offsets, at: 99), 0,
+                "a point inside the first column is the first column")
+    expectEqual(ColumnLayout.columnIndex(offsets: offsets, at: 100), 1,
+                "a point on a boundary belongs to the column it starts")
+    expectEqual(ColumnLayout.columnIndex(offsets: offsets, at: 349), 2,
+                "a point inside a narrow column is that column")
+    expectEqual(ColumnLayout.columnIndex(offsets: offsets, at: 724), 4,
+                "a point in the last column is the last column")
+    expectEqual(ColumnLayout.columnIndex(offsets: offsets, at: 5_000), 4,
+                "a point past the content clamps to the last column")
+    expectEqual(ColumnLayout.columnIndex(offsets: offsets, at: -20), 0,
+                "a point before the content clamps to the first column")
+    expect(ColumnLayout.columnIndex(offsets: [0], at: 10) == nil,
+           "a grid with no columns has no column under the pointer")
+
+    // Every point in a column's span must resolve to that column, or a menu
+    // would sometimes act on the neighbour.
+    for index in 0..<widths.count {
+        let start = offsets[index]
+        for x in stride(from: start, to: offsets[index + 1], by: 7) {
+            expectEqual(ColumnLayout.columnIndex(offsets: offsets, at: x), index,
+                        "x=\(Int(x)) falls in column \(index)")
+        }
+    }
+
+    // Wide files are the case this exists for: a thousand columns must cost a
+    // screenful of cells, not a thousand.
+    let many = [CGFloat](repeating: 80, count: 1_000)
+    let manyOffsets = ColumnLayout.offsets(for: many)
+    let onScreen = ColumnLayout.visibleRange(offsets: manyOffsets, x: 40_000, width: 1_200)
+    expect(onScreen.count < 30, "a thousand-column grid draws a screenful, not the file")
+    expect(onScreen.contains(500), "the range covers the column under the left edge")
+}
+
 // MARK: - Engine round-trip
 
 section("Engine round-trip")
