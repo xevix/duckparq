@@ -176,7 +176,16 @@ final class AppModel {
         panel.prompt = "Add Folder"
         panel.message = "Choose a folder to browse for parquet files"
         guard panel.runModal() == .OK else { return }
-        for url in panel.urls where !roots.contains(url) {
+        addRoots(panel.urls)
+    }
+
+    /// Put folders in the sidebar, expanded, skipping any already there.
+    ///
+    /// Compared by path rather than by URL: the same folder arrives as `/a/b`
+    /// from an open panel and `/a/b/` from a drop, and those two URLs are not
+    /// equal — added twice, the sidebar would draw the folder twice.
+    func addRoots(_ urls: [URL]) {
+        for url in urls where !roots.contains(where: { $0.path == url.path }) {
             roots.append(url)
             expandedFolders.insert(url)
         }
@@ -213,20 +222,36 @@ final class AppModel {
         open(url)
     }
 
-    /// Open a file dropped on the window.
+    /// Take what was dropped on the window.
     ///
-    /// Returns whether the drop held a parquet file at all. Saying no is what
-    /// makes the dragged file fly back to where it came from, rather than
+    /// Returns whether the drop held anything DuckParq deals in. Saying no is
+    /// what makes the dragged item fly back to where it came from, rather than
     /// disappearing into a window that quietly did nothing with it.
     ///
-    /// A drop can carry a whole Finder selection. Only the first parquet file
-    /// is opened — a window shows one table, and picking the first is at least
-    /// a rule that can be predicted.
+    /// A drop can carry a whole Finder selection, so both kinds are handled and
+    /// each keeps the meaning it has everywhere else in the app:
+    ///
+    ///   - Folders go into the sidebar, exactly as Add Folder… puts them there.
+    ///     Every folder dropped is added — the panel takes several at once too,
+    ///     and a folder costs a row rather than the window's one table.
+    ///   - Files: the first parquet file is opened. A window shows one table,
+    ///     and picking the first is at least a rule that can be predicted.
+    ///
+    /// Folders first, so a drop of a folder and a file inside it opens the file
+    /// in the tree it now belongs to rather than into Recently Opened.
+    ///
+    /// A folder already in the sidebar counts as accepted rather than refused:
+    /// the drop was understood, and there is nothing left to do about it. Flying
+    /// it back would say the folder is not there when it plainly is.
     @discardableResult
     func openDropped(_ urls: [URL]) -> Bool {
-        guard let file = FileTree.parquetFiles(in: urls).first else { return false }
-        open(file)
-        return true
+        let folders = FileTree.directories(in: urls)
+        addRoots(folders)
+
+        let file = FileTree.parquetFiles(in: urls).first
+        if let file { open(file) }
+
+        return !folders.isEmpty || file != nil
     }
 
     /// Open a parquet file, and put a row for it on screen.

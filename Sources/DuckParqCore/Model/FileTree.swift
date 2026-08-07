@@ -202,6 +202,17 @@ public enum FileTree {
         }
     }
 
+    /// The folders among some URLs, in the order given.
+    ///
+    /// The other half of sifting a drop. A folder dragged in is a folder to
+    /// browse — the same thing Add Folder… produces — so it is picked out
+    /// rather than ignored, and a drop holding both kinds does both.
+    public static func directories(in urls: [URL]) -> [URL] {
+        urls.filter {
+            (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+        }
+    }
+
     // MARK: - Locating a file in the added roots
 
     /// The components of `url` below `directory`, or nil when `url` is not

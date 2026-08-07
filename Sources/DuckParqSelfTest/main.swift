@@ -227,6 +227,25 @@ do {
     expect(FileTree.parquetFiles(in: [trap]).isEmpty,
            "a folder named .parquet is not mistaken for a file")
     try? FileManager.default.removeItem(at: trap)
+
+    // The other half of the sift: a dropped folder is a folder to browse, so
+    // one drop can both add a root and open a file.
+    expectEqual(FileTree.directories(in: dropped).map(\.lastPathComponent),
+                [hiveDirectory.lastPathComponent],
+                "only folders survive as folders, in the order dragged")
+    expect(FileTree.directories(in: [smallParquet]).isEmpty,
+           "a file is not a folder to add")
+    expect(FileTree.directories(in: []).isEmpty, "an empty drop yields no folders")
+
+    // Neither half is asked to guess: existence is read from disk, not from the
+    // name, so a folder called .parquet is added and a missing path is neither.
+    let namedLikeAFile = fixtures.appendingPathComponent("looks-like-a-file.parquet")
+    try? FileManager.default.createDirectory(at: namedLikeAFile, withIntermediateDirectories: true)
+    expectEqual(FileTree.directories(in: [namedLikeAFile]).count, 1,
+                "a folder named .parquet is still a folder to browse")
+    try? FileManager.default.removeItem(at: namedLikeAFile)
+    expect(FileTree.directories(in: [fixtures.appendingPathComponent("gone")]).isEmpty,
+           "a path that is not there is not a folder")
 }
 
 // MARK: - Locating a file in the added roots

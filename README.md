@@ -26,7 +26,8 @@ Three ways in, all doing the same thing:
 
 - **File ▸ Open File…** (⌥⌘O).
 - **Drag a file onto the window.** Anywhere in it — the whole window is the
-  target. Files that are not parquet are ignored.
+  target. Drag a *folder* instead and it joins the sidebar, exactly as **Add
+  Folder…** puts it there. Anything else is ignored.
 - **Open it from Finder**, once the app is installed:
 
 ```bash
