@@ -270,6 +270,17 @@ struct DataGridView: View {
 
     private func headerRow(layout: GridLayout, visible: Range<Int>) -> some View {
         let widths = layout.widths
+        // Read once here, not inside the ForEach — `RowView` is handed its
+        // columns for the same reason.
+        //
+        // `visible` describes the columns as they were when this header was
+        // built, and SwiftUI re-runs a ForEach body whenever something the body
+        // observed changes. A body reading `table.columns` live therefore
+        // indexes the *new* columns with the *old* range, and emptying them
+        // crashes it: closing a file, or removing the added folder the open
+        // file was inside, clears the grid out from under a header still
+        // describing eleven columns.
+        let columns = table.columns
         return HStack(spacing: 0) {
             // A spacer standing in for the columns scrolled off to the left, so
             // the cells that are drawn land where the rows put theirs.
@@ -280,22 +291,27 @@ struct DataGridView: View {
             // duplicate or empty column names, and identical ForEach ids would
             // drop cells and shift every column after them.
             ForEach(visible, id: \.self) { index in
-                let column = table.columns[index]
-                HeaderCell(
-                    column: column,
-                    width: widths[index],
-                    direction: table.sortDirection(for: column.name),
-                    ordinal: table.sortOrdinal(for: column.name),
-                    onToggle: { additive in
-                        GridTrace.log("tap column \(index) \(column.name) additive \(additive)",
-                                      dedupe: false)
-                        table.toggleSort(column: column.name, additive: additive)
-                        GridTrace.log("sort now [" + table.sort.map {
-                            "\($0.column) \($0.direction.rawValue)"
-                        }.joined(separator: ", ") + "]", dedupe: false)
-                    },
-                    onResize: { delta in resize(column, currentWidth: widths[index], by: delta) }
-                )
+                // The snapshot and the range come from the same build, so this
+                // holds — but a header cell for a column that is gone is not
+                // worth crashing over if it ever stops holding.
+                if index < columns.count, index < widths.count {
+                    let column = columns[index]
+                    HeaderCell(
+                        column: column,
+                        width: widths[index],
+                        direction: table.sortDirection(for: column.name),
+                        ordinal: table.sortOrdinal(for: column.name),
+                        onToggle: { additive in
+                            GridTrace.log("tap column \(index) \(column.name) additive \(additive)",
+                                          dedupe: false)
+                            table.toggleSort(column: column.name, additive: additive)
+                            GridTrace.log("sort now [" + table.sort.map {
+                                "\($0.column) \($0.direction.rawValue)"
+                            }.joined(separator: ", ") + "]", dedupe: false)
+                        },
+                        onResize: { delta in resize(column, currentWidth: widths[index], by: delta) }
+                    )
+                }
             }
         }
         .frame(height: 26)
