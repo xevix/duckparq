@@ -7,8 +7,16 @@ struct DuckParqApp: App {
     @State private var app = AppModel()
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
+    /// A single window, not a `WindowGroup`.
+    ///
+    /// `WindowGroup` is a template: SwiftUI opens a *new* window for every open
+    /// request the app receives, so each `open -a DuckParq file.parquet` left
+    /// another copy of the whole browser on screen, and macOS then restored the
+    /// accumulated set on the next launch. DuckParq browses folders from one
+    /// sidebar rather than opening a document per file, so there is exactly one
+    /// window to have — `Window` says so, and open requests are routed into it.
     var body: some Scene {
-        WindowGroup {
+        Window("DuckParq", id: "main") {
             ContentView()
                 .environment(app)
                 .frame(minWidth: 900, minHeight: 520)
