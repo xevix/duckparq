@@ -10,6 +10,8 @@ FIXTURES := $(ROOT)/.fixtures
 BUILD    := $(ROOT)/.build
 APP      := $(BUILD)/DuckParq.app
 
+LSREGISTER := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+
 # DuckDB's statically linked extensions are registered through the generated
 # extension loader. The linker discards archive members nothing references, so
 # the extension archives must be force-loaded or the parquet reader silently
@@ -73,9 +75,13 @@ app: release
 run: app
 	open $(APP)
 
+## install: Launch Services notices /Applications on its own schedule, so the
+## document types are re-registered by hand -- otherwise Finder keeps offering
+## whatever the previous copy of the bundle claimed.
 install: app
 	rm -rf /Applications/DuckParq.app
 	cp -R $(APP) /Applications/
+	@$(LSREGISTER) -f /Applications/DuckParq.app
 	@echo "installed /Applications/DuckParq.app"
 
 clean:

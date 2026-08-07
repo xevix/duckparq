@@ -40,6 +40,20 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$EXECUTABLE" "$APP/Contents/MacOS/DuckParq"
 
+# Two document type entries for one format, on purpose.
+#
+# Parquet has no system UTI, so every viewer invents one and only one of them
+# wins the .parquet extension in the Launch Services database. The first entry
+# claims files typed as our own declaration below; the second claims the
+# extension directly, the legacy spelling, which still binds when some other
+# app's UTI is the one that won. Launch Services folds them into a single
+# "DuckParq" row in Open With.
+#
+# The rank is what actually gets us recommended: Alternate means "I can open
+# this but prefer someone else", which buries the app at the bottom of Open
+# With. Default means "I am a reasonable handler for this", which is what Tad
+# claims and what puts an app in Finder's recommended set. Owner would claim we
+# defined the format, which Apache did.
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -62,9 +76,18 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <dict>
       <key>CFBundleTypeName</key><string>Parquet File</string>
       <key>CFBundleTypeRole</key><string>Viewer</string>
-      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>CFBundleTypeIconFile</key><string>AppIcon</string>
+      <key>LSHandlerRank</key><string>Default</string>
       <key>LSItemContentTypes</key>
       <array><string>${BUNDLE_ID}.parquet</string></array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Parquet File</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>CFBundleTypeIconFile</key><string>AppIcon</string>
+      <key>LSHandlerRank</key><string>Default</string>
+      <key>CFBundleTypeExtensions</key>
+      <array><string>parquet</string><string>pq</string><string>parq</string></array>
     </dict>
   </array>
   <key>UTImportedTypeDeclarations</key>
