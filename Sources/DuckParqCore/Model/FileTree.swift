@@ -29,6 +29,22 @@ public struct FileNode: Identifiable, Hashable, Sendable {
         guard let byteSize else { return nil }
         return ByteCountFormatter.string(fromByteCount: byteSize, countStyle: .file)
     }
+
+    /// A node for a single parquet file, with its size and date read from disk.
+    ///
+    /// Files reached from outside a directory listing — opened from Finder, or
+    /// remembered from a previous launch — still have to look like every other
+    /// row, so they are described the same way.
+    public static func file(at url: URL) -> FileNode {
+        let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        return FileNode(
+            url: url,
+            isDirectory: false,
+            isDataset: false,
+            byteSize: values?.fileSize.map(Int64.init),
+            modified: values?.contentModificationDate
+        )
+    }
 }
 
 public enum FileTree {
@@ -172,6 +188,93 @@ public enum FileTree {
             }
         }
         return false
+    }
+
+    /// The parquet files among some URLs, in the order given.
+    ///
+    /// Used to sift a drop, which can carry anything the Finder had selected.
+    /// A directory is excluded even when its name ends in `.parquet`: a folder
+    /// is a dataset, which is a different thing to open.
+    public static func parquetFiles(in urls: [URL]) -> [URL] {
+        urls.filter { url in
+            guard parquetExtensions.contains(url.pathExtension.lowercased()) else { return false }
+            return (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory != true
+        }
+    }
+
+    // MARK: - Locating a file in the added roots
+
+    /// The components of `url` below `directory`, or nil when `url` is not
+    /// below it.
+    ///
+    /// Compared component-wise rather than as strings: `/data/sales` is not a
+    /// prefix-match for `/data/sales-2024`, but the string test says it is. It
+    /// is also trailing-slash-proof, which plain `URL` equality is not — a
+    /// directory listing hands back `file:///a/b/` where an open panel hands
+    /// back `file:///a/b`, and those two URLs are not equal.
+    ///
+    /// Symlinks are resolved only as a fallback. Finder passes `/private/var/…`
+    /// for a root that was added as `/var/…`, and the two resolve alike; doing
+    /// it unconditionally would instead rewrite paths that already matched.
+    public static func relativeComponents(of url: URL, under directory: URL) -> [String]? {
+        func descent(from base: [String], to candidate: [String]) -> [String]? {
+            guard candidate.count > base.count, Array(candidate.prefix(base.count)) == base
+            else { return nil }
+            return Array(candidate.dropFirst(base.count))
+        }
+
+        if let found = descent(from: directory.pathComponents, to: url.pathComponents) {
+            return found
+        }
+        return descent(from: resolvedComponents(directory), to: resolvedComponents(url))
+    }
+
+    /// A URL's components with the symlinks in its path resolved.
+    ///
+    /// `resolvingSymlinksInPath` resolves nothing at all when the path does not
+    /// exist, and the leaf here is a file that may since have been moved. The
+    /// directory is what carries the symlink worth resolving, so it is resolved
+    /// on its own and the name put back.
+    private static func resolvedComponents(_ url: URL) -> [String] {
+        let resolved = url.resolvingSymlinksInPath()
+        if resolved.path != url.path { return resolved.pathComponents }
+        return url.deletingLastPathComponent()
+            .resolvingSymlinksInPath()
+            .appendingPathComponent(url.lastPathComponent)
+            .pathComponents
+    }
+
+    /// Whether `url` lies somewhere below `directory`.
+    public static func contains(_ directory: URL, _ url: URL) -> Bool {
+        relativeComponents(of: url, under: directory) != nil
+    }
+
+    /// The added root `url` sits under.
+    ///
+    /// The deepest match wins: with both `/data` and `/data/sales` added, a file
+    /// in the latter is revealed there rather than several levels down the
+    /// former, which is the shorter trip for the reader.
+    public static func root(containing url: URL, in roots: [URL]) -> URL? {
+        roots
+            .filter { contains($0, url) }
+            .max { $0.pathComponents.count < $1.pathComponents.count }
+    }
+
+    /// Every directory that has to be open for `url` to be on screen: `root`
+    /// itself, then each directory down to the one holding `url`.
+    ///
+    /// The URLs are built by appending onto `root` as the caller spelled it, so
+    /// they compare equal to the ones a directory listing produces — which is
+    /// what the sidebar's expansion set is holding.
+    public static func ancestors(of url: URL, upTo root: URL) -> [URL] {
+        guard let relative = relativeComponents(of: url, under: root) else { return [] }
+        var chain = [root]
+        var current = root
+        for component in relative.dropLast() {
+            current = current.appendingPathComponent(component)
+            chain.append(current)
+        }
+        return chain
     }
 
     /// Recursive name search, used by the sidebar's filter field. Bounded so a

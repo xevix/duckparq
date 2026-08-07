@@ -15,6 +15,7 @@ final class AppModel {
     private enum Defaults {
         static let roots = "dev.xevix.duckparq.roots"
         static let formatOnSave = "dev.xevix.duckparq.formatOnSave"
+        static let recentlyOpened = "dev.xevix.duckparq.recentlyOpened"
     }
 
     let engine: DuckDBEngine
@@ -39,6 +40,34 @@ final class AppModel {
     var expandedFolders: Set<URL> = []
     /// True while `expandAll()` is still walking the tree.
     private(set) var isExpandingAll = false
+
+    /// Files opened from Finder that live outside every added folder.
+    ///
+    /// Opening a file is not a request to browse the folder it happens to sit
+    /// in — that folder may be a Downloads directory with a thousand unrelated
+    /// things in it. The file gets a row of its own instead, and adding the
+    /// folder stays a deliberate act, on the row's context menu.
+    private(set) var recentlyOpened: [URL] = [] {
+        didSet { persistRecentlyOpened() }
+    }
+    var showsRecentlyOpened = true
+
+    private static let recentlyOpenedLimit = 20
+
+    /// The route the sidebar has to scroll along to bring a row into view: the
+    /// added folder, each folder below it, and last the file itself.
+    ///
+    /// A route rather than a destination because the sidebar builds rows only
+    /// as they approach the viewport. A file a hundred folders down does not
+    /// exist to be scrolled to until every folder above it has been scrolled to
+    /// first — see `SidebarView`'s walk of this.
+    private(set) var revealRoute: [URL] = []
+    /// Changes on every request, so asking twice for the same row still counts
+    /// as a change worth acting on.
+    private(set) var revealNonce = 0
+
+    /// Folders whose rows the sidebar has read from disk and drawn.
+    private var listedDirectories: Set<URL> = []
 
     var showsInspector = false
     var showsSQLEditor = false
@@ -108,6 +137,7 @@ final class AppModel {
         )
 
         loadRoots()
+        loadRecentlyOpened()
         refreshSavedQueries()
 
         // Syntax highlighting keywords come from the engine rather than a
@@ -152,6 +182,162 @@ final class AppModel {
         }
     }
 
+    // MARK: - Opening a file
+
+    /// Choose a parquet file in a panel and open it.
+    ///
+    /// Deliberately the same call as a double-click in Finder, down to leaving
+    /// the containing folder out of the sidebar: picking one file to look at is
+    /// the same intent however it was picked, and having the two routes differ
+    /// would only mean learning which is which.
+    func openFile() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        // Parquet has no system type, so this resolves through the extensions
+        // the bundle declares — one type covering all three where the bundle is
+        // registered, one per extension where it is not, hence the dedupe. An
+        // empty list filters nothing, which is the right way to fail here:
+        // showing every file beats showing none.
+        var types: [UTType] = []
+        for suffix in FileTree.parquetExtensions.sorted() {
+            if let type = UTType(filenameExtension: suffix), !types.contains(type) {
+                types.append(type)
+            }
+        }
+        panel.allowedContentTypes = types
+        panel.prompt = "Open"
+        panel.message = "Choose a parquet file to open"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        open(url)
+    }
+
+    /// Open a file dropped on the window.
+    ///
+    /// Returns whether the drop held a parquet file at all. Saying no is what
+    /// makes the dragged file fly back to where it came from, rather than
+    /// disappearing into a window that quietly did nothing with it.
+    ///
+    /// A drop can carry a whole Finder selection. Only the first parquet file
+    /// is opened — a window shows one table, and picking the first is at least
+    /// a rule that can be predicted.
+    @discardableResult
+    func openDropped(_ urls: [URL]) -> Bool {
+        guard let file = FileTree.parquetFiles(in: urls).first else { return false }
+        open(file)
+        return true
+    }
+
+    /// Open a parquet file, and put a row for it on screen.
+    ///
+    /// Shared by Finder and by Open File — see `openFile()`.
+    ///
+    /// Two cases, and the difference is whether the file is already reachable
+    /// in the sidebar. Under an added folder, the chain of folders down to it
+    /// is opened and the row scrolled to — the file was always there, it was
+    /// just shut away. Outside every added folder it goes to Recently Opened,
+    /// because silently adding its parent would drag a whole directory into the
+    /// sidebar on the strength of one double-click.
+    ///
+    /// Either way the file opens in the grid; the row is about being able to
+    /// find it again.
+    func open(_ url: URL) {
+        // A filtered sidebar is showing search results, not the tree, so
+        // nothing can be revealed in it until the filter is gone.
+        searchQuery = ""
+
+        if let root = FileTree.root(containing: url, in: roots) {
+            let folders = FileTree.ancestors(of: url, upTo: root)
+            expandedFolders.formUnion(folders)
+            requestReveal(along: folders + [url])
+        } else {
+            rememberRecentlyOpened(url)
+            // A Recently Opened row sits at the top of the sidebar and is drawn
+            // as soon as the section is, so there is nothing to walk down to.
+            requestReveal(along: [url])
+        }
+
+        select(FileNode.file(at: url))
+    }
+
+    // MARK: - Recently opened
+
+    private func loadRecentlyOpened() {
+        let paths = UserDefaults.standard.stringArray(forKey: Defaults.recentlyOpened) ?? []
+        recentlyOpened = paths.map { URL(fileURLWithPath: $0) }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    private func persistRecentlyOpened() {
+        UserDefaults.standard.set(recentlyOpened.map(\.path), forKey: Defaults.recentlyOpened)
+    }
+
+    private func rememberRecentlyOpened(_ url: URL) {
+        recentlyOpened.removeAll { $0.path == url.path }
+        recentlyOpened.insert(url, at: 0)
+        if recentlyOpened.count > Self.recentlyOpenedLimit {
+            recentlyOpened.removeLast(recentlyOpened.count - Self.recentlyOpenedLimit)
+        }
+        showsRecentlyOpened = true
+    }
+
+    /// What Recently Opened actually draws.
+    ///
+    /// Filtered rather than pruned on the way in: a file whose folder gets
+    /// added later belongs in the tree, and taking the row away is how you see
+    /// that it moved there. Removing the folder again brings it back.
+    var recentlyOpenedRows: [FileNode] {
+        recentlyOpened
+            .filter { !isCoveredByRoot($0) }
+            .map(FileNode.file(at:))
+    }
+
+    func forgetRecentlyOpened(_ url: URL) {
+        recentlyOpened.removeAll { $0.path == url.path }
+    }
+
+    func clearRecentlyOpened() {
+        recentlyOpened = []
+    }
+
+    /// Whether the sidebar's tree can already reach this file.
+    func isCoveredByRoot(_ url: URL) -> Bool {
+        FileTree.root(containing: url, in: roots) != nil
+    }
+
+    /// Add the folder a file sits in, then reveal the file inside it.
+    ///
+    /// The row leaves Recently Opened as a consequence of the folder being
+    /// added, not as a separate step — `recentlyOpenedRows` stops listing what
+    /// the tree now shows.
+    func addContainingFolder(of url: URL) {
+        let folder = url.deletingLastPathComponent()
+        if !roots.contains(where: { $0.path == folder.path }) {
+            roots.append(folder)
+        }
+        expandedFolders.insert(folder)
+        requestReveal(along: [folder, url])
+    }
+
+    // MARK: - Revealing a row
+
+    /// Ask the sidebar to scroll along a route, ending on the row to show.
+    private func requestReveal(along route: [URL]) {
+        revealRoute = route
+        revealNonce += 1
+    }
+
+    /// Called by the sidebar when a folder's rows have been read and drawn.
+    func directoryDidList(_ url: URL) {
+        listedDirectories.insert(url)
+    }
+
+    /// Whether a folder's rows exist to be scrolled to.
+    func isDirectoryListed(_ url: URL) -> Bool {
+        listedDirectories.contains(url)
+    }
+
     // MARK: - Sidebar expansion
 
     func isExpanded(_ url: URL) -> Bool { expandedFolders.contains(url) }
@@ -164,6 +350,12 @@ final class AppModel {
 
     func collapseAll() {
         expandedFolders = []
+        showsRecentlyOpened = false
+    }
+
+    /// Whether Collapse All has anything left to shut.
+    var canCollapseAll: Bool {
+        !expandedFolders.isEmpty || (showsRecentlyOpened && !recentlyOpenedRows.isEmpty)
     }
 
     /// Open every folder under every root.
@@ -175,6 +367,7 @@ final class AppModel {
     func expandAll(limit: Int = 5_000) {
         guard !isExpandingAll else { return }
         isExpandingAll = true
+        showsRecentlyOpened = true
         let roots = self.roots
         Task { [weak self] in
             let found = await Task.detached(priority: .userInitiated) { () -> Set<URL> in

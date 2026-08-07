@@ -194,6 +194,112 @@ do {
     expect(datasetSource.readPath.hasSuffix("/**/*.parquet"), "datasets read recursively")
 }
 
+// MARK: - Sifting a drop
+
+section("Dropped files")
+
+do {
+    // A drop carries whatever Finder had selected, which is anything at all.
+    let dropped = [
+        fixtures.appendingPathComponent("does-not-exist.txt"),
+        hiveDirectory,
+        smallParquet,
+        typesParquet,
+    ]
+    expectEqual(FileTree.parquetFiles(in: dropped).map(\.lastPathComponent),
+                ["small.parquet", "types.parquet"],
+                "only parquet files survive a drop, in the order dragged")
+    expect(FileTree.parquetFiles(in: [hiveDirectory]).isEmpty,
+           "a folder is not a file to open, whatever it holds")
+    expect(FileTree.parquetFiles(in: []).isEmpty, "an empty drop yields nothing")
+
+    // The other two extensions the bundle claims have to be honoured here too,
+    // or a file Finder handed over on a double-click would be refused on a drop.
+    let alternatives = ["a.pq", "b.parq", "c.PARQUET"].map(URL.init(fileURLWithPath:))
+    expectEqual(FileTree.parquetFiles(in: alternatives).count, 3,
+                "every claimed extension is accepted, whatever its case")
+    expect(FileTree.parquetFiles(in: [URL(fileURLWithPath: "/x/notes.csv")]).isEmpty,
+           "a file that is not parquet is refused")
+
+    // A directory named like a file is still a directory.
+    let trap = fixtures.appendingPathComponent("looks-like-a-file.parquet")
+    try? FileManager.default.createDirectory(at: trap, withIntermediateDirectories: true)
+    expect(FileTree.parquetFiles(in: [trap]).isEmpty,
+           "a folder named .parquet is not mistaken for a file")
+    try? FileManager.default.removeItem(at: trap)
+}
+
+// MARK: - Locating a file in the added roots
+//
+// What the sidebar needs to open a file handed over by Finder: which added
+// folder it belongs to, and which folders have to be expanded to put it on
+// screen.
+
+section("Reveal in the tree")
+
+do {
+    let data = URL(fileURLWithPath: "/data")
+    let deep = URL(fileURLWithPath: "/data/2024/q1/sales.parquet")
+
+    expect(FileTree.contains(data, deep), "a file below an added folder is found in it")
+    expect(!FileTree.contains(deep, data), "containment is not symmetric")
+    expect(!FileTree.contains(data, data), "a folder does not contain itself")
+
+    // A string prefix test says /data contains /database — the sidebar would
+    // then expand a folder the file is not in, and never show the file.
+    expect(!FileTree.contains(data, URL(fileURLWithPath: "/database/x.parquet")),
+           "a folder is not matched by a name it merely starts")
+    expect(!FileTree.contains(URL(fileURLWithPath: "/data/sales"),
+                              URL(fileURLWithPath: "/data/sales-2024/x.parquet")),
+           "sibling folders sharing a prefix stay separate")
+
+    expectEqual(FileTree.relativeComponents(of: deep, under: data) ?? [],
+                ["2024", "q1", "sales.parquet"],
+                "the descent from the folder to the file is reported in full")
+
+    // A directory listing yields file:///a/b/ where an open panel yields
+    // file:///a/b. Those two URLs are not equal, so the comparison cannot be
+    // one — the roots come from the panel and the folders below from listings.
+    expect(FileTree.contains(URL(fileURLWithPath: "/data", isDirectory: true), deep),
+           "a trailing slash on the folder does not hide the file")
+
+    // Finder passes /private/tmp/… for a folder added as /tmp/…, and only the
+    // resolved forms match. The second case is the harder one: a path whose
+    // leaf does not exist resolves to itself, symlinked directory and all.
+    expect(FileTree.contains(URL(fileURLWithPath: "/etc"),
+                             URL(fileURLWithPath: "/private/etc/hosts")),
+           "a symlinked folder contains a file Finder names differently")
+    expect(FileTree.contains(URL(fileURLWithPath: "/tmp"),
+                             URL(fileURLWithPath: "/private/tmp/gone.parquet")),
+           "and still does when the file itself is no longer there")
+
+    // The deepest added folder wins: it is the shorter trip to the row.
+    let roots = [data, URL(fileURLWithPath: "/data/2024"), URL(fileURLWithPath: "/elsewhere")]
+    expectEqual(FileTree.root(containing: deep, in: roots)?.path, "/data/2024",
+                "the nearest added folder is the one to reveal in")
+    expect(FileTree.root(containing: URL(fileURLWithPath: "/other/x.parquet"), in: roots) == nil,
+           "a file under no added folder has no root")
+    expect(FileTree.root(containing: deep, in: []) == nil, "with no folders added there is no root")
+
+    expectEqual(FileTree.ancestors(of: deep, upTo: data).map(\.path),
+                ["/data", "/data/2024", "/data/2024/q1"],
+                "every folder down to the file's own is expanded, the file itself is not")
+    expectEqual(FileTree.ancestors(of: URL(fileURLWithPath: "/data/top.parquet"), upTo: data).map(\.path),
+                ["/data"],
+                "a file directly in the added folder needs only that folder open")
+    expect(FileTree.ancestors(of: deep, upTo: URL(fileURLWithPath: "/elsewhere")).isEmpty,
+           "a file outside the folder has nothing to expand")
+
+    // The expanded URLs are compared against ones the sidebar built from a
+    // directory listing, so they have to be spelled the same way.
+    let listed = fixtures.appendingPathComponent("hive")
+    let chain = FileTree.ancestors(of: listed.appendingPathComponent("x.parquet"), upTo: fixtures)
+    expect(chain.contains(listed),
+           "an expanded folder equals the URL a directory listing produces")
+    expect(Set(FileTree.children(of: fixtures).map(\.url)).isSuperset(of: [listed]),
+           "and that URL is in fact what the listing produced")
+}
+
 // MARK: - Column layout
 
 section("Column layout")

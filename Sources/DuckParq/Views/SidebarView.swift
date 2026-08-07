@@ -10,45 +10,65 @@ import SwiftUI
 struct SidebarView: View {
     @Environment(AppModel.self) private var app
     @State private var searchResults: [FileNode] = []
+    @State private var revealWalk: Task<Void, Never>?
 
     var body: some View {
         @Bindable var app = app
 
         VStack(spacing: 0) {
-            List {
-                if app.searchQuery.isEmpty {
-                    ForEach(app.roots, id: \.self) { root in
-                        Section {
-                            if app.isExpanded(root) {
-                                // A folder you added is often the dataset
-                                // itself, so offer it directly rather than
-                                // making you find a file inside it first.
-                                if FileTree.looksLikeDataset(root) {
-                                    RootDatasetRow(url: root)
+            // The reader wraps the List so a row opened from Finder can be
+            // scrolled to; rows are identified by their URL, which is what
+            // AppModel asks for.
+            ScrollViewReader { scroller in
+                List {
+                    if app.searchQuery.isEmpty {
+                        RecentlyOpenedSection()
+
+                        ForEach(app.roots, id: \.self) { root in
+                            Section {
+                                if app.isExpanded(root) {
+                                    // A folder you added is often the dataset
+                                    // itself, so offer it directly rather than
+                                    // making you find a file inside it first.
+                                    if FileTree.looksLikeDataset(root) {
+                                        RootDatasetRow(url: root)
+                                    }
+                                    DirectoryContents(url: root, depth: 0)
                                 }
-                                DirectoryContents(url: root, depth: 0)
+                            } header: {
+                                RootHeader(url: root)
                             }
-                        } header: {
-                            RootHeader(url: root)
                         }
-                    }
-                } else {
-                    Section("Search results") {
-                        if searchResults.isEmpty {
-                            Text("No matches").foregroundStyle(.secondary).font(.callout)
-                        }
-                        ForEach(searchResults) { node in
-                            FileRow(node: node)
+                    } else {
+                        Section("Search results") {
+                            if searchResults.isEmpty {
+                                Text("No matches").foregroundStyle(.secondary).font(.callout)
+                            }
+                            ForEach(searchResults) { node in
+                                FileRow(node: node)
+                            }
                         }
                     }
                 }
+                .listStyle(.sidebar)
+                // Keyed on the nonce, not the route: revealing the same file
+                // twice has to scroll twice.
+                .onChange(of: app.revealNonce) { _, _ in
+                    let route = app.revealRoute
+                    revealWalk?.cancel()
+                    revealWalk = Task { await walk(route, with: scroller) }
+                }
             }
-            .listStyle(.sidebar)
 
             if app.roots.isEmpty {
                 VStack(spacing: 8) {
                     Text("No folders yet").foregroundStyle(.secondary).font(.callout)
-                    Button("Add Folder…") { app.addRoot() }
+                    HStack(spacing: 8) {
+                        Button("Add Folder…") { app.addRoot() }
+                        // Browsing a folder is not the only reason to be here;
+                        // one file you already know the name of is the other.
+                        Button("Open File…") { app.openFile() }
+                    }
                 }
                 .frame(maxWidth: .infinity)
                 .padding()
@@ -66,7 +86,7 @@ struct SidebarView: View {
                 Button { app.collapseAll() } label: {
                     Image(systemName: "arrow.down.right.and.arrow.up.left")
                 }
-                .disabled(app.expandedFolders.isEmpty)
+                .disabled(!app.canCollapseAll)
                 .help("Collapse every folder")
 
                 Button { app.expandAll() } label: {
@@ -82,6 +102,126 @@ struct SidebarView: View {
         }
     }
 
+    /// Scroll down a route one folder at a time, ending on the row to show.
+    ///
+    /// A List builds rows only as they come near the viewport, so a file a
+    /// hundred folders down does not exist to be scrolled to: asking for it
+    /// directly does nothing at all, and the folder holding it is never even
+    /// read from disk. Scrolling to each folder in turn is what brings the next
+    /// one into existence.
+    ///
+    /// Each step waits for that folder's rows before reaching past them —
+    /// briefly, and with a ceiling, because a folder on a slow volume is worth
+    /// waiting for but not worth hanging the walk over. Giving up early costs
+    /// the scroll, not the open: the file is selected and its folders are
+    /// expanded regardless of how far this gets.
+    @MainActor
+    private func walk(_ route: [URL], with scroller: ScrollViewProxy) async {
+        for (index, url) in route.enumerated() {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                scroller.scrollTo(url, anchor: .center)
+            }
+            guard index < route.count - 1 else { return }
+
+            // One beat for the row just scrolled to to be laid out, then up to
+            // a second for its contents to arrive.
+            for _ in 0..<20 {
+                try? await Task.sleep(for: .milliseconds(50))
+                if Task.isCancelled { return }
+                if app.isDirectoryListed(url) { break }
+            }
+        }
+    }
+}
+
+/// Files opened from Finder that no added folder covers.
+///
+/// A metafolder, not a real one — its rows come from anywhere on disk, so each
+/// one shows the folder it actually lives in, which is the thing you need to
+/// tell two identically named exports apart.
+private struct RecentlyOpenedSection: View {
+    @Environment(AppModel.self) private var app
+
+    var body: some View {
+        let rows = app.recentlyOpenedRows
+        if !rows.isEmpty {
+            Section {
+                if app.showsRecentlyOpened {
+                    ForEach(rows) { node in
+                        RecentlyOpenedRow(node: node)
+                    }
+                }
+            } header: {
+                header(count: rows.count)
+            }
+        }
+    }
+
+    private func header(count: Int) -> some View {
+        HStack(spacing: 0) {
+            HStack(spacing: 4) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(app.showsRecentlyOpened ? 90 : 0))
+                    .animation(.easeInOut(duration: 0.15), value: app.showsRecentlyOpened)
+                    .frame(width: 10)
+
+                Image(systemName: "clock")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Text("Recently Opened").lineLimit(1)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { app.showsRecentlyOpened.toggle() }
+            .help("Files opened from Finder that are not in an added folder")
+
+            Spacer(minLength: 12)
+
+            Button {
+                app.clearRecentlyOpened()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.tertiary)
+            .help("Clear all \(count) recently opened files")
+        }
+    }
+}
+
+/// A recently opened file. Same row as one in the tree, plus the folder it came
+/// from — without a parent folder above it, the name alone says too little.
+private struct RecentlyOpenedRow: View {
+    let node: FileNode
+    @Environment(AppModel.self) private var app
+
+    private var isSelected: Bool { app.selection?.url == node.url }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "doc.text")
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(node.name).lineLimit(1)
+                Text(node.url.deletingLastPathComponent().lastPathComponent)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+            }
+            Spacer(minLength: 0)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { app.select(node) }
+        .listRowBackground(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
+        .help(node.url.path)
+        .contextMenu {
+            FileContextMenu(node: node)
+            Divider()
+            Button("Remove from Recently Opened") { app.forgetRecentlyOpened(node.url) }
+        }
+    }
 }
 
 /// An added folder's header: its disclosure control, its name, and — kept well
@@ -222,6 +362,9 @@ private struct DirectoryContents: View {
         children = listing.nodes
         outcome = listing.outcome
         isLoaded = true
+        // A row cannot be scrolled to before it exists. This is what lets a
+        // reveal walking down to a file know this folder's rows are there.
+        app.directoryDidList(url)
     }
 }
 
@@ -332,6 +475,13 @@ struct FileContextMenu: View {
     @Environment(AppModel.self) private var app
 
     var body: some View {
+        // Only offered for a file the tree cannot already reach — which is
+        // every row in Recently Opened, and none in the tree itself.
+        if !node.isDirectory, !app.isCoveredByRoot(node.url) {
+            Button("Add Containing Folder") { app.addContainingFolder(of: node.url) }
+                .help("Browse \(node.url.deletingLastPathComponent().lastPathComponent) in the sidebar")
+            Divider()
+        }
         Button("Copy Path") { copy(node.url.path) }
         Button("Copy Name") { copy(node.name) }
         Button("Copy as read_parquet(…)") { copy(readExpression) }

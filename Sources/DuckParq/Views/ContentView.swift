@@ -6,6 +6,8 @@ struct ContentView: View {
 
     /// Height of the SQL panel, dragged by the divider above it.
     @State private var sqlHeight: CGFloat = 150
+    /// True while a file is being dragged over the window.
+    @State private var isDropTargeted = false
 
     var body: some View {
         @Bindable var app = app
@@ -35,6 +37,20 @@ struct ContentView: View {
         }
         .sheet(isPresented: $app.showsExportSheet) {
             ExportSheet()
+        }
+        // The whole window takes the drop, not the sidebar alone: a file
+        // dragged in is aimed at the app, and having to hit one column of it
+        // would be a rule you could only learn by failing.
+        .dropDestination(for: URL.self) { urls, _ in
+            app.openDropped(urls)
+        } isTargeted: { isDropTargeted = $0 }
+        .overlay {
+            if isDropTargeted {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color.accentColor, lineWidth: 3)
+                    .padding(3)
+                    .allowsHitTesting(false)
+            }
         }
     }
 

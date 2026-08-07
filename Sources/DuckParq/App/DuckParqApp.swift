@@ -1,5 +1,4 @@
 import AppKit
-import DuckParqCore
 import SwiftUI
 
 @main
@@ -12,7 +11,7 @@ struct DuckParqApp: App {
             ContentView()
                 .environment(app)
                 .frame(minWidth: 900, minHeight: 520)
-                .onOpenURL { url in openPath(url) }
+                .onOpenURL { url in app.open(url) }
         }
         .defaultSize(width: 1200, height: 760)
         .commands { commands }
@@ -21,6 +20,10 @@ struct DuckParqApp: App {
     @CommandsBuilder
     private var commands: some Commands {
         CommandGroup(replacing: .newItem) {
+            // ⌘O stays on Add Folder, which is what this app is mostly for;
+            // opening one file is the occasional case and gets the modifier.
+            Button("Open File…") { app.openFile() }
+                .keyboardShortcut("o", modifiers: [.command, .option])
             Button("Add Folder…") { app.addRoot() }
                 .keyboardShortcut("o", modifiers: .command)
             Button("Open Query…") { app.openQuery() }
@@ -52,9 +55,11 @@ struct DuckParqApp: App {
                 .disabled(app.sqlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             Divider()
             Button("Collapse All Folders") { app.collapseAll() }
-                .disabled(app.expandedFolders.isEmpty)
+                .disabled(!app.canCollapseAll)
             Button("Expand All Folders") { app.expandAll() }
                 .disabled(app.roots.isEmpty)
+            Button("Clear Recently Opened") { app.clearRecentlyOpened() }
+                .disabled(app.recentlyOpenedRows.isEmpty)
             Divider()
             Button("Clear Sort") { app.table.clearSort() }
                 .disabled(app.table.sort.isEmpty)
@@ -64,22 +69,6 @@ struct DuckParqApp: App {
         }
     }
 
-    /// Opening a .parquet file from Finder adds its folder to the sidebar and
-    /// selects the file.
-    private func openPath(_ url: URL) {
-        let directory = url.deletingLastPathComponent()
-        if !app.roots.contains(directory) {
-            app.roots.append(directory)
-        }
-        let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-        app.select(FileNode(
-            url: url,
-            isDirectory: false,
-            isDataset: false,
-            byteSize: values?.fileSize.map(Int64.init),
-            modified: values?.contentModificationDate
-        ))
-    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
