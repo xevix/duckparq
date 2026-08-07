@@ -417,6 +417,11 @@ final class AppModel {
     // MARK: - Selection
 
     func select(_ node: FileNode) {
+        // Clicking the row that is already selected changes nothing on screen,
+        // so it should cost nothing: no re-read of the file, no scroll position
+        // thrown away, no re-seeded editor. Compared by URL, which is what the
+        // sidebar itself draws the selection highlight from.
+        guard selection?.url != node.url else { return }
         guard let source = node.dataSource else { return }
         selection = node
         table.open(source)
