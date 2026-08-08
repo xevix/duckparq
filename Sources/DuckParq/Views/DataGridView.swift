@@ -67,7 +67,7 @@ struct DataGridView: View {
     /// Set by a Home/End press that has to wait on `jumpToStart()`/
     /// `jumpToEnd()` before there is anywhere to scroll to yet; applied and
     /// cleared the next time rows land.
-    @State private var pendingScrollIntent: Edge?
+    @State private var pendingScrollIntent: GridScroll.Edge?
     /// Rebuilt whenever a fresh result arrives, so widths re-measure per query.
     @State private var measuredSignature: String = ""
     /// Bumped when the system switches between overlay and legacy scrollers,
@@ -414,34 +414,23 @@ struct DataGridView: View {
     }
 
     /// Keep the rows under the eye where they were when earlier ones are
-    /// spliced in above them.
-    ///
-    /// The scroll view is anchored to the top of its content, so inserting rows
-    /// above the viewport leaves the offset alone and moves every row already
-    /// on screen down by the height of what arrived. Two things follow, and the
-    /// second is the one that reads as a bug: the rows being read jump away, and
-    /// an offset that had reached zero — which is where scrolling up to ask for
-    /// the page leaves it — has no further "up" to report, so the page after
-    /// that could not be asked for without scrolling back down first.
-    ///
-    /// Moving the viewport down by exactly the height of the new rows undoes
-    /// both: same rows under the eye, and the newly loaded ones sitting above
-    /// as somewhere left to scroll.
+    /// spliced in above them — see `GridScroll.offsetAfterPrepend`, which is
+    /// where the reasoning for the shift lives.
     private func holdPlaceAcrossPrepend() {
         guard table.prependedRowCount > 0 else { return }
-        let restored = scrollY.distanceFromTop
-            + CGFloat(table.prependedRowCount) * Self.rowHeight
+        let restored = GridScroll.offsetAfterPrepend(
+            from: scrollY.distanceFromTop,
+            prepended: table.prependedRowCount,
+            rowHeight: Self.rowHeight
+        )
         GridTrace.log("""
             prepended \(table.prependedRowCount) rows: \
             \(scrollY.distanceFromTop.rounded()) -> \(restored.rounded())
             """, dedupe: false)
         scrollY.distanceFromTop = restored
-        // A point rather than `scrollTo(y:)`, which does not leave the other
-        // axis where it was: it returns the columns to the left edge, so a
-        // page of earlier rows on a wide file would carry the view back to
-        // column one. Naming both axes says where the viewport goes, and `x`
-        // is the offset the header is already mirroring, so nothing moves
-        // sideways.
+        // A point for the same reason a landing is one: `scrollTo(y:)` returns
+        // the columns to the left edge, so a page of earlier rows on a wide
+        // file would carry the view back to column one.
         //
         // Not animated, and not deferred a turn the way a Home/End landing is:
         // this is a correction for content that arrived in this very update,
@@ -451,12 +440,19 @@ struct DataGridView: View {
         scrollPosition.scrollTo(point: CGPoint(x: scrollX, y: restored))
     }
 
-    /// Scroll to an edge of the content, leaving the other axis alone — a
-    /// wide file's columns stay where the user left them when Home or End
-    /// moves the rows.
-    private func scroll(to edge: Edge) {
+    /// Land the rows on an end of the result, leaving the columns where the
+    /// user left them.
+    ///
+    /// A point rather than `scrollTo(edge:)`, which does only the first half of
+    /// that: it returns the horizontal offset to zero, so Home and End on a
+    /// file wider than the window also walked the view back to the first
+    /// column, having been asked to move the rows. `scrollX` is the offset the
+    /// header is already mirroring, so naming it here is naming where the
+    /// columns already are. See `GridScroll.landing`.
+    private func scroll(to edge: GridScroll.Edge) {
+        let landing = GridScroll.landing(on: edge, keepingX: scrollX)
         withAnimation(.easeOut(duration: 0.15)) {
-            scrollPosition.scrollTo(edge: edge)
+            scrollPosition.scrollTo(point: CGPoint(x: landing.x, y: landing.y))
         }
     }
 

@@ -1809,6 +1809,56 @@ do {
                 Address.forward(offset: 900), "a page overrunning the end is counted forward")
 }
 
+// MARK: - Grid scrolling
+
+section("Grid scrolling")
+
+do {
+    // Every move the grid makes on the user's behalf names both axes, because
+    // the SwiftUI calls that name only one -- `scrollTo(edge:)` and
+    // `scrollTo(y:)` -- return the horizontal offset to zero as they go. That
+    // is a bug you see rather than read: Home or End on a file wider than the
+    // window moved the rows as asked and walked the columns back to the first
+    // one at the same time. So the x asked for is always the x the columns are
+    // already at.
+    let columns: CGFloat = 268
+
+    expectEqual(GridScroll.landing(on: .top, keepingX: columns),
+                GridScroll.Landing(x: columns, y: 0),
+                "Home lands on the first row without moving the columns")
+    expectEqual(GridScroll.landing(on: .bottom, keepingX: columns).x, columns,
+                "and End leaves them alone too")
+    expectEqual(GridScroll.landing(on: .bottom, keepingX: 0).x, 0,
+                "a grid resting at the left edge stays there")
+
+    // The bottom is deliberately not a measured height. A landing is asked for
+    // just after the rows were replaced, when a measured content height would
+    // still describe the window that has gone; a y past any content is clamped
+    // by the scroll view against the rows as actually laid out. "Past any
+    // content" has to mean it for a file of any size -- three billion rows of
+    // 20 points is 6e10, and this is many orders past that.
+    expect(GridScroll.landing(on: .bottom, keepingX: columns).y > 1e30,
+           "End asks for a y beyond any content there could be, and is clamped to the real end")
+
+    // Holding the reading position across a page of earlier rows. The case the
+    // bug was reported from is the first one: scrolling up to the top is how
+    // the page gets asked for, so the viewport is at zero when it arrives, and
+    // without the shift there is no "up" left to ask for the next one with.
+    expectEqual(GridScroll.offsetAfterPrepend(from: 0, prepended: 500, rowHeight: 20),
+                10_000,
+                "a viewport at the top gains the whole prepended page to scroll back up through")
+    expectEqual(GridScroll.offsetAfterPrepend(from: 2_000, prepended: 500, rowHeight: 20),
+                12_000,
+                "and one further down keeps the rows it was reading under the eye")
+    // The last step back to row 0 is however much of a page is left.
+    expectEqual(GridScroll.offsetAfterPrepend(from: 640, prepended: 200, rowHeight: 20),
+                4_640,
+                "a short page shifts by what it actually brought")
+    expectEqual(GridScroll.offsetAfterPrepend(from: 3_000, prepended: 0, rowHeight: 20),
+                3_000,
+                "and a page that brought nothing moves the viewport not at all")
+}
+
 // MARK: - TableModel (the logic the UI drives)
 
 section("TableModel")
