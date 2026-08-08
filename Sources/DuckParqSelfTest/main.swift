@@ -1442,6 +1442,122 @@ do {
                 .comparison, "a column with no values at all offers comparison, not an empty list")
 }
 
+// MARK: - Value completion
+
+section("Filter value completion")
+
+do {
+    // The lookup itself, against a list with a known shape. It is a lower
+    // bound, not a prefix match: what a half-typed value wants offered is where
+    // it lands among the column's values, and a prefix match has nothing to say
+    // the moment a typo takes it off the list.
+    let index = DistinctValueIndex(
+        values: ["alpha", "beta", "delta", "epsilon", "gamma"], isComplete: true)
+
+    expectEqual(index.suggestions(startingAt: "b"), ["beta", "delta", "epsilon", "gamma"],
+                "completions start where the typed text lands")
+    expectEqual(index.suggestions(startingAt: ""), index.values,
+                "an empty field is offered the column's first values")
+    expectEqual(index.suggestions(startingAt: "beta").first, "beta",
+                "a value already typed in full completes to itself, not the next one along")
+    expectEqual(index.suggestions(startingAt: "c"), ["delta", "epsilon", "gamma"],
+                "text matching nothing still lands somewhere rather than offering nothing")
+    expect(index.suggestions(startingAt: "z").isEmpty, "past the last value there is nothing to offer")
+    expectEqual(index.suggestions(startingAt: "", limit: 2), ["alpha", "beta"],
+                "the list is capped at the limit asked for")
+    expect(DistinctValueIndex(values: [], isComplete: true).suggestions(startingAt: "a").isEmpty,
+           "an empty index offers nothing rather than trapping")
+    expectEqual(DistinctValueIndex.suggestionLimit, 10, "ten completions are offered")
+}
+
+do {
+    let query = SQLBuilder.orderedDistinctValues(
+        source: .file(smallParquet), column: labelColumn, limit: 10)
+    expect(query.sql.contains("ORDER BY value ASC"),
+           "completions are read in order — a truncated read must hold the first values")
+    expect(query.sql.contains("IS NOT NULL"), "NULL is not something to complete a value to")
+    expectEqual(query.params, [smallParquet.path], "with nothing typed there is nothing else to bind")
+
+    let bounded = SQLBuilder.orderedDistinctValues(
+        source: .file(smallParquet), column: labelColumn, startingAt: "row-5", limit: 10)
+    expect(bounded.sql.contains(">= $2"), "typed text is bound, never interpolated")
+    expectEqual(bounded.params, [smallParquet.path, "row-5"], "and bound after the path")
+}
+
+do {
+    let probe = Probe(session: session)
+    let label = ColumnInfo(name: "label", typeName: "VARCHAR")
+
+    let index = try await probe.distinctValueIndex(for: label, in: .file(smallParquet))
+    expect(index.isComplete, "a thousand values is well inside what an index holds")
+    expectEqual(index.values.count, 1000, "every distinct value is held")
+    expectEqual(index.suggestions(startingAt: "row-1"),
+                ["row-1", "row-10", "row-100", "row-101", "row-102",
+                 "row-103", "row-104", "row-105", "row-106", "row-107"],
+                "completions come back lexicographic, which is the order the index is in")
+
+    // Truncation. Holding the lexicographically *first* values rather than an
+    // arbitrary set is what makes a truncated index usable at all: it is exact
+    // as far as it goes, and the caller can tell where that ends.
+    let clipped = try await probe.distinctValueIndex(for: label, in: .file(smallParquet), limit: 5)
+    expect(!clipped.isComplete, "a column past the limit is known to be truncated")
+    expectEqual(clipped.values, ["row-0", "row-1", "row-10", "row-100", "row-101"],
+                "and what it holds is the first values, not whichever five came out of the hash table")
+
+    // So only the stretch past the end of a truncated index has to reach DuckDB.
+    let far = try await probe.valueSuggestions(
+        for: label, in: .file(smallParquet), startingAt: "row-99")
+    expectEqual(far, ["row-99", "row-990", "row-991", "row-992", "row-993",
+                      "row-994", "row-995", "row-996", "row-997", "row-998"],
+                "DuckDB answers for a stretch no index holds, in the same order")
+
+    // NULLs are dropped rather than spending the limit. `is null` is the
+    // operator that asks for them, and there is nothing to complete one to.
+    let sparse = try await probe.distinctValueIndex(
+        for: ColumnInfo(name: "maybe_text", typeName: "VARCHAR"), in: .file(typesParquet))
+    expectEqual(sparse.values.count, 171, "the 29 NULL rows contribute no value to complete to")
+    expect(!sparse.values.contains(""), "and none of them arrives as an empty string")
+}
+
+do {
+    // End to end through the model, which is where the index gets cached.
+    let completionCache = PreviewCache()
+    let model = TableModel(
+        gridSession: try DuckDBSession(engine: engine, label: "complete-grid"),
+        metaSession: try DuckDBSession(engine: engine, label: "complete-meta"),
+        countSession: try DuckDBSession(engine: engine, label: "complete-count"),
+        filterSession: try DuckDBSession(engine: engine, label: "complete-filter"),
+        cache: completionCache
+    )
+    model.open(.file(smallParquet))
+
+    let label = ColumnInfo(name: "label", typeName: "VARCHAR")
+    expectEqual(try await model.valueSuggestions(for: label, startingAt: "row-99"),
+                ["row-99", "row-990", "row-991", "row-992", "row-993",
+                 "row-994", "row-995", "row-996", "row-997", "row-998"],
+                "the model completes from the column's real values")
+
+    let fingerprint = SourceFingerprint.compute(for: .file(smallParquet))!
+    expect(completionCache.valueIndex(for: fingerprint, column: "label") != nil,
+           "the read is remembered, so the next keystroke is a binary search rather than a scan")
+
+    // Fast typing must not mean a scan per keystroke: the reads in flight are
+    // shared, so these all resolve to one index.
+    async let a = model.valueSuggestions(for: label, startingAt: "row-2")
+    async let b = model.valueSuggestions(for: label, startingAt: "row-20")
+    async let c = model.valueSuggestions(for: label, startingAt: "row-200")
+    expectEqual(try await a.first, "row-2", "each keystroke gets its own answer")
+    expectEqual(try await b.first, "row-20", "…from the one shared index")
+    expectEqual(try await c.first, "row-200", "…however fast they arrive")
+
+    // In SQL mode there is no source to read a column's values from, and the
+    // filter bar is disabled anyway.
+    model.runSQL("SELECT 1 AS x")
+    try? await Task.sleep(for: .milliseconds(200))
+    expect(try await model.valueSuggestions(for: label, startingAt: "row").isEmpty,
+           "a SQL result has no column values to complete against")
+}
+
 // MARK: - Preview cache
 
 section("Preview cache")

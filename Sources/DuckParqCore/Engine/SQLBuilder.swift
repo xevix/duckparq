@@ -365,6 +365,41 @@ public enum SQLBuilder {
         return BoundSQL(sql: sql, params: [source.readPath])
     }
 
+    /// A column's distinct values in lexicographic order, capped at `limit`.
+    ///
+    /// Unlike `distinctValues`, the order is the whole point: this feeds the
+    /// completions offered while an equality filter is being typed, where "the
+    /// next few values" *is* the answer. It also means a truncated read holds
+    /// the lexicographically first values rather than whichever ones the hash
+    /// table happened to emit first, so what it holds is exact as far as it goes.
+    ///
+    /// NULL is excluded. There is nothing to complete it to, and `is null` is
+    /// the operator that asks for it.
+    ///
+    /// `startingAt` narrows to the values at or after some text, so a column
+    /// with too many values to hold can still be asked about the stretch being
+    /// typed. `ORDER BY … LIMIT` plans as a Top-N, so that stays a bounded scan.
+    public static func orderedDistinctValues(
+        source: DataSource,
+        column: ColumnInfo,
+        startingAt lowerBound: String? = nil,
+        limit: Int
+    ) -> BoundSQL {
+        let reference = quote(column.name)
+        var params = [source.readPath]
+        var sql = """
+            SELECT DISTINCT CAST(\(reference) AS VARCHAR) AS value \
+            FROM \(source.readExpression(parameterIndex: 1)) \
+            WHERE \(reference) IS NOT NULL
+            """
+        if let lowerBound {
+            params.append(lowerBound)
+            sql += " AND CAST(\(reference) AS VARCHAR) >= $\(params.count)"
+        }
+        sql += " ORDER BY value ASC LIMIT \(max(limit, 1))"
+        return BoundSQL(sql: sql, params: params)
+    }
+
     // MARK: - Metadata
 
     /// One row summarising the source, whether it is a file or a thousand of

@@ -119,6 +119,9 @@ struct FilterEditor: View {
     @State private var argument = ""
     @State private var secondArgument = ""
 
+    @State private var suggestions: [String] = []
+    @State private var isLoadingSuggestions = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
@@ -160,6 +163,7 @@ struct FilterEditor: View {
         .frame(width: 300)
         .onSubmit { submit() }
         .task { await probe() }
+        .task(id: "\(suggestsValues)\u{1F}\(argument)") { await refreshSuggestions() }
     }
 
     // MARK: - Controls
@@ -281,15 +285,106 @@ struct FilterEditor: View {
         .pickerStyle(.menu)
 
         if op.argumentCount >= 1 {
-            TextField(op == .between ? "from" : "value", text: $argument)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(size: 11, design: .monospaced))
+            if suggestsValues {
+                FilterValueField(
+                    text: $argument,
+                    placeholder: "value",
+                    onTab: acceptFirstSuggestion,
+                    onSubmit: submit
+                )
+                .frame(height: 21)
+                suggestionList
+            } else {
+                TextField(op == .between ? "from" : "value", text: $argument)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11, design: .monospaced))
+            }
         }
         if op.argumentCount >= 2 {
             TextField("to", text: $secondArgument)
                 .textFieldStyle(.roundedBorder)
                 .font(.system(size: 11, design: .monospaced))
         }
+    }
+
+    // MARK: - Completions
+
+    /// Whether the value being typed can be completed from the column's values.
+    ///
+    /// Text columns only, and only for `=`: a completion is a whole value, which
+    /// is what equality wants and what `contains`, `starts with` or an ordered
+    /// comparison do not. Not offered alongside the dropdown either — there the
+    /// values are already on screen, to tick rather than to type.
+    private var suggestsValues: Bool {
+        guard column.kind == .text, op == .equal, !isProbing else { return false }
+        if case .dropdown = affordance { return false }
+        return true
+    }
+
+    @ViewBuilder
+    private var suggestionList: some View {
+        if !suggestions.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(suggestions.enumerated()), id: \.element) { position, value in
+                    Button { argument = value } label: {
+                        HStack(spacing: 6) {
+                            Text(value)
+                                .font(.system(size: 11, design: .monospaced))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 4)
+                            // Only on the first row, because Tab takes that one
+                            // and nothing else navigates the list.
+                            if position == 0 {
+                                Text("tab")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 3)
+                                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
+                            }
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .background(position == 0 ? Color.accentColor.opacity(0.15) : .clear)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 5))
+            .overlay(RoundedRectangle(cornerRadius: 5).stroke(.quaternary))
+        } else if isLoadingSuggestions {
+            Text("Reading values…").font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    /// Take the first completion, which is what Tab does.
+    ///
+    /// False when there is nothing to take — no list, or a value already typed
+    /// out in full — so that Tab falls back to moving focus rather than
+    /// appearing to be a dead key.
+    private func acceptFirstSuggestion() -> Bool {
+        guard let first = suggestions.first, first != argument else { return false }
+        argument = first
+        return true
+    }
+
+    /// Re-ask for completions. Driven by `.task(id:)`, so a keystroke cancels
+    /// the lookup for the one before it.
+    private func refreshSuggestions() async {
+        guard suggestsValues else {
+            suggestions = []
+            isLoadingSuggestions = false
+            return
+        }
+        isLoadingSuggestions = true
+        let found = try? await app.table.valueSuggestions(for: column, startingAt: argument)
+        // A cancelled lookup is stale by definition; the one that replaced it
+        // owns these two, including the flag.
+        guard !Task.isCancelled else { return }
+        suggestions = found ?? []
+        isLoadingSuggestions = false
     }
 
     /// Return in a value field applies the filter, the same as clicking Apply.

@@ -23,6 +23,51 @@ public enum FilterAffordance: Sendable, Equatable {
     case comparison
 }
 
+/// A column's distinct values in order, held so that typing into an equality
+/// filter can be completed without a query per keystroke.
+public struct DistinctValueIndex: Sendable, Equatable {
+    /// How many completions an equality filter offers. Ten is what fits under a
+    /// text field without the popover becoming a list you scroll.
+    public static let suggestionLimit = 10
+
+    /// Ascending and deduplicated, with NULL dropped.
+    public let values: [String]
+
+    /// False when the column has more distinct values than the index was
+    /// allowed to hold.
+    ///
+    /// `values` is then the lexicographically *first* of them, which is a
+    /// meaningful thing to have: it answers exactly for anything up to its last
+    /// entry, and knows nothing at all beyond it. The distinction matters
+    /// because "no completions" and "no completions I can see from here" look
+    /// identical on screen — see `TableModel.valueSuggestions(for:startingAt:)`,
+    /// which asks DuckDB for that stretch rather than showing an empty list.
+    public let isComplete: Bool
+
+    public init(values: [String], isComplete: Bool) {
+        self.values = values
+        self.isComplete = isComplete
+    }
+
+    /// The values at or after `typed`, in order.
+    ///
+    /// "At or after" rather than "starting with": what a half-typed value wants
+    /// offered is where it lands among the column's values, and a prefix match
+    /// has nothing to say the moment a typo takes it off the list. A value
+    /// equal to `typed` is kept, so completing an already-exact value is a
+    /// no-op instead of a jump to the next one along.
+    public func suggestions(startingAt typed: String, limit: Int = suggestionLimit) -> [String] {
+        // Lower bound by bisection — this runs on every keystroke.
+        var low = 0
+        var high = values.count
+        while low < high {
+            let middle = low + (high - low) / 2
+            if values[middle] < typed { low = middle + 1 } else { high = middle }
+        }
+        return Array(values[low..<min(low + max(limit, 0), values.count)])
+    }
+}
+
 /// Schema, counts and cardinality lookups. These run on their own session so a
 /// slow grid query never delays a schema panel, and vice versa.
 public struct Probe: Sendable {
@@ -126,6 +171,61 @@ public struct Probe: Sendable {
         // in the order you would look something up in, and the counts are right
         // there to be read.
         return .dropdown(values: values.sorted { $0.value < $1.value }, nullCount: nullCount)
+    }
+
+    /// How many of a column's distinct values are held for completing an
+    /// equality filter.
+    ///
+    /// Twenty times `defaultMaxDistinct`, because the two caps answer different
+    /// questions. That one asks what a person can usefully *scan*; this one only
+    /// has to be searched, so the ceiling is memory — ten thousand values is a
+    /// few hundred kilobytes of strings, and holding them turns every keystroke
+    /// after the first into a binary search instead of a scan of the column.
+    public static let defaultSuggestionIndexLimit = 10_000
+
+    /// Read a column's distinct values in order, up to `limit` of them.
+    ///
+    /// One read, cached by the caller, in exchange for every later completion
+    /// being local. Unlike `filterAffordance` there is no screening step: the
+    /// answer is useful truncated, so there is nothing to reject a column for.
+    public func distinctValueIndex(
+        for column: ColumnInfo,
+        in source: DataSource,
+        limit: Int = Probe.defaultSuggestionIndexLimit
+    ) async throws -> DistinctValueIndex {
+        // One row past the limit, which is how a truncated index is told from
+        // one that happens to hold the column exactly.
+        let query = SQLBuilder.orderedDistinctValues(source: source, column: column, limit: limit + 1)
+        let batch = try await session.queryAll(query.sql, params: query.params, limit: limit + 1)
+
+        let held = min(batch.rowCount, limit)
+        var values: [String] = []
+        values.reserveCapacity(held)
+        for row in 0..<held {
+            if let value = batch[row, 0] { values.append(value) }
+        }
+        // Re-sorted here because the lookups against it are Swift comparisons:
+        // DuckDB orders VARCHAR by bytes, which agrees with `<` on ASCII and
+        // can disagree on anything else. SQL still does the ordering above, so
+        // a truncated index holds the first values rather than an arbitrary set.
+        return DistinctValueIndex(values: values.sorted(), isComplete: batch.rowCount <= limit)
+    }
+
+    /// A column's distinct values at or after `typed`, straight from DuckDB.
+    ///
+    /// The fallback for a column with more distinct values than an index holds,
+    /// asked only once the typing has run past the end of what it holds.
+    public func valueSuggestions(
+        for column: ColumnInfo,
+        in source: DataSource,
+        startingAt typed: String,
+        limit: Int = DistinctValueIndex.suggestionLimit
+    ) async throws -> [String] {
+        let query = SQLBuilder.orderedDistinctValues(
+            source: source, column: column, startingAt: typed, limit: limit
+        )
+        let batch = try await session.queryAll(query.sql, params: query.params, limit: limit)
+        return (0..<batch.rowCount).compactMap { batch[$0, 0] }
     }
 
     public func fileMetadata(of source: DataSource) async throws -> RowBatch {

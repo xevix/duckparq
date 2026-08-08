@@ -122,6 +122,8 @@ public final class PreviewCache: @unchecked Sendable {
     private var stats: [SourceFingerprint: CachedStats] = [:]
     /// Filter affordances, by column name within a source.
     private var affordances: [SourceFingerprint: [String: FilterAffordance]] = [:]
+    /// Distinct-value indexes for filter autocompletion, likewise by column.
+    private var valueIndexes: [SourceFingerprint: [String: DistinctValueIndex]] = [:]
     /// Least-recently-used first.
     private var order: [SourceFingerprint] = []
 
@@ -187,12 +189,37 @@ public final class PreviewCache: @unchecked Sendable {
         evict()
     }
 
+    /// The values held for completing a column's equality filter.
+    ///
+    /// Worth keeping for the same reason as `affordance`, and more so: building
+    /// it reads the column, and it is consulted on every keystroke.
+    public func valueIndex(for fingerprint: SourceFingerprint, column: String) -> DistinctValueIndex? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = valueIndexes[fingerprint]?[column] else { return nil }
+        touch(fingerprint)
+        return entry
+    }
+
+    public func storeValueIndex(
+        _ index: DistinctValueIndex,
+        for fingerprint: SourceFingerprint,
+        column: String
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        valueIndexes[fingerprint, default: [:]][column] = index
+        touch(fingerprint)
+        evict()
+    }
+
     public func clear() {
         lock.lock()
         defer { lock.unlock() }
         entries.removeAll()
         stats.removeAll()
         affordances.removeAll()
+        valueIndexes.removeAll()
         order.removeAll()
     }
 
@@ -216,6 +243,7 @@ public final class PreviewCache: @unchecked Sendable {
             entries.removeValue(forKey: oldest)
             stats.removeValue(forKey: oldest)
             affordances.removeValue(forKey: oldest)
+            valueIndexes.removeValue(forKey: oldest)
         }
     }
 }

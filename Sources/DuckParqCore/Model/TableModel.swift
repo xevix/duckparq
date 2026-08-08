@@ -106,6 +106,9 @@ public final class TableModel {
     private var loadTask: Task<Void, Never>?
     private var countTask: Task<Void, Never>?
     private var schemaTask: Task<Void, Never>?
+    /// Distinct-value reads for filter autocompletion, by column name. Doubles
+    /// as the memo for a completed one — see `valueIndex(for:in:)`.
+    private var valueIndexTasks: [String: Task<DistinctValueIndex, Error>] = [:]
 
     /// Where to file this result once it has both a page and a count.
     private var pendingCacheKey: SourceFingerprint?
@@ -189,6 +192,7 @@ public final class TableModel {
         mode = .source(source)
         filters = []
         sort = []
+        discardValueIndexes()
         reload()
     }
 
@@ -230,6 +234,7 @@ public final class TableModel {
             self.filters = []
             self.sort = []
             self.columns = []
+            self.discardValueIndexes()
             self.reload()
         }
     }
@@ -251,6 +256,7 @@ public final class TableModel {
         isCountingRows = false
         rowsAreStale = false
         queryStartedAt = nil
+        discardValueIndexes()
         cancelInFlight()
     }
 
@@ -353,6 +359,78 @@ public final class TableModel {
             cache.storeAffordance(affordance, for: fingerprint, column: column.name)
         }
         return affordance
+    }
+
+    /// Completions for an equality filter being typed on `column`: the distinct
+    /// values at or after what has been typed so far, in order.
+    ///
+    /// Answered from a held index of the column's values wherever it can be — a
+    /// keystroke must not cost a read. DuckDB is asked directly only for a
+    /// column with more distinct values than the index holds, and only once the
+    /// typing has run past the end of what it holds, which is the one case
+    /// where the local answer would be a short list passing itself off as the
+    /// whole one.
+    public func valueSuggestions(
+        for column: ColumnInfo,
+        startingAt typed: String,
+        limit: Int = DistinctValueIndex.suggestionLimit
+    ) async throws -> [String] {
+        guard case .source(let source) = mode else { return [] }
+
+        let index = try await valueIndex(for: column, in: source)
+        let local = index.suggestions(startingAt: typed, limit: limit)
+        if index.isComplete || local.count == limit { return local }
+
+        return try await filterProbe.valueSuggestions(
+            for: column, in: source, startingAt: typed, limit: limit
+        )
+    }
+
+    /// The column's value index, read once and then remembered.
+    ///
+    /// The read is held as a task rather than awaited inline so that the next
+    /// keystroke joins the one in flight instead of starting a second scan of
+    /// the same column. Unstructured on purpose: the caller that started it is
+    /// a view task that the following keystroke cancels, and that must not take
+    /// the read everyone else is waiting on down with it.
+    private func valueIndex(
+        for column: ColumnInfo,
+        in source: DataSource
+    ) async throws -> DistinctValueIndex {
+        if let existing = valueIndexTasks[column.name] { return try await existing.value }
+
+        let cache = self.cache
+        let probe = self.filterProbe
+        let task = Task { () throws -> DistinctValueIndex in
+            let fingerprint = await Task.detached(priority: .userInitiated) {
+                SourceFingerprint.compute(for: source)
+            }.value
+            if let fingerprint, let cached = cache.valueIndex(for: fingerprint, column: column.name) {
+                return cached
+            }
+            let index = try await probe.distinctValueIndex(for: column, in: source)
+            if let fingerprint {
+                cache.storeValueIndex(index, for: fingerprint, column: column.name)
+            }
+            return index
+        }
+        valueIndexTasks[column.name] = task
+
+        do {
+            return try await task.value
+        } catch {
+            // A failed read is not an answer worth remembering, so the next
+            // keystroke gets to try again. Only if it is still the current one:
+            // a retry may already have replaced it.
+            if valueIndexTasks[column.name] == task { valueIndexTasks[column.name] = nil }
+            throw error
+        }
+    }
+
+    /// Value indexes belong to the source they were read from.
+    private func discardValueIndexes() {
+        for task in valueIndexTasks.values { task.cancel() }
+        valueIndexTasks.removeAll()
     }
 
     // MARK: - Loading
@@ -770,6 +848,7 @@ public final class TableModel {
     /// Forget every remembered preview and re-read what is on screen.
     public func clearCache() {
         cache.clear()
+        discardValueIndexes()
         if case .source = mode { reload(keepingRows: true) }
     }
 }
