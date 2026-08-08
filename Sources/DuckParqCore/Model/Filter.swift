@@ -107,6 +107,10 @@ public struct Filter: Sendable, Hashable, Identifiable {
 public enum SortDirection: String, Sendable, Hashable {
     case ascending = "ASC"
     case descending = "DESC"
+
+    public var inverted: SortDirection {
+        self == .ascending ? .descending : .ascending
+    }
 }
 
 public struct SortKey: Sendable, Hashable, Identifiable {

@@ -47,6 +47,16 @@ struct DataGridView: View {
     /// measured from the content.
     @State private var widthOverrides: [String: CGFloat] = [:]
     @State private var selectedRow: Int?
+    /// Whether the grid has keyboard focus, so Home/End reach it rather than
+    /// whatever text field last had it.
+    @FocusState private var isGridFocused: Bool
+    /// Drives Home/End. Bound rather than read: the grid only ever writes to
+    /// it, and reads its scroll offset from `onScrollGeometryChange`.
+    @State private var scrollPosition = ScrollPosition()
+    /// Set by a Home/End press that has to wait on `jumpToStart()`/
+    /// `jumpToEnd()` before there is anywhere to scroll to yet; applied and
+    /// cleared the next time rows land.
+    @State private var pendingScrollIntent: Edge?
     /// Rebuilt whenever a fresh result arrives, so widths re-measure per query.
     @State private var measuredSignature: String = ""
     /// Bumped when the system switches between overlay and legacy scrollers,
@@ -187,6 +197,7 @@ struct DataGridView: View {
                 Divider()
                 ScrollView([.horizontal, .vertical]) {
                     LazyVStack(alignment: .leading, spacing: 0) {
+                        loadingEarlierIndicator
                         ForEach(table.rows) { row in
                             RowView(
                                 row: row,
@@ -198,7 +209,10 @@ struct DataGridView: View {
                                 isSelected: selectedRow == row.id
                             )
                             .equatable()
-                            .onTapGesture { selectedRow = row.id }
+                            .onTapGesture {
+                                selectedRow = row.id
+                                isGridFocused = true
+                            }
                             .onAppear { table.loadMoreIfNeeded(displayedIndex: row.id) }
                         }
                         footer
@@ -212,6 +226,14 @@ struct DataGridView: View {
                 // dataset you had not scrolled. Anchoring to the top also keeps
                 // the view still when a later page is appended below.
                 .defaultScrollAnchor(.topLeading)
+                // Home and End drive this rather than a `ScrollViewReader`.
+                // `scrollTo(id:)` scrolls to a row the lazy stack has already
+                // built, and the row a jump wants is by definition one it has
+                // not — the End key's target arrives in the same update as the
+                // rows themselves. Scrolling to an *edge* asks nothing about
+                // what is realised, and lands the scroller against the end of
+                // the content, which is what "go to the end" means.
+                .scrollPosition($scrollPosition)
                 // `contentOffset.x` is measured from the *inset* origin, and
                 // this scroll view carries a leading inset the width of the
                 // sidebar — NavigationSplitView insets its detail content so it
@@ -248,6 +270,34 @@ struct DataGridView: View {
                 } action: { _, x in
                     scrollX = x
                 }
+                // Paging backward, driven by where the viewport actually is.
+                //
+                // Not by rows appearing, which is how paging forward works: a
+                // `LazyVStack` fills from the top, so the rows it realises when
+                // a window lands are the ones at `windowStart` whether or not
+                // anyone scrolled there — indistinguishable, at the row level,
+                // from the user having scrolled to the top. That is what made
+                // End load a second page behind itself.
+                //
+                // A scroll offset cannot be confused that way. Replacing the
+                // rows under an unchanged offset produces no change here, so
+                // landing on the end is silent; only moving the viewport
+                // reports anything. Requiring the offset to have *decreased*
+                // makes it narrower still: the user has to be scrolling toward
+                // the top for this to fire at all.
+                .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                    max(geometry.contentOffset.y + geometry.contentInsets.top, 0)
+                } action: { previousTop, distanceFromTop in
+                    guard distanceFromTop < previousTop else { return }
+                    guard distanceFromTop < Self.rowHeight * CGFloat(TableModel.prefetchDistance) else {
+                        return
+                    }
+                    GridTrace.log("""
+                        scrolled up to \(distanceFromTop.rounded()) from \(previousTop.rounded()) \
+                        -> loadEarlier (windowStart \(table.windowStart) rows \(table.rows.count))
+                        """, dedupe: false)
+                    table.loadEarlier()
+                }
                 // A two-axis scroll view flashes both indicators together, so
                 // scrolling down drew a horizontal bar whose thumb filled the
                 // whole track — an indicator for an axis with nothing to scroll.
@@ -262,7 +312,77 @@ struct DataGridView: View {
                 // one that means never.
                 .scrollIndicators(contentWidth > viewport ? .automatic : .never,
                                   axes: .horizontal)
+                .focusable()
+                .focusEffectDisabled()
+                .focused($isGridFocused)
+                .onKeyPress(.home) {
+                    handleHomeKey()
+                    return .handled
+                }
+                .onKeyPress(.end) {
+                    handleEndKey()
+                    return .handled
+                }
+                .onChange(of: table.rowsGeneration) { _, _ in landAfterCommit() }
+                .onAppear { isGridFocused = true }
             }
+        }
+    }
+
+    // MARK: - Home / End
+
+    /// `reachedStart` means row 0 is already loaded — nothing to fetch, only
+    /// somewhere to scroll to. Otherwise the window is anchored elsewhere (an
+    /// earlier `jumpToEnd()`, say) and has to be reset to the front first,
+    /// the same one page `reload()` reads for a freshly opened file.
+    private func handleHomeKey() {
+        if table.reachedStart {
+            scroll(to: .top)
+        } else {
+            pendingScrollIntent = .top
+            table.jumpToStart()
+        }
+    }
+
+    /// `reachedEnd` means the last row is already loaded — true once ordinary
+    /// scrolling has exhausted the file, not just after `jumpToEnd()`.
+    /// Otherwise a single page anchored at the true end has to be fetched
+    /// first, rather than the whole file.
+    private func handleEndKey() {
+        GridTrace.log("END key: reachedEnd \(table.reachedEnd) windowStart \(table.windowStart)",
+                      dedupe: false)
+        if table.reachedEnd {
+            scroll(to: .bottom)
+        } else {
+            pendingScrollIntent = .bottom
+            table.jumpToEnd()
+        }
+    }
+
+    /// Put the grid where the last commit asked it to be.
+    ///
+    /// Deferred a turn: the rows land in the update that bumped
+    /// `rowsGeneration`, and the scroll view only lays them out in the next
+    /// one — scrolling to the end of content whose height is still the old
+    /// content's lands short. Nothing here reports back that the scroll
+    /// happened; the model reads that off the rows the grid then draws, which
+    /// is the one account of it that cannot race the layout.
+    private func landAfterCommit() {
+        GridTrace.log("""
+            commit: rows \(table.rows.count) windowStart \(table.windowStart) \
+            reachedEnd \(table.reachedEnd) intent \(pendingScrollIntent.map(String.init(describing:)) ?? "none")
+            """, dedupe: false)
+        guard let intent = pendingScrollIntent else { return }
+        pendingScrollIntent = nil
+        Task { @MainActor in scroll(to: intent) }
+    }
+
+    /// Scroll to an edge of the content, leaving the other axis alone — a
+    /// wide file's columns stay where the user left them when Home or End
+    /// moves the rows.
+    private func scroll(to edge: Edge) {
+        withAnimation(.easeOut(duration: 0.15)) {
+            scrollPosition.scrollTo(edge: edge)
         }
     }
 
@@ -332,6 +452,21 @@ struct DataGridView: View {
     }
 
     // MARK: - Rows
+
+    /// Mirrors `footer`'s "Loading more rows…" but at the top of the
+    /// `LazyVStack`, for `loadEarlier()` paging in rows above what is on
+    /// screen rather than below it.
+    @ViewBuilder
+    private var loadingEarlierIndicator: some View {
+        if table.isLoadingEarlier {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Loading earlier rows…").foregroundStyle(.secondary)
+            }
+            .font(.caption)
+            .padding(10)
+        }
+    }
 
     @ViewBuilder
     private var footer: some View {
@@ -908,6 +1043,7 @@ private struct StatusBar: View {
     private func busyLabel(_ table: TableModel) -> String {
         if table.isLoading { return "Querying…" }
         if table.isLoadingMore { return "Loading more rows…" }
+        if table.isLoadingEarlier { return "Loading earlier rows…" }
         return "Counting rows…"
     }
 

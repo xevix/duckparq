@@ -65,6 +65,10 @@ public final class DuckDBSession: @unchecked Sendable {
     private var cursorConnections: [Int: dpq_conn] = [:]
     private var nextCursorToken = 0
 
+    /// Names this session in an `SQLTrace` line, so a trace shows which of the
+    /// four sessions ran a statement — the whole point of their being separate.
+    private let label: String
+
     public init(engine: DuckDBEngine = .shared, label: String) throws {
         var err: UnsafeMutablePointer<CChar>?
         guard let conn = dpq_conn_open(engine.db, &err) else {
@@ -72,6 +76,7 @@ public final class DuckDBSession: @unchecked Sendable {
         }
         self.engine = engine
         self.conn = conn
+        self.label = label
         self.queue = DispatchQueue(label: "dev.xevix.duckparq.session.\(label)")
     }
 
@@ -114,15 +119,22 @@ public final class DuckDBSession: @unchecked Sendable {
 
     /// Run a statement for effect (CREATE VIEW, COPY, SET...).
     public func execute(_ sql: String, params: [String] = []) async throws {
-        try await onQueue {
-            var err: UnsafeMutablePointer<CChar>?
-            let ok = withCStringArray(params) { pointers in
-                dpq_exec(self.conn, sql, pointers, Int32(params.count), &err)
+        let trace = SQLTrace.begin(session: label, sql: sql, params: params)
+        do {
+            try await onQueue {
+                var err: UnsafeMutablePointer<CChar>?
+                let ok = withCStringArray(params) { pointers in
+                    dpq_exec(self.conn, sql, pointers, Int32(params.count), &err)
+                }
+                guard ok else {
+                    throw DuckDBError.engine(takeMessage(&err) ?? "query failed")
+                }
             }
-            guard ok else {
-                throw DuckDBError.engine(takeMessage(&err) ?? "query failed")
-            }
+        } catch {
+            SQLTrace.finish(trace, error: error)
+            throw error
         }
+        SQLTrace.finish(trace)
     }
 
     /// Classify the statements in `sql` using DuckDB's parser, without running
@@ -172,6 +184,10 @@ public final class DuckDBSession: @unchecked Sendable {
     ) async throws -> QueryCursor {
         let (token, connection) = try makeCursorConnection()
         let boxed = UncheckedBox(connection)
+        // The cursor carries this and closes it out, since a streaming query
+        // is not finished when it opens — it is finished when the last row has
+        // been pulled, which is what the elapsed time should cover.
+        let trace = SQLTrace.begin(session: label, sql: sql, params: params)
         do {
             return try await onQueue {
                 var err: UnsafeMutablePointer<CChar>?
@@ -184,9 +200,12 @@ public final class DuckDBSession: @unchecked Sendable {
                 guard let handle else {
                     throw DuckDBError.engine(takeMessage(&err) ?? "query failed")
                 }
-                return QueryCursor(handle: handle, session: self, connectionToken: token)
+                return QueryCursor(
+                    handle: handle, session: self, connectionToken: token, trace: trace
+                )
             }
         } catch {
+            SQLTrace.finish(trace, error: error)
             releaseCursorConnection(token)
             throw error
         }

@@ -216,8 +216,17 @@ public enum SQLBuilder {
     /// Wrapped rather than appended so it applies to a query the user typed as
     /// well as one built here, and so it composes with a query that already ends
     /// in its own `LIMIT` (the tighter of the two wins, which is correct).
-    public static func windowed(_ query: BoundSQL, limit: Int) -> BoundSQL {
-        BoundSQL(sql: "SELECT * FROM (\(query.sql)) LIMIT \(max(limit, 1))", params: query.params)
+    ///
+    /// `offset` is 0 for the forward-growing window this Top-N pushdown is
+    /// written for. A non-zero offset — reading a page anchored somewhere other
+    /// than the start, as jumping to the end of the file does — does not get
+    /// that pushdown: DuckDB still has to produce and discard everything before
+    /// it. That is inherent to asking for an arbitrary middle or tail slice, not
+    /// something this clause can fix.
+    public static func windowed(_ query: BoundSQL, limit: Int, offset: Int = 0) -> BoundSQL {
+        var sql = "SELECT * FROM (\(query.sql)) LIMIT \(max(limit, 1))"
+        if offset > 0 { sql += " OFFSET \(offset)" }
+        return BoundSQL(sql: sql, params: query.params)
     }
 
     /// Wrap an arbitrary query the user typed, applying grid sort on top.

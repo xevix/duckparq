@@ -25,11 +25,21 @@ public actor QueryCursor {
     /// Identifies this cursor's dedicated connection, released on close.
     private let connectionToken: Int
     public nonisolated let columnNames: [String]
+    /// The `SQLTrace` entry for the statement this cursor is streaming, closed
+    /// out by `close()` with everything it produced.
+    private let trace: SQLTrace.Ticket?
+    private var rowsFetched = 0
 
-    init(handle: dpq_cursor, session: DuckDBSession, connectionToken: Int) {
+    init(
+        handle: dpq_cursor,
+        session: DuckDBSession,
+        connectionToken: Int,
+        trace: SQLTrace.Ticket? = nil
+    ) {
         self.boxedHandle = UncheckedBox(handle)
         self.session = session
         self.connectionToken = connectionToken
+        self.trace = trace
         let count = Int(dpq_cursor_column_count(handle))
         self.columnNames = (0..<count).map { index in
             dpq_cursor_column_name(handle, Int32(index)).map { String(cString: $0) } ?? "column\(index)"
@@ -55,6 +65,7 @@ public actor QueryCursor {
             return Self.decode(raw, columnCount: columnCount)
         }
 
+        rowsFetched += page?.rowCount ?? 0
         if page == nil { close() }
         return page
     }
@@ -94,12 +105,17 @@ public actor QueryCursor {
     public func close() {
         guard let boxed = boxedHandle else { return }
         boxedHandle = nil
+        SQLTrace.finish(trace, rows: rowsFetched)
         dpq_cursor_close(boxed.value)
         session.releaseCursorConnection(connectionToken)
     }
 
     deinit {
         if let boxed = boxedHandle {
+            // Dropped without being closed — an abandoned query still ends, so
+            // the trace should not be left with a statement that never
+            // finished.
+            SQLTrace.finish(trace, rows: rowsFetched)
             dpq_cursor_close(boxed.value)
             session.releaseCursorConnection(connectionToken)
         }

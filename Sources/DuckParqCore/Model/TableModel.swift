@@ -52,6 +52,10 @@ public final class TableModel {
 
     public private(set) var isLoading = false
     public private(set) var isLoadingMore = false
+    /// A backward step is in flight — `loadEarlier()`'s counterpart to
+    /// `isLoadingMore`, kept separate so the grid can show a loading affordance
+    /// at the top of the rows rather than the bottom.
+    public private(set) var isLoadingEarlier = false
     public private(set) var reachedEnd = false
     public private(set) var hitRowCap = false
     public private(set) var errorMessage: String?
@@ -85,6 +89,15 @@ public final class TableModel {
     /// per page. Browsing is what this app is for; reading a million rows in
     /// order is what the export button is for.
     public private(set) var windowSize = pageSize
+
+    /// Offset of `rows[0]` within the full result. Zero for the ordinary
+    /// top-down window `commit()` fills in; only `jumpToEnd()` and
+    /// `loadEarlier()` anchor it anywhere else.
+    public private(set) var windowStart = 0
+
+    /// Whether the loaded rows already reach back to row 0 — nothing earlier
+    /// to page in. The Home-key counterpart of `reachedEnd`.
+    public var reachedStart: Bool { windowStart == 0 }
 
     private let gridSession: DuckDBSession
     /// Schema and cardinality lookups.
@@ -250,9 +263,11 @@ public final class TableModel {
         loadedSource = nil
         pendingCacheKey = nil
         windowSize = Self.pageSize
+        windowStart = 0
         rowCap = Self.loadedRowCap
         isLoading = false
         isLoadingMore = false
+        isLoadingEarlier = false
         isCountingRows = false
         rowsAreStale = false
         queryStartedAt = nil
@@ -437,14 +452,18 @@ public final class TableModel {
 
     /// The query the grid is currently showing, for export and for the SQL
     /// editor's "edit this query" affordance.
-    public var currentQuery: BoundSQL? {
+    public var currentQuery: BoundSQL? { query(orderedBy: sort) }
+
+    /// `currentQuery` with a different ORDER BY — the same source, filters and
+    /// shape, ordered as asked. Only `jumpToEnd()` uses anything but `sort`.
+    private func query(orderedBy order: [SortKey]) -> BoundSQL? {
         switch mode {
         case .empty:
             return nil
         case .source(let source):
-            return SQLBuilder.rows(source: source, filters: filters, sort: sort)
+            return SQLBuilder.rows(source: source, filters: filters, sort: order)
         case .sql(let text):
-            return BoundSQL(sql: SQLBuilder.sorted(rawSQL: text, sort: sort), params: [])
+            return BoundSQL(sql: SQLBuilder.sorted(rawSQL: text, sort: order), params: [])
         }
     }
 
@@ -491,7 +510,7 @@ public final class TableModel {
     }
 
     /// Anything is in flight that the user could reasonably want to stop.
-    public var isBusy: Bool { isLoading || isLoadingMore || isCountingRows }
+    public var isBusy: Bool { isLoading || isLoadingMore || isLoadingEarlier || isCountingRows }
 
     /// Stop everything in flight, keeping whatever is already on screen.
     ///
@@ -505,6 +524,7 @@ public final class TableModel {
         stopTiming()
         isLoading = false
         isLoadingMore = false
+        isLoadingEarlier = false
         isCountingRows = false
         wasCancelled = true
         // The window stays where it is, so scrolling does not immediately
@@ -564,7 +584,11 @@ public final class TableModel {
         errorMessage = nil
         isLoading = !widening
         isLoadingMore = widening
+        isLoadingEarlier = false
         wasCancelled = false
+        // Every full re-run — first look or widened window alike — starts
+        // counting from row 0. Only `jumpToEnd()`/`loadEarlier()` move this.
+        if !widening { windowStart = 0 }
         queryStartedAt = Date()
         lastQueryDuration = nil
 
@@ -698,12 +722,27 @@ public final class TableModel {
         }
     }
 
-    /// Called by the grid as it approaches the end of the loaded rows.
+    /// Called by the grid as a row appears near the end of the loaded rows.
+    ///
+    /// Forward only, and deliberately so. A row appearing says nothing about
+    /// where the user is: a `LazyVStack` fills from the top, so the rows it
+    /// realises the instant a window lands are the ones at `windowStart`
+    /// whether or not anyone scrolled there. Reading that as "the user is at
+    /// the top, page in what comes before it" is what made a jump to the end
+    /// immediately load a second page behind itself. Going backward is
+    /// therefore not reachable from here at all — it is `loadEarlier()`, which
+    /// the grid calls only from an actual upward scroll.
+    ///
+    /// `displayedIndex` is the row's `id` — a global offset into the full
+    /// result, not a position in `rows` — so it is compared against
+    /// `windowStart` rather than assumed to start at 0.
     public func loadMoreIfNeeded(displayedIndex: Int) {
         // Deliberately not `isBusy`: a `count(*)` over a huge dataset can run
         // for a while, and scrolling should not wait on it.
-        guard !isLoading, !isLoadingMore, !reachedEnd, !hitRowCap else { return }
-        guard displayedIndex >= rows.count - Self.prefetchDistance else { return }
+        guard !isLoading, !isLoadingMore, !isLoadingEarlier else { return }
+        guard !reachedEnd, !hitRowCap else { return }
+        let localIndex = displayedIndex - windowStart
+        guard localIndex >= rows.count - Self.prefetchDistance else { return }
         loadMore()
     }
 
@@ -729,7 +768,192 @@ public final class TableModel {
         guard hitRowCap else { return }
         rowCap *= 2
         hitRowCap = false
-        loadMore()
+        windowStart == 0 ? loadMore() : loadEarlier()
+    }
+
+    /// Extend the window backward by one page, the way scrolling up past
+    /// `windowStart` should page in earlier rows — the mirror of `loadMore()`
+    /// widening it forward.
+    ///
+    /// A constant step, not a doubling one: `loadMore()` doubles because each
+    /// widening is a fresh `LIMIT`-from-0 re-run, so doubling bounds the number
+    /// of re-runs needed to reach any depth. A backward step is a plain
+    /// `OFFSET` read of rows not yet loaded — there is no re-run to amortize,
+    /// so there is nothing a bigger step would buy beyond a larger single read.
+    public func loadEarlier() {
+        guard !isLoading, !isLoadingMore, !isLoadingEarlier else { return }
+        guard windowStart > 0, !isExplain else { return }
+        guard rows.count < rowCap else {
+            hitRowCap = true
+            return
+        }
+        guard let query = currentQuery else { return }
+
+        let chunk = min(Self.pageSize, windowStart)
+        let start = windowStart - chunk
+
+        generation += 1
+        let generation = self.generation
+        cancelInFlight()
+        isLoadingEarlier = true
+        wasCancelled = false
+        queryStartedAt = Date()
+        lastQueryDuration = nil
+
+        loadTask = Task { [weak self] in
+            await self?.performEarlierLoad(query: query, start: start, limit: chunk, generation: generation)
+        }
+    }
+
+    private func performEarlierLoad(query: BoundSQL, start: Int, limit: Int, generation: Int) async {
+        let bounded = SQLBuilder.windowed(query, limit: limit, offset: start)
+        do {
+            let batch = try await gridSession.queryAll(bounded.sql, params: bounded.params, limit: limit)
+            guard generation == self.generation else { return }
+            prepend(cells(from: batch), start: start)
+        } catch {
+            guard generation == self.generation else { return }
+            report(error)
+        }
+        guard generation == self.generation else { return }
+        isLoadingEarlier = false
+        stopTiming()
+    }
+
+    /// Splice an earlier page onto the front of the loaded rows. The backward
+    /// counterpart of `commit()` — `reachedEnd` is left alone, since nothing
+    /// about the tail changed.
+    private func prepend(_ cells: [[String?]], start: Int) {
+        guard !cells.isEmpty else { return }
+        let earlier = cells.enumerated().map { GridRow(id: start + $0.offset, cells: $0.element) }
+        rows = earlier + rows
+        rowsGeneration += 1
+        windowStart = start
+    }
+
+    /// Load the window at the end of the result and anchor there — what the
+    /// Home key's opposite number, the End key, asks for: the last page, not
+    /// the whole file.
+    ///
+    /// Needs the total row count to know where that page starts, so this waits
+    /// for the count to resolve if it has not already — the one place loading
+    /// the last page has to be slower than loading the first, which never
+    /// needs to know how much comes after it.
+    public func jumpToEnd() {
+        guard currentQuery != nil, !isExplain else { return }
+
+        generation += 1
+        let generation = self.generation
+        cancelInFlight()
+        errorMessage = nil
+        isLoading = true
+        isLoadingMore = false
+        isLoadingEarlier = false
+        wasCancelled = false
+        rowsAreStale = false
+        reachedEnd = false
+        queryStartedAt = Date()
+        lastQueryDuration = nil
+
+        loadTask = Task { [weak self] in
+            await self?.performTailLoad(generation: generation)
+        }
+    }
+
+    private func performTailLoad(generation: Int) async {
+        if totalRowCount == nil, let countQuery = rowCountQuery() {
+            isCountingRows = true
+            let count = try? await counter.count(countQuery)
+            guard generation == self.generation else { return }
+            totalRowCount = count
+            isCountingRows = false
+        }
+
+        guard let total = totalRowCount, let forwardQuery = currentQuery else {
+            isLoading = false
+            stopTiming()
+            return
+        }
+        guard total > 0 else {
+            rows = []
+            rowsGeneration += 1
+            windowStart = 0
+            reachedEnd = true
+            isLoading = false
+            stopTiming()
+            return
+        }
+
+        let start = max(0, total - Self.pageSize)
+        let limit = total - start
+
+        // Read the tail by turning the sort around rather than by skipping to
+        // it, wherever there is a sort to turn around.
+        //
+        // `ORDER BY x … OFFSET n` is the pathological shape: a Top-N cannot
+        // answer it, because the rows it wants are the ones a Top-N throws
+        // away, so DuckDB has to order the whole result and discard all but
+        // the last page. `ORDER BY x DESC LIMIT 500` asks for the same rows as
+        // a Top-N — 500 rows kept against a scan — and the page is then put
+        // back the right way up here. Measured at 100M rows: 5.58s against
+        // 0.26s, and the gap widens with the row count, since one side is a
+        // full sort and the other a fixed-size heap.
+        //
+        // With a sort that has ties this can return a different page from the
+        // one `OFFSET` would have — both are the maximal rows, but which of a
+        // tied group makes the cut is not something `ORDER BY x` settles. The
+        // page shown is always correctly ordered and always from the end.
+        //
+        // Unsorted, there is nothing to turn around and this falls back to
+        // `OFFSET`, which is cheap there anyway: a parquet scan skips whole
+        // row groups on their metadata rather than decoding them.
+        let readsBackwards = !sort.isEmpty
+        let inverted = sort.map { SortKey(column: $0.column, direction: $0.direction.inverted) }
+        let bounded: BoundSQL
+        if readsBackwards, let invertedQuery = query(orderedBy: inverted) {
+            bounded = SQLBuilder.windowed(invertedQuery, limit: limit)
+        } else {
+            bounded = SQLBuilder.windowed(forwardQuery, limit: limit, offset: start)
+        }
+
+        do {
+            let batch = try await gridSession.queryAll(bounded.sql, params: bounded.params, limit: limit)
+            guard generation == self.generation else { return }
+            let page = cells(from: batch)
+            commitTail(readsBackwards ? page.reversed() : page, offset: start)
+        } catch {
+            guard generation == self.generation else { return }
+            report(error)
+        }
+        guard generation == self.generation else { return }
+        isLoading = false
+        stopTiming()
+    }
+
+    /// Replace the grid's rows with a window anchored at the end of the
+    /// result. Unlike `commit()`, `reachedEnd` does not need to be inferred
+    /// from a short read — asking for exactly what is left past `offset` means
+    /// whatever comes back already is the end.
+    private func commitTail(_ cells: [[String?]], offset: Int) {
+        rows = cells.enumerated().map { GridRow(id: offset + $0.offset, cells: $0.element) }
+        rowsGeneration += 1
+        rowsAreStale = false
+        windowStart = offset
+        windowSize = max(cells.count, Self.pageSize)
+        reachedEnd = true
+        hitRowCap = false
+        // These rows are the end of the file, so they are not the opening
+        // preview this load may have been on its way to filing.
+        pendingCacheKey = nil
+    }
+
+    /// Return to the opening window — what the Home key asks for after the
+    /// window has moved elsewhere. Reruns the query exactly as `reload()`
+    /// does for a freshly opened file: one page from row 0, not everything
+    /// paged in on the way there.
+    public func jumpToStart() {
+        guard windowStart != 0 else { return }
+        reload()
     }
 
     private func report(_ error: Error) {
@@ -763,15 +987,9 @@ public final class TableModel {
     /// It runs concurrently with the preview, so a slow count over a large
     /// dataset never delays the rows.
     private func startRowCount(generation: Int) {
-        let countQuery: BoundSQL
-        switch mode {
-        case .empty:
+        guard let countQuery = rowCountQuery() else {
             isCountingRows = false
             return
-        case .source(let source):
-            countQuery = SQLBuilder.rowCount(source: source, filters: filters)
-        case .sql(let text):
-            countQuery = SQLBuilder.rowCount(rawSQL: text)
         }
 
         isCountingRows = true
@@ -787,6 +1005,33 @@ public final class TableModel {
             if let count, self.rows.count >= count, !self.rowsAreStale { self.reachedEnd = true }
             self.storePreviewIfReady()
         }
+    }
+
+    /// The `count(*)` for the current mode, or nil when there is nothing to
+    /// count against — shared by the count that runs alongside every fresh
+    /// load and the one `jumpToEnd()` needs on demand.
+    private func rowCountQuery() -> BoundSQL? {
+        switch mode {
+        case .empty:
+            return nil
+        case .source(let source):
+            return SQLBuilder.rowCount(source: source, filters: filters)
+        case .sql(let text):
+            return SQLBuilder.rowCount(rawSQL: text)
+        }
+    }
+
+    /// Row-major cells from a fully collected batch, in the same
+    /// `[[String?]]` shape the streaming cursor path produces.
+    private func cells(from batch: RowBatch) -> [[String?]] {
+        let width = max(batch.columns.count, columns.count, 1)
+        var result: [[String?]] = []
+        result.reserveCapacity(batch.rowCount)
+        for row in 0..<batch.rowCount {
+            let start = row * width
+            result.append(Array(batch.cells[start..<min(start + width, batch.cells.count)]))
+        }
+        return result
     }
 
     // MARK: - Cache
@@ -813,6 +1058,7 @@ public final class TableModel {
         rows = cached.rows.enumerated().map { GridRow(id: $0.offset, cells: $0.element) }
         rowsGeneration += 1
         rowsAreStale = false
+        windowStart = 0
         totalRowCount = cached.totalRowCount
         isCountingRows = false
         reachedEnd = cached.reachedEnd

@@ -1712,6 +1712,43 @@ do {
     try? FileManager.default.removeItem(at: destination)
 }
 
+// MARK: - SQL trace
+
+section("SQL trace")
+
+do {
+    // The trace is a diagnostic, so the properties worth holding are that it
+    // is silent unless asked for, and that when asked for it emits something
+    // that can be run. Whether it is on for this process is decided by the
+    // environment at launch, so the suite checks whichever half applies rather
+    // than trying to flip it underneath itself.
+    if SQLTrace.isEnabled {
+        let ticket = SQLTrace.begin(session: "selftest-trace", sql: "SELECT $1", params: ["x"])
+        expect(ticket != nil, "an enabled trace issues a ticket")
+        SQLTrace.finish(ticket, rows: 1)
+    } else {
+        expect(SQLTrace.begin(session: "off", sql: "SELECT 1", params: []) == nil,
+               "tracing off issues no ticket, so nothing is written")
+        SQLTrace.finish(nil)
+        expect(true, "finishing a nil ticket is a no-op rather than a crash")
+    }
+
+    // What the trace writes is `inlined`, and the reason it writes that rather
+    // than the bound form is that the line has to be runnable. That property
+    // belongs to the substitution, so it is asserted on a statement shaped
+    // like the ones the grid actually issues -- a path parameter inside a
+    // quoted literal, which is where a naive substitution goes wrong.
+    let bound = SQLBuilder.rows(source: .file(smallParquet),
+                                sort: [SortKey(column: "id", direction: .descending)])
+    let runnable = SQLBuilder.inlined(BoundSQL(sql: bound.sql, params: bound.params))
+    expect(!runnable.contains("$1"), "a traced statement carries no unsubstituted placeholders")
+    expect(runnable.contains(smallParquet.path), "and names the file it read")
+
+    // The real check: DuckDB accepts it.
+    let echoed = try await session.queryAll(runnable, limit: 1)
+    expectEqual(echoed.rowCount, 1, "a traced statement runs as written")
+}
+
 // MARK: - TableModel (the logic the UI drives)
 
 section("TableModel")
@@ -1724,8 +1761,10 @@ func settle(_ model: TableModel, timeout: TimeInterval = 30) async {
     try? await Task.sleep(for: .milliseconds(60))
     while Date() < deadline {
         // The row count runs alongside the first page, so a settled model means
-        // all three are done -- otherwise assertions race the counter.
-        if !model.isLoading && !model.isLoadingMore && !model.isCountingRows { return }
+        // all four are done -- otherwise assertions race the counter.
+        if !model.isLoading && !model.isLoadingMore && !model.isLoadingEarlier && !model.isCountingRows {
+            return
+        }
         try? await Task.sleep(for: .milliseconds(40))
     }
 }
@@ -1964,6 +2003,105 @@ do {
     await settle(model)
     expect(!model.servedFromCache, "clearing the cache forces a fresh read")
     expectEqual(model.rows.count, TableModel.pageSize, "and the fresh read still works")
+
+    // End: jump to the last page and anchor there, rather than reading the
+    // whole file to get to the bottom.
+    expectEqual(model.windowStart, 0, "starting from the opening window")
+    model.jumpToEnd()
+    await settle(model)
+    expectEqual(model.rows.count, TableModel.pageSize, "jumping to the end loads one page, not the whole file")
+    expectEqual(model.windowStart, 500, "the tail window starts a page before the file's last row")
+    expect(model.reachedEnd, "the tail window already reaches the last row")
+    expect(!model.reachedStart, "the tail window does not also reach row 0")
+    expectEqual(model.rows.map(\.id), Array(500..<1000), "row ids reflect each row's true offset in the file")
+    expectEqual(model.rows.last?.cells[idIndex], "999", "the last row loaded is the file's actual last row")
+
+    // Landing on the end must be one query and stay one query. Rendering the
+    // window cannot pull in another page: every row of it is handed to
+    // `loadMoreIfNeeded`, which is the call the grid makes as rows appear, and
+    // none of them may page backward. This is what turned one five-second read
+    // into two on a billion-row dataset -- a `LazyVStack` fills from the top,
+    // so the rows realised on arrival look exactly like the user having
+    // scrolled to the top of the window.
+    let generationAtTail = model.rowsGeneration
+    for row in model.rows {
+        model.loadMoreIfNeeded(displayedIndex: row.id)
+    }
+    await settle(model)
+    expectEqual(model.rowsGeneration, generationAtTail, "landing on the end runs one query, not several")
+    expectEqual(model.windowStart, 500, "rendering the tail window cannot page backward")
+    expectEqual(model.rows.count, TableModel.pageSize, "and the tail window is left as it landed")
+
+    // Scrolling up from the tail must load in earlier rows the same way
+    // scrolling down from the top does, not by re-reading everything. The
+    // grid asks for this explicitly, off an upward scroll -- it is the one
+    // path backward, and nothing about drawing rows can reach it.
+    model.loadEarlier()
+    await settle(model)
+    expectEqual(model.rows.count, 1000, "scrolling up from the tail eventually reaches the front of the file")
+    expectEqual(model.windowStart, 0, "loading earlier rows all the way back reaches row 0")
+    expect(model.reachedStart, "row 0 loaded means the window reaches the start")
+    expect(model.reachedEnd, "the tail end is untouched by loading earlier rows")
+    expectEqual(model.rows.map(\.id), Array(0..<1000), "row ids stay contiguous across a prepend")
+    expectEqual(model.rows.first?.cells[idIndex], "0", "the first row loaded is the file's actual first row")
+
+    // Home after End: jumping back to the front reads a fresh opening page,
+    // the same one `reload()` reads for a newly opened file -- not the whole
+    // file, even though the whole file happens to be loaded right now from
+    // the walk back up above.
+    model.jumpToEnd()
+    await settle(model)
+    expectEqual(model.windowStart, 500, "back at the tail window")
+    model.jumpToStart()
+    await settle(model)
+    expectEqual(model.windowStart, 0, "Home resets the window to the front")
+    expectEqual(model.rows.count, TableModel.pageSize, "Home loads a single page, not the whole file")
+    expectEqual(model.rows.map(\.id), Array(0..<TableModel.pageSize), "back to the opening window's row ids")
+    expectEqual(model.rows.first?.cells[idIndex], "0", "the opening window starts at the file's first row")
+
+    // Home is a no-op, query-wise, when row 0 is already loaded.
+    let generationAtStart = model.rowsGeneration
+    model.jumpToStart()
+    expectEqual(model.rowsGeneration, generationAtStart,
+                "jumpToStart does nothing when the window already reaches row 0")
+
+    // A sorted End reads the tail by inverting the ORDER BY and turning the
+    // page back over, rather than ordering the whole result to skip past it.
+    // The rows it produces must be indistinguishable from what the OFFSET it
+    // replaces would have returned -- same rows, same order, right way up.
+    model.clearFilters()
+    model.toggleSort(column: "id")
+    await settle(model)
+    expectEqual(model.sortDirection(for: "id"), .ascending, "sorted ascending by id")
+
+    model.jumpToEnd()
+    await settle(model)
+    expectEqual(model.rows.count, TableModel.pageSize, "a sorted End still loads exactly one page")
+    expectEqual(model.windowStart, 500, "anchored at the last page of the sorted result")
+    expect(model.reachedEnd, "and it is the end")
+    expectEqual(model.rows.first?.cells[idIndex], "500",
+                "the tail page is the right way up -- lowest id of the page first")
+    expectEqual(model.rows.last?.cells[idIndex], "999",
+                "and runs to the highest id, not reversed")
+    let sortedTailIDs = model.rows.compactMap { $0.cells[idIndex].flatMap(Int.init) }
+    expectEqual(sortedTailIDs, Array(500..<1000), "the sorted tail page is ascending and contiguous")
+
+    // Same check with the sort the other way round, where inverting means
+    // ascending: the page must still read top-to-bottom in the sort's own
+    // direction.
+    model.toggleSort(column: "id")
+    await settle(model)
+    expectEqual(model.sortDirection(for: "id"), .descending, "sorted descending by id")
+    model.jumpToEnd()
+    await settle(model)
+    let descendingTailIDs = model.rows.compactMap { $0.cells[idIndex].flatMap(Int.init) }
+    expectEqual(descendingTailIDs, Array(0..<500).reversed().map { $0 },
+                "the tail of a descending sort is the lowest ids, still descending")
+    expectEqual(model.rows.first?.cells[idIndex], "499", "descending tail starts at 499")
+    expectEqual(model.rows.last?.cells[idIndex], "0", "and ends at the file's lowest id")
+
+    model.clearSort()
+    await settle(model)
 }
 
 // MARK: - Scale
@@ -2063,6 +2201,73 @@ if FileManager.default.fileExists(atPath: bigParquet.path) {
     model.reload()
     await settle(model)
     expectEqual(model.rows.count, TableModel.pageSize, "the grid recovers after a cancel")
+
+    // End on a 10M-row file must land on the real last page without reading
+    // the 10M rows in front of it -- the whole reason `jumpToEnd()` exists
+    // rather than scrolling there by widening the window until it covers the
+    // file. Explicitly unsorted: the cancelled sort above left `key` behind as
+    // the active sort, and jumping to the end of that would correctly land on
+    // the last row in key order rather than the file's physical last row.
+    model.clearSort()
+    await settle(model)
+    let bigIdIndex = model.columns.firstIndex { $0.name == "id" }!
+    let endAt = Date()
+    model.jumpToEnd()
+    await settle(model)
+    let endElapsed = Date().timeIntervalSince(endAt)
+    expectEqual(model.rows.count, TableModel.pageSize, "the tail window is one page of a 10M-row file")
+    expectEqual(model.windowStart, 10_000_000 - TableModel.pageSize,
+                "the tail window starts one page before the file's last row")
+    expect(model.reachedEnd, "the tail window reaches the file's actual last row")
+    expectEqual(model.rows.last?.cells[bigIdIndex], "9999999", "the last row is the file's actual last row")
+    expect(endElapsed < 5, "jumping to the end of a 10M-row file is fast (took \(String(format: "%.2f", endElapsed))s)")
+    print("  jump to end: \(String(format: "%.2f", endElapsed))s")
+
+    // Scrolling up a step from there pages in one more chunk, not the other
+    // 9,999,500 rows in front of it.
+    let earlierAt = Date()
+    model.loadEarlier()
+    await settle(model)
+    let earlierElapsed = Date().timeIntervalSince(earlierAt)
+    expectEqual(model.rows.count, TableModel.pageSize * 2, "one step back loads one more page")
+    expectEqual(model.windowStart, 10_000_000 - TableModel.pageSize * 2,
+                "the window's start moves back by exactly one page")
+    expect(earlierElapsed < 5,
+           "loading one earlier page stays cheap (took \(String(format: "%.2f", earlierElapsed))s)")
+    print("  load one earlier page: \(String(format: "%.2f", earlierElapsed))s")
+
+    // The end of a *sorted* 10M-row result. This is the case that inverting
+    // the ORDER BY exists for: reaching it with OFFSET means ordering all 10M
+    // rows and discarding all but the last page, because the rows a Top-N
+    // keeps are precisely the ones this wants thrown away. Inverted it is a
+    // Top-N like any other, so it must land in about the time a sorted first
+    // page takes rather than the time a full sort takes.
+    model.toggleSort(column: "measure")
+    await settle(model)
+    let sortedEndAt = Date()
+    model.jumpToEnd()
+    await settle(model)
+    let sortedEndElapsed = Date().timeIntervalSince(sortedEndAt)
+    expectEqual(model.rows.count, TableModel.pageSize, "the sorted tail is one page")
+    expectEqual(model.windowStart, 10_000_000 - TableModel.pageSize, "anchored at the end of the sort")
+    let tailMeasures = model.rows.compactMap { $0.cells[measureIndex].flatMap(Double.init) }
+    expectEqual(tailMeasures.count, TableModel.pageSize, "every tail row carries a measure")
+    expect(tailMeasures == tailMeasures.sorted(),
+           "the inverted read is turned back over, so the page reads ascending like the sort")
+
+    // Cross-check against DuckDB's own answer for the largest value, so a
+    // page that is internally consistent but off the end cannot pass.
+    let tailCheck = try await verifier.queryAll(
+        "SELECT measure FROM read_parquet($1) ORDER BY measure DESC LIMIT 1",
+        params: [bigParquet.path], limit: 1)
+    expectEqual(model.rows.last?.cells[measureIndex], tailCheck[0, 0],
+                "the last row of the sorted tail is DuckDB's own maximum")
+    expect(sortedEndElapsed < 5,
+           "the end of a sorted 10M-row result is a Top-N, not a full sort "
+           + "(took \(String(format: "%.2f", sortedEndElapsed))s)")
+    print("  jump to end, sorted: \(String(format: "%.2f", sortedEndElapsed))s")
+    model.clearSort()
+    await settle(model)
 } else {
     print("\n— Scale: skipped (run `BIG=1 make fixtures` for the 10M-row file)")
 }
