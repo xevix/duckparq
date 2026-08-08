@@ -185,6 +185,15 @@ do {
     expect(!FileTree.isHivePartitionName("=2024"), "a value with no key is not a partition name")
     expect(!FileTree.isHivePartitionName("plain"), "a folder without = is not a partition")
 
+    // The outermost partition key names the column the dataset is laid out by,
+    // which is the one it opens ordered by.
+    expectEqual(FileTree.topLevelHiveKey(of: hiveDirectory), "year",
+                "the top-level partition key is read from the partition folder names")
+    expectEqual(FileTree.topLevelHiveKey(of: fixtures), String?.none,
+                "a plain folder of parquet files has no partition key")
+    expectEqual(FileTree.topLevelHiveKey(of: hiveDirectory.appendingPathComponent("nope")),
+                String?.none, "an unreadable directory has no partition key")
+
     // Search must not descend into partitions either, or a hive dataset floods
     // the results with a file per partition.
     expect(FileTree.search(root: hiveDirectory, query: "data").isEmpty,
@@ -1749,6 +1758,57 @@ do {
     expectEqual(echoed.rowCount, 1, "a traced statement runs as written")
 }
 
+// MARK: - Page addressing
+
+section("Page addressing")
+
+do {
+    // Which end of the result a page is counted from. The point is that a page
+    // near the end is reached by counting back from the end, so the last page
+    // of three billion rows is offset 0 and the one before it offset 500 --
+    // rather than offsets of three billion, which DuckDB can only satisfy by
+    // producing and discarding everything in front of them.
+    typealias Address = TableModel.PageAddress
+    let billions = 3_131_875_121
+
+    expectEqual(TableModel.pageAddress(start: billions - 500, count: 500,
+                                       total: billions, invertible: true),
+                Address.reversed(offset: 0),
+                "the last page is at the far end's offset 0, not the near end's three billion")
+    expectEqual(TableModel.pageAddress(start: billions - 1000, count: 500,
+                                       total: billions, invertible: true),
+                Address.reversed(offset: 500),
+                "the page before it is 500 back from the end")
+    expectEqual(TableModel.pageAddress(start: billions - 1500, count: 500,
+                                       total: billions, invertible: true),
+                Address.reversed(offset: 1000),
+                "and the one before that 1000, counting away from the end")
+
+    // The first page is already at the near end, so counting forward wins.
+    expectEqual(TableModel.pageAddress(start: 0, count: 500, total: 1000, invertible: true),
+                Address.forward(offset: 0), "the first page is counted forward")
+
+    // The crossover is the midpoint: past it, forward is the shorter way again.
+    expectEqual(TableModel.pageAddress(start: 400, count: 100, total: 1000, invertible: true),
+                Address.forward(offset: 400), "a page before the midpoint is counted forward")
+    expectEqual(TableModel.pageAddress(start: 600, count: 100, total: 1000, invertible: true),
+                Address.reversed(offset: 300), "a page past the midpoint is counted back")
+
+    // Without a sort there is no order to run backward, and without a total
+    // there is nothing to measure the far end against.
+    expectEqual(TableModel.pageAddress(start: billions - 500, count: 500,
+                                       total: billions, invertible: false),
+                Address.forward(offset: billions - 500),
+                "an unsorted result can only be counted forward, however far in")
+    expectEqual(TableModel.pageAddress(start: 900, count: 100, total: nil, invertible: true),
+                Address.forward(offset: 900),
+                "an uncounted result cannot be addressed from its end")
+
+    // A page running past the end would give a negative offset backward.
+    expectEqual(TableModel.pageAddress(start: 900, count: 500, total: 1000, invertible: true),
+                Address.forward(offset: 900), "a page overrunning the end is counted forward")
+}
+
 // MARK: - TableModel (the logic the UI drives)
 
 section("TableModel")
@@ -2102,6 +2162,55 @@ do {
 
     model.clearSort()
     await settle(model)
+
+    // A hive dataset opens ordered by its top-level partition key. That order
+    // is close to free -- the value comes from the path, not the data -- and
+    // having one is what lets the end of the dataset be reached by counting
+    // back from it rather than past everything in front of it.
+    model.open(.dataset(hiveDirectory))
+    await settle(model)
+    expectEqual(model.sort.map(\.column), ["year"], "a hive dataset opens sorted by its partition key")
+    expectEqual(model.sortDirection(for: "year"), .ascending, "ascending, so it opens at the earliest")
+    expectEqual(model.defaultSort, model.sort, "and that sort is the one it opened in")
+    expectEqual(model.totalRowCount, 3000, "the whole dataset is counted across its partitions")
+    let yearIndex = model.columns.firstIndex { $0.name == "year" }!
+    let firstYears = model.rows.prefix(20).compactMap { $0.cells[yearIndex].flatMap(Int.init) }
+    expect(firstYears == firstYears.sorted(), "the opening page is ordered by the partition key")
+    expectEqual(model.rows.first?.cells[yearIndex], "2023", "and starts at the earliest partition")
+
+    // The end of it, and the page before that, which is the pair the counting
+    // exists for.
+    model.jumpToEnd()
+    await settle(model)
+    expect(model.reachedEnd, "End on a hive dataset reaches the end")
+    expectEqual(model.rows.count, TableModel.pageSize, "and loads one page of it")
+    expectEqual(model.windowStart, 2500, "anchored a page before the last row")
+    expectEqual(model.rows.last?.cells[yearIndex], "2024", "the last row is in the latest partition")
+    let tailYears = model.rows.compactMap { $0.cells[yearIndex].flatMap(Int.init) }
+    expect(tailYears == tailYears.sorted(), "the tail page is turned back the right way up")
+
+    model.loadEarlier()
+    await settle(model)
+    expectEqual(model.windowStart, 2000, "the page before the end loads")
+    expectEqual(model.rows.count, 1000, "and joins the one already there")
+    expectEqual(model.rows.map(\.id), Array(2000..<3000), "with contiguous ids across the seam")
+    let joinedYears = model.rows.compactMap { $0.cells[yearIndex].flatMap(Int.init) }
+    expect(joinedYears == joinedYears.sorted(), "and the two pages agree on the ordering")
+
+    // A user clearing the sort gets the dataset unordered, so the default is a
+    // starting point rather than something imposed.
+    model.clearSort()
+    await settle(model)
+    expect(model.sort.isEmpty, "the opening sort clears like any other")
+    expect(model.defaultSort != model.sort, "which is no longer the view it opened in")
+
+    // A plain folder of parquet files is not partitioned, so it opens unsorted.
+    model.open(.dataset(fixtures))
+    await settle(model)
+    expect(model.sort.isEmpty, "a plain folder of parquet files opens unsorted")
+    expect(model.defaultSort.isEmpty, "and has no opening sort to speak of")
+
+    model.clear()
 }
 
 // MARK: - Scale

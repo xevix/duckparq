@@ -180,6 +180,33 @@ public enum FileTree {
         return containsHivePartitions(entries)
     }
 
+    /// The key naming a hive layout's outermost partition — the `year` in
+    /// `year=2024/region=us/` — or nil for anything not partitioned that way.
+    ///
+    /// This is the column the dataset is physically laid out by, which is what
+    /// makes it the one worth ordering by: its value comes from the path
+    /// rather than the data, so DuckDB can order by it without reading a
+    /// column, and can skip whole partitions it does not need.
+    ///
+    /// Bounded like `containsHivePartitions`, and for the same reason: a
+    /// dataset of many thousands of partitions should not be walked to answer
+    /// a question the first partition answers.
+    public static func topLevelHiveKey(of url: URL) -> String? {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
+        ) else { return nil }
+
+        for entry in entries.prefix(256) {
+            let name = entry.lastPathComponent
+            guard isHivePartitionName(name),
+                  let separator = name.firstIndex(of: "="),
+                  (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+            else { continue }
+            return String(name[name.startIndex..<separator])
+        }
+        return nil
+    }
+
     private static func containsHivePartitions(_ entries: [URL]) -> Bool {
         for entry in entries.prefix(256) {
             guard isHivePartitionName(entry.lastPathComponent) else { continue }

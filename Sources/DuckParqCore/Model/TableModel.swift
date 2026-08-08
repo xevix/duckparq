@@ -95,6 +95,13 @@ public final class TableModel {
     /// `loadEarlier()` anchor it anywhere else.
     public private(set) var windowStart = 0
 
+    /// The sort the current source opened in — see `defaultSort(for:)`.
+    ///
+    /// Kept so the preview cache can tell "the view as it opens" from "a view
+    /// the user has sorted". Only the former is cacheable, and on a hive
+    /// dataset the former is no longer the unsorted one.
+    public private(set) var defaultSort: [SortKey] = []
+
     /// Whether the loaded rows already reach back to row 0 — nothing earlier
     /// to page in. The Home-key counterpart of `reachedEnd`.
     public var reachedStart: Bool { windowStart == 0 }
@@ -204,9 +211,27 @@ public final class TableModel {
         }
         mode = .source(source)
         filters = []
-        sort = []
+        defaultSort = Self.defaultSort(for: source)
+        sort = defaultSort
         discardValueIndexes()
         reload()
+    }
+
+    /// The sort a source opens in.
+    ///
+    /// Empty for a file, and for a plain folder of parquet files. A hive
+    /// dataset opens ordered by its top-level partition key, which is the
+    /// column it is physically laid out by — so the order is close to free,
+    /// and having one is what lets the end of the dataset be read by turning
+    /// the sort around instead of counting to it. See `fetchPage`.
+    ///
+    /// A default rather than a fixture: clicking the header clears it like any
+    /// other sort, and `clearSort()` leaves the dataset unordered.
+    private static func defaultSort(for source: DataSource) -> [SortKey] {
+        guard case .dataset(let url) = source,
+              let key = FileTree.topLevelHiveKey(of: url)
+        else { return [] }
+        return [SortKey(column: key, direction: .ascending)]
     }
 
     /// Run a query from the SQL editor, if it is allowed to run.
@@ -245,6 +270,7 @@ public final class TableModel {
             self.sqlStatementKind = kinds.first ?? .select
             self.mode = .sql(trimmed)
             self.filters = []
+            self.defaultSort = []
             self.sort = []
             self.columns = []
             self.discardValueIndexes()
@@ -262,6 +288,7 @@ public final class TableModel {
         totalRowCount = nil
         loadedSource = nil
         pendingCacheKey = nil
+        defaultSort = []
         windowSize = Self.pageSize
         windowStart = 0
         rowCap = Self.loadedRowCap
@@ -787,7 +814,7 @@ public final class TableModel {
             hitRowCap = true
             return
         }
-        guard let query = currentQuery else { return }
+        guard currentQuery != nil else { return }
 
         let chunk = min(Self.pageSize, windowStart)
         let start = windowStart - chunk
@@ -801,16 +828,18 @@ public final class TableModel {
         lastQueryDuration = nil
 
         loadTask = Task { [weak self] in
-            await self?.performEarlierLoad(query: query, start: start, limit: chunk, generation: generation)
+            await self?.performEarlierLoad(start: start, limit: chunk, generation: generation)
         }
     }
 
-    private func performEarlierLoad(query: BoundSQL, start: Int, limit: Int, generation: Int) async {
-        let bounded = SQLBuilder.windowed(query, limit: limit, offset: start)
+    private func performEarlierLoad(start: Int, limit: Int, generation: Int) async {
         do {
-            let batch = try await gridSession.queryAll(bounded.sql, params: bounded.params, limit: limit)
+            // Stepping back from a window anchored at the end, this is the
+            // page just inside the one already loaded — offset 500 from the
+            // far end, then 1000, rather than three billion from the near one.
+            let page = try await fetchPage(start: start, count: limit, total: totalRowCount)
             guard generation == self.generation else { return }
-            prepend(cells(from: batch), start: start)
+            prepend(page, start: start)
         } catch {
             guard generation == self.generation else { return }
             report(error)
@@ -869,7 +898,7 @@ public final class TableModel {
             isCountingRows = false
         }
 
-        guard let total = totalRowCount, let forwardQuery = currentQuery else {
+        guard let total = totalRowCount, currentQuery != nil else {
             isLoading = false
             stopTiming()
             return
@@ -887,40 +916,10 @@ public final class TableModel {
         let start = max(0, total - Self.pageSize)
         let limit = total - start
 
-        // Read the tail by turning the sort around rather than by skipping to
-        // it, wherever there is a sort to turn around.
-        //
-        // `ORDER BY x … OFFSET n` is the pathological shape: a Top-N cannot
-        // answer it, because the rows it wants are the ones a Top-N throws
-        // away, so DuckDB has to order the whole result and discard all but
-        // the last page. `ORDER BY x DESC LIMIT 500` asks for the same rows as
-        // a Top-N — 500 rows kept against a scan — and the page is then put
-        // back the right way up here. Measured at 100M rows: 5.58s against
-        // 0.26s, and the gap widens with the row count, since one side is a
-        // full sort and the other a fixed-size heap.
-        //
-        // With a sort that has ties this can return a different page from the
-        // one `OFFSET` would have — both are the maximal rows, but which of a
-        // tied group makes the cut is not something `ORDER BY x` settles. The
-        // page shown is always correctly ordered and always from the end.
-        //
-        // Unsorted, there is nothing to turn around and this falls back to
-        // `OFFSET`, which is cheap there anyway: a parquet scan skips whole
-        // row groups on their metadata rather than decoding them.
-        let readsBackwards = !sort.isEmpty
-        let inverted = sort.map { SortKey(column: $0.column, direction: $0.direction.inverted) }
-        let bounded: BoundSQL
-        if readsBackwards, let invertedQuery = query(orderedBy: inverted) {
-            bounded = SQLBuilder.windowed(invertedQuery, limit: limit)
-        } else {
-            bounded = SQLBuilder.windowed(forwardQuery, limit: limit, offset: start)
-        }
-
         do {
-            let batch = try await gridSession.queryAll(bounded.sql, params: bounded.params, limit: limit)
+            let page = try await fetchPage(start: start, count: limit, total: total)
             guard generation == self.generation else { return }
-            let page = cells(from: batch)
-            commitTail(readsBackwards ? page.reversed() : page, offset: start)
+            commitTail(page, offset: start)
         } catch {
             guard generation == self.generation else { return }
             report(error)
@@ -928,6 +927,84 @@ public final class TableModel {
         guard generation == self.generation else { return }
         isLoading = false
         stopTiming()
+    }
+
+    /// Read the rows at `[start, start + count)` of the current result,
+    /// counted from whichever end of it they are nearer to.
+    ///
+    /// Counting from the start to a page near the end means DuckDB producing
+    /// and discarding everything in front of it — three billion rows for the
+    /// last page of a dataset that size, and very nearly that again for the
+    /// page before it. Turning the sort around counts the same page from the
+    /// other end, where the last page is at offset 0, the one before it at
+    /// 500, and so on back; the rows arrive reversed and are turned over here.
+    /// The crossover is the midpoint, after which counting forward is the
+    /// shorter way round again.
+    ///
+    /// Turning the sort around is also what stops `ORDER BY x … OFFSET n`
+    /// being planned as a full sort. A Top-N cannot answer that shape — the
+    /// rows it keeps are the ones the offset wants discarded — so DuckDB
+    /// orders the whole result to reach the end of it. Inverted it is an
+    /// ordinary Top-N: 5.58s against 0.26s at 100M rows.
+    ///
+    /// Both need a sort to invert. An unsorted result has no order to run
+    /// backward — a scan's "last 500 rows" are defined by nothing but the scan
+    /// — so those are counted forward however far in they are. That is the
+    /// case a hive dataset sidesteps by opening ordered by its partition key.
+    ///
+    /// Where the sort has ties this can return a different page than counting
+    /// forward would: both hold rows equal under the sort, but which of a tied
+    /// group falls in a given page is not something `ORDER BY x` settles.
+    private func fetchPage(start: Int, count: Int, total: Int?) async throws -> [[String?]] {
+        let inverted = sort.map { SortKey(column: $0.column, direction: $0.direction.inverted) }
+        let address = Self.pageAddress(
+            start: start, count: count, total: total, invertible: !sort.isEmpty
+        )
+
+        let source: BoundSQL?
+        let offset: Int
+        switch address {
+        case .forward(let forwardOffset):
+            source = currentQuery
+            offset = forwardOffset
+        case .reversed(let reversedOffset):
+            source = query(orderedBy: inverted)
+            offset = reversedOffset
+        }
+        guard let source else { return [] }
+
+        let bounded = SQLBuilder.windowed(source, limit: count, offset: offset)
+        let batch = try await gridSession.queryAll(bounded.sql, params: bounded.params, limit: count)
+        let page = cells(from: batch)
+        if case .reversed = address { return page.reversed() }
+        return page
+    }
+
+    /// Which end of the result a page is counted from.
+    public enum PageAddress: Equatable, Sendable {
+        /// Counted forward from the first row, in the sort as it stands.
+        case forward(offset: Int)
+        /// Counted back from the last row, with the sort inverted. The rows
+        /// arrive in reverse and are turned over before they are shown.
+        case reversed(offset: Int)
+    }
+
+    /// Pick the shorter way round to the page at `[start, start + count)`.
+    ///
+    /// Split out from `fetchPage` because it is the whole idea, and it is
+    /// arithmetic: the last page of three billion rows is `.reversed(0)`, the
+    /// page before it `.reversed(500)`, and somewhere around the midpoint
+    /// counting forward becomes the shorter way again.
+    ///
+    /// `.forward` whenever there is no sort to invert, or no total to measure
+    /// against — an unsorted result has no order to run backward.
+    public static func pageAddress(
+        start: Int, count: Int, total: Int?, invertible: Bool
+    ) -> PageAddress {
+        guard invertible, let total else { return .forward(offset: start) }
+        let reversedOffset = total - (start + count)
+        guard reversedOffset >= 0, reversedOffset < start else { return .forward(offset: start) }
+        return .reversed(offset: reversedOffset)
     }
 
     /// Replace the grid's rows with a window anchored at the end of the
@@ -1044,7 +1121,7 @@ public final class TableModel {
     /// is actively composing, where serving a remembered one would be
     /// indistinguishable from a fresh one and wrong in a way they could not see.
     private func fingerprintForCaching() async -> SourceFingerprint? {
-        guard case .source(let source) = mode, filters.isEmpty, sort.isEmpty,
+        guard case .source(let source) = mode, filters.isEmpty, sort == defaultSort,
               windowSize == Self.pageSize
         else { return nil }
         return await Task.detached(priority: .userInitiated) {
@@ -1073,7 +1150,7 @@ public final class TableModel {
     private func storePreviewIfReady() {
         guard let key = pendingCacheKey,
               !isLoading, !isCountingRows,
-              case .source = mode, filters.isEmpty, sort.isEmpty,
+              case .source = mode, filters.isEmpty, sort == defaultSort,
               windowSize == Self.pageSize,
               errorMessage == nil,
               !columns.isEmpty, !rows.isEmpty
