@@ -192,6 +192,14 @@ do {
 
     let datasetSource = DataSource.dataset(hiveDirectory)
     expect(datasetSource.readPath.hasSuffix("/**/*.parquet"), "datasets read recursively")
+
+    // With the partitions withheld, the sidebar's only way to open a hive
+    // folder is the note explaining why — so tapping it has to resolve to the
+    // exact same dataset "All files as one dataset" would open.
+    let hiveNoteNode = FileNode(url: hiveDirectory, isDirectory: true, isDataset: true,
+                                 byteSize: nil, modified: nil)
+    expectEqual(hiveNoteNode.dataSource, .dataset(hiveDirectory),
+                "tapping the hive-partitioned note opens the whole folder as one dataset")
 }
 
 // MARK: - Sifting a drop

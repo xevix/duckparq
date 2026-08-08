@@ -345,6 +345,13 @@ private struct DirectoryContents: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.vertical, 2)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            // Same effect as tapping "All files as one dataset" for this
+            // folder: hive partitions are a dead end to browse individually,
+            // so clicking the note should just open the dataset.
+            app.select(FileNode(url: url, isDirectory: true, isDataset: true, byteSize: nil, modified: nil))
+        }
     }
 
     private func reload() {
