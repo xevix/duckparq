@@ -57,6 +57,60 @@ public enum GridScroll {
         }
     }
 
+    /// Which way a Page Up or Page Down press moves the rows.
+    ///
+    /// Distinct from `Edge`, which is where a press *lands*. A page is a step
+    /// of a known size from wherever the viewport already is, and the two
+    /// cannot be spelled the same way: Home and End are absolute and need no
+    /// current position, these are relative and are nothing without one.
+    public enum PageDirection: Sendable, Equatable {
+        case up
+        case down
+    }
+
+    /// How far one Page Up or Page Down press moves the viewport.
+    ///
+    /// A screenful less one row, so the row at the boundary is shown twice
+    /// rather than stepped over — the line you were reading when you pressed
+    /// the key is still on screen afterward, which is what makes paging through
+    /// a file readable rather than a series of disjoint screenfuls.
+    ///
+    /// Never less than a row, so the grid still moves when it is asked to: a
+    /// viewport barely taller than a row would otherwise ask for a step of
+    /// nothing, and a viewport of zero — which is what the grid reports before
+    /// the scroll view has been laid out — for a step backward.
+    public static func pageStep(viewportHeight: CGFloat, rowHeight: CGFloat) -> CGFloat {
+        max(viewportHeight - rowHeight, rowHeight)
+    }
+
+    /// Where the viewport goes for a Page Up or Page Down press, with the
+    /// columns held at `x` for the same reason a Home or End landing holds
+    /// them: this moves the rows, and nothing about it asks for the columns to
+    /// move too.
+    ///
+    /// Clamped at the top, and deliberately not at the bottom. Zero is a bound
+    /// this can be sure of; the end of the content is not, since the rows the
+    /// content is made of are still being paged in and a height measured here
+    /// would be the height of whatever was loaded a moment ago. The scroll view
+    /// clamps the far end against the rows as actually laid out, which is the
+    /// one account of it that cannot be stale — the same bargain
+    /// `landing(on: .bottom)` makes.
+    public static func page(
+        _ direction: PageDirection,
+        from distanceFromTop: CGFloat,
+        viewportHeight: CGFloat,
+        rowHeight: CGFloat,
+        keepingX x: CGFloat
+    ) -> Landing {
+        let step = pageStep(viewportHeight: viewportHeight, rowHeight: rowHeight)
+        switch direction {
+        case .up:
+            return Landing(x: x, y: max(distanceFromTop - step, 0))
+        case .down:
+            return Landing(x: x, y: distanceFromTop + step)
+        }
+    }
+
     /// Where the viewport must move to hold its rows still when `prepended`
     /// rows are spliced in above it.
     ///

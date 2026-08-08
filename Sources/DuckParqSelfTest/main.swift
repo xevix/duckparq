@@ -2008,6 +2008,48 @@ do {
                 "and a page that brought nothing moves the viewport not at all")
 }
 
+do {
+    // Page Up and Page Down: a step of a screenful from wherever the viewport
+    // is, rather than a place to land. The columns are held for the same reason
+    // Home and End hold them -- the press moves the rows and says nothing about
+    // the columns.
+    let columns: CGFloat = 268
+    let viewport: CGFloat = 600
+    let row: CGFloat = 20
+
+    expectEqual(GridScroll.pageStep(viewportHeight: viewport, rowHeight: row), 580,
+                "a page is a screenful less the one row of overlap that keeps the reading position visible")
+    expectEqual(GridScroll.pageStep(viewportHeight: 24, rowHeight: row), 20,
+                "a viewport barely taller than a row still moves a whole row")
+    expectEqual(GridScroll.pageStep(viewportHeight: 0, rowHeight: row), 20,
+                "and one not laid out yet moves forward rather than backward")
+
+    expectEqual(GridScroll.page(.down, from: 0, viewportHeight: viewport,
+                                rowHeight: row, keepingX: columns),
+                GridScroll.Landing(x: columns, y: 580),
+                "Page Down moves a page down the rows without moving the columns")
+    expectEqual(GridScroll.page(.up, from: 580, viewportHeight: viewport,
+                                rowHeight: row, keepingX: columns),
+                GridScroll.Landing(x: columns, y: 0),
+                "and Page Up brings it back to exactly where it started")
+    expectEqual(GridScroll.page(.up, from: 100, viewportHeight: viewport,
+                                rowHeight: row, keepingX: columns).y,
+                0,
+                "paging up from less than a page in stops at the top rather than above it")
+    expectEqual(GridScroll.page(.up, from: 0, viewportHeight: viewport,
+                                rowHeight: row, keepingX: columns).y,
+                0,
+                "and a viewport already at the top has nowhere to go -- which is what tells the grid to ask for earlier rows instead")
+
+    // The far end is the scroll view's to clamp, against the rows as laid out.
+    // Anything measured here would describe the window before the last page
+    // landed, which is exactly when a page down is most likely to be pressed.
+    expectEqual(GridScroll.page(.down, from: 9_900, viewportHeight: viewport,
+                                rowHeight: row, keepingX: 0).y,
+                10_480,
+                "Page Down asks past the end and lets the scroll view stop it at the real one")
+}
+
 // MARK: - TableModel (the logic the UI drives)
 
 section("TableModel")

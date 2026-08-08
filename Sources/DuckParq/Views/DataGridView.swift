@@ -49,6 +49,14 @@ enum GridTrace {
 @MainActor
 private final class ScrollOffset {
     var distanceFromTop: CGFloat = 0
+    /// How tall the scrolling area is, which is how far a Page Up or Page Down
+    /// press moves.
+    ///
+    /// Measured from the scroll view rather than derived from the grid's frame:
+    /// the header and the divider above it are outside the scroll view, and a
+    /// legacy horizontal scroller is inside its frame but outside its viewport.
+    /// A page that overshot by that much would step over rows nobody saw.
+    var viewportHeight: CGFloat = 0
 }
 
 struct DataGridView: View {
@@ -331,6 +339,15 @@ struct DataGridView: View {
                         """, dedupe: false)
                     table.loadEarlier()
                 }
+                // How far a page is. Its own observer rather than a field on
+                // the one above: that one fires on the *offset* changing and
+                // reads a decrease as the user paging backward, so folding a
+                // height into it would have a window resize ask for rows.
+                .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                    geometry.containerSize.height
+                } action: { _, height in
+                    scrollY.viewportHeight = height
+                }
                 // A two-axis scroll view flashes both indicators together, so
                 // scrolling down drew a horizontal bar whose thumb filled the
                 // whole track — an indicator for an axis with nothing to scroll.
@@ -356,13 +373,21 @@ struct DataGridView: View {
                     handleEndKey()
                     return .handled
                 }
+                .onKeyPress(.pageUp) {
+                    handlePageKey(.up)
+                    return .handled
+                }
+                .onKeyPress(.pageDown) {
+                    handlePageKey(.down)
+                    return .handled
+                }
                 .onChange(of: table.rowsGeneration) { _, _ in landAfterCommit() }
                 .onAppear { isGridFocused = true }
             }
         }
     }
 
-    // MARK: - Home / End
+    // MARK: - Home / End / Page Up / Page Down
 
     /// `reachedStart` means row 0 is already loaded — nothing to fetch, only
     /// somewhere to scroll to. Otherwise the window is anchored elsewhere (an
@@ -390,6 +415,50 @@ struct DataGridView: View {
             pendingScrollIntent = .bottom
             table.jumpToEnd()
         }
+    }
+
+    /// Move the rows by a screenful, which is all Page Up and Page Down ask
+    /// for: unlike Home and End they name a distance rather than a place, so
+    /// they never move the window — whatever is loaded is what they scroll
+    /// through, and the rows beyond it are paged in by the same two observers
+    /// that answer a scroll made by hand.
+    ///
+    /// Not animated, and that is the point rather than an omission. A Home or
+    /// End landing can afford a quarter-second ease because there is nowhere
+    /// further to go once it arrives; a page cannot, because the next press
+    /// starts from where this one ended and reads that from the scroll geometry.
+    /// Mid-animation the geometry reports a partway offset, so a held key would
+    /// page by whatever fraction of a screen had been travelled when it
+    /// repeated — a scroll that goes slower the faster it is asked for.
+    private func handlePageKey(_ direction: GridScroll.PageDirection) {
+        let landing = GridScroll.page(
+            direction,
+            from: scrollY.distanceFromTop,
+            viewportHeight: scrollY.viewportHeight,
+            rowHeight: Self.rowHeight,
+            keepingX: scrollX
+        )
+        GridTrace.log("""
+            PAGE \(direction == .up ? "UP" : "DOWN"): \
+            \(scrollY.distanceFromTop.rounded()) -> \(landing.y.rounded()) \
+            viewport \(scrollY.viewportHeight.rounded()) \
+            windowStart \(table.windowStart) rows \(table.rows.count)
+            """, dedupe: false)
+
+        // Pressed at the top of a window that does not begin at row 0, there is
+        // nothing above the viewport to move into, so the press has to ask for
+        // the rows rather than scroll to them. Scrolling up asks for them
+        // already, but only from an offset that *decreases* — see the geometry
+        // observer — and an offset of zero has no smaller value to report.
+        // Ordinary paging up reaches the prefetch distance long before it
+        // reaches the top, so this is the case where a page landed the viewport
+        // flat against it before the earlier rows arrived.
+        // `loadEarlier()` decides for itself whether there is anything earlier.
+        if direction == .up, landing.y >= scrollY.distanceFromTop {
+            table.loadEarlier()
+            return
+        }
+        scrollPosition.scrollTo(point: CGPoint(x: landing.x, y: landing.y))
     }
 
     /// Put the grid where the last commit asked it to be.
