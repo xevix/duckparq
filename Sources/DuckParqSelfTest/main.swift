@@ -1809,6 +1809,48 @@ do {
                 Address.forward(offset: 900), "a page overrunning the end is counted forward")
 }
 
+// MARK: - Row summary
+
+section("Row summary")
+
+do {
+    // The opening window is unchanged: it starts at row 0, so the loaded count
+    // already says everything -- "500 of 3,000" means the first 500.
+    expectEqual(RowSummary.text(loaded: 500, windowStart: 0, total: 3000),
+                "500 of 3,000 rows", "a window at the top reports what it has loaded")
+
+    // A window anchored at the end must not report the same thing. Saying
+    // "500 of 3,000" there tells the reader they are at the front of the file
+    // when they are looking at the back of it -- the count of loaded rows says
+    // nothing about which rows those are.
+    expectEqual(RowSummary.text(loaded: 500, windowStart: 2500, total: 3000),
+                "2,501–3,000 of 3,000 rows", "the last page reports where it sits, counted from the total")
+
+    // Scrolling up from there widens the window backward, and the range grows
+    // from its near end rather than the loaded count simply going up.
+    expectEqual(RowSummary.text(loaded: 1000, windowStart: 2000, total: 3000),
+                "2,001–3,000 of 3,000 rows", "a backward step extends the range, not just the count")
+
+    // Walking all the way back to row 0 lands on the whole result again.
+    expectEqual(RowSummary.text(loaded: 3000, windowStart: 0, total: 3000),
+                "3,000 rows", "a window holding everything just says how much that is")
+
+    // A short tail: 700 rows anchor their last page at 200, so the range runs
+    // 201 to 700 and not 201 to 700-of-something-else.
+    expectEqual(RowSummary.text(loaded: 500, windowStart: 200, total: 700),
+                "201–700 of 700 rows", "a result that is not a whole number of pages still adds up")
+
+    // Before the count lands there is no total to measure against.
+    expectEqual(RowSummary.text(loaded: 500, windowStart: 0, total: nil),
+                "500 rows loaded", "with no count there is only what is loaded")
+    expectEqual(RowSummary.text(loaded: 500, windowStart: 2500, total: nil),
+                "500 rows loaded", "including when the window has been moved")
+
+    // An empty result spans nothing, so there is no range to report.
+    expectEqual(RowSummary.text(loaded: 0, windowStart: 0, total: 0),
+                "0 rows", "an empty result reports itself as empty")
+}
+
 // MARK: - Hive page index
 
 // The order a hive dataset is paged in, and the arithmetic that turns a row
@@ -2234,6 +2276,24 @@ do {
     expect(!model.reachedStart, "the tail window does not also reach row 0")
     expectEqual(model.rows.map(\.id), Array(500..<1000), "row ids reflect each row's true offset in the file")
     expectEqual(model.rows.last?.cells[idIndex], "999", "the last row loaded is the file's actual last row")
+
+    // What the status bar says about that window, taken from the model rather
+    // than from hand-picked numbers -- the summary is only right if
+    // `windowStart` means what it is read as meaning here.
+    expectEqual(RowSummary.text(loaded: model.rows.count,
+                                windowStart: model.windowStart,
+                                total: model.totalRowCount),
+                "501–1,000 of 1,000 rows",
+                "landing on the end says which rows those are, not that 500 are loaded")
+
+    model.loadEarlier()
+    await settle(model)
+    expectEqual(RowSummary.text(loaded: model.rows.count,
+                                windowStart: model.windowStart,
+                                total: model.totalRowCount),
+                "1,000 rows", "and stepping back to row 0 has the whole file loaded")
+    model.jumpToEnd()
+    await settle(model)
 
     // Landing on the end must be one query and stay one query. Rendering the
     // window cannot pull in another page: every row of it is handed to

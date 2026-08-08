@@ -1118,17 +1118,15 @@ private struct StatusBar: View {
     }
 
     /// Always reports the total, not just what has been fetched — the grid only
-    /// ever holds a preview, so "500 rows" alone would misrepresent the file.
+    /// ever holds a preview, so "500 rows" alone would misrepresent the file —
+    /// and where in the result the loaded rows sit, since the window does not
+    /// always start at the top. See `RowSummary`.
     private func rowSummary(_ table: TableModel) -> String {
-        let loaded = table.rows.count.formatted()
-        guard let total = table.totalRowCount else {
-            // The count is still running, or the statement has no row count.
-            return "\(loaded) rows loaded"
-        }
-        if table.rows.count >= total {
-            return "\(total.formatted()) rows"
-        }
-        return "\(loaded) of \(total.formatted()) rows"
+        RowSummary.text(
+            loaded: table.rows.count,
+            windowStart: table.windowStart,
+            total: table.totalRowCount
+        )
     }
 
     private func sortSummary(_ table: TableModel) -> String {
