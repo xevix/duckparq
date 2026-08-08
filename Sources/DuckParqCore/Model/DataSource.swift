@@ -26,14 +26,21 @@ public enum DataSource: Sendable, Hashable {
     }
 
     /// `read_parquet(...)` with the path as parameter `$index`.
-    public func readExpression(parameterIndex: Int) -> String {
+    ///
+    /// `filename` adds the virtual column naming the file each row came from,
+    /// which is what lets a dataset be counted per file in a single pass. It is
+    /// off by default because it would otherwise show up as a column of the
+    /// grid.
+    public func readExpression(parameterIndex: Int, filename: Bool = false) -> String {
+        let filenameOption = filename ? ", filename = true" : ""
         switch self {
         case .file:
-            return "read_parquet($\(parameterIndex))"
+            return "read_parquet($\(parameterIndex)\(filenameOption))"
         case .dataset:
             // hive_partitioning surfaces key=value directory names as columns;
             // union_by_name tolerates files whose column order differs.
-            return "read_parquet($\(parameterIndex), hive_partitioning = true, union_by_name = true)"
+            return "read_parquet($\(parameterIndex), hive_partitioning = true, "
+                + "union_by_name = true\(filenameOption))"
         }
     }
 }

@@ -1809,6 +1809,113 @@ do {
                 Address.forward(offset: 900), "a page overrunning the end is counted forward")
 }
 
+// MARK: - Hive page index
+
+// The order a hive dataset is paged in, and the arithmetic that turns a row
+// offset into a file to read. Both are pure, so they are checked here without a
+// database; the end-to-end behaviour is in "Paging integrity".
+
+section("Hive page index")
+
+do {
+    typealias File = HivePageIndex.File
+    func file(_ path: String, _ rows: Int, _ values: [String?]) -> File {
+        File(path: path, totalRows: rows, partitionValues: values)
+    }
+
+    // Sorting the paths as plain text is the trap this ordering exists to
+    // avoid. DuckDB types a hive key -- `month` comes back BIGINT -- so
+    // `ORDER BY month` counts 1, 2, … 10, 11, 12 while the paths sort
+    // `month=1`, `month=10`, `month=11`, `month=12`, `month=2`. Paging in path
+    // order would put the rows in an order the sort in the header contradicts,
+    // and would disagree with what exporting the same view produces.
+    let months = (1...12).map { file("/d/month=\($0)/f.parquet", 10, ["\($0)"]) }
+    let orderedMonths = HivePageIndex.order(months.shuffled(), keyCount: 1)
+    expectEqual(orderedMonths.map { $0.partitionValues[0] }, (1...12).map { "\($0)" },
+                "a numeric partition key orders as numbers, not as text")
+
+    // Where the values are not all numbers, text order is the right answer --
+    // that is what DuckDB infers the column as.
+    let regions = ["us", "eu", "apac"].map { (value: String) in
+        file("/d/region=\(value)/f.parquet", 10, [value])
+    }
+    expectEqual(HivePageIndex.order(regions, keyCount: 1).map { $0.partitionValues[0] },
+                ["apac", "eu", "us"], "a text partition key orders lexicographically")
+
+    // Mixed values are text too: one non-numeric value is what makes DuckDB
+    // read the whole column as VARCHAR.
+    let mixed = ["10", "9", "later"].map { (value: String) in
+        file("/d/k=\(value)/f.parquet", 10, [value])
+    }
+    expectEqual(HivePageIndex.order(mixed, keyCount: 1).map { $0.partitionValues[0] },
+                ["10", "9", "later"], "a key with any non-numeric value orders as text")
+
+    // Nesting: the outer key decides first, the inner one breaks it, and the
+    // path breaks that.
+    let nested = [
+        file("/d/year=2024/region=us/f.parquet", 1, ["2024", "us"]),
+        file("/d/year=2023/region=us/b.parquet", 1, ["2023", "us"]),
+        file("/d/year=2023/region=eu/f.parquet", 1, ["2023", "eu"]),
+        file("/d/year=2023/region=us/a.parquet", 1, ["2023", "us"]),
+    ]
+    expectEqual(HivePageIndex.order(nested, keyCount: 2).map(\.path), [
+        "/d/year=2023/region=eu/f.parquet",
+        "/d/year=2023/region=us/a.parquet",
+        "/d/year=2023/region=us/b.parquet",
+        "/d/year=2024/region=us/f.parquet",
+    ], "partitions order outermost key first, then by file name")
+
+    // A NULL partition is written `__HIVE_DEFAULT_PARTITION__` on disk, and
+    // DuckDB sorts NULL last ascending. Ordering it as the literal string would
+    // drop it in among the `_`-prefixed values instead.
+    let withNull = [
+        file("/d/g=__HIVE_DEFAULT_PARTITION__/f.parquet", 1, [nil]),
+        file("/d/g=3/f.parquet", 1, ["3"]),
+        file("/d/g=1/f.parquet", 1, ["1"]),
+    ]
+    expectEqual(HivePageIndex.order(withNull, keyCount: 1).map { $0.partitionValues[0] },
+                ["1", "3", nil], "a NULL partition sorts last, matching DuckDB's NULLS LAST")
+
+    // Parsing a path back into its partition values, which is where the
+    // sentinel becomes a real nil.
+    let root = URL(fileURLWithPath: "/data/events")
+    let parsed = HivePageIndex.partitionComponents(
+        of: "/data/events/year=2024/region=__HIVE_DEFAULT_PARTITION__/part-0.parquet", under: root)
+    expectEqual(parsed.keys, ["year", "region"], "the keys come off the path outermost first")
+    expectEqual(parsed.values, ["2024", nil], "and the default-partition sentinel reads as NULL")
+
+    // A value may itself contain '=' -- only the first one separates.
+    let equals = HivePageIndex.partitionComponents(
+        of: "/data/events/expr=a=b/part-0.parquet", under: root)
+    expectEqual(equals.values, ["a=b"], "only the first = separates key from value")
+
+    // Turning a row range into file reads. Three files of 500 rows: a page
+    // wholly inside one file, a page spanning a boundary, and the tail.
+    let counts = [500, 500, 500]
+    expectEqual(HivePageIndex.spans(start: 0, count: 500, rowCounts: counts),
+                [HivePageIndex.Span(file: 0, offset: 0, count: 500)],
+                "a page that fills one file is one read")
+    expectEqual(HivePageIndex.spans(start: 400, count: 300, rowCounts: counts),
+                [HivePageIndex.Span(file: 0, offset: 400, count: 100),
+                 HivePageIndex.Span(file: 1, offset: 0, count: 200)],
+                "a page across a file boundary is two reads, in order")
+    expectEqual(HivePageIndex.spans(start: 1000, count: 500, rowCounts: counts),
+                [HivePageIndex.Span(file: 2, offset: 0, count: 500)],
+                "the tail page reads only the last file")
+    expectEqual(HivePageIndex.spans(start: 1400, count: 500, rowCounts: counts),
+                [HivePageIndex.Span(file: 2, offset: 400, count: 100)],
+                "a page overrunning the end stops at the end")
+    expectEqual(HivePageIndex.spans(start: 1500, count: 500, rowCounts: counts), [],
+                "a page starting past the end reads nothing")
+
+    // A file every row of which a filter excluded contributes nothing, and must
+    // not shift the rows after it.
+    expectEqual(HivePageIndex.spans(start: 0, count: 30, rowCounts: [10, 0, 40]),
+                [HivePageIndex.Span(file: 0, offset: 0, count: 10),
+                 HivePageIndex.Span(file: 2, offset: 0, count: 20)],
+                "an empty file is skipped rather than counted")
+}
+
 // MARK: - Grid scrolling
 
 section("Grid scrolling")
@@ -2292,6 +2399,284 @@ do {
     await settle(model)
     expect(model.sort.isEmpty, "a plain folder of parquet files opens unsorted")
     expect(model.defaultSort.isEmpty, "and has no opening sort to speak of")
+
+    model.clear()
+}
+
+// MARK: - Paging integrity (no row shown twice, none skipped)
+
+// Scrolling through a result must show every row exactly once. The row ids the
+// grid carries cannot tell you whether it does: they are ordinals — `windowStart
+// + index` — so a row served twice under two different offsets arrives as two
+// different ids, and a walk that repeats half its rows still hands back
+// `0..<3000` in perfect order. These checks therefore compare the *data* of a
+// stable key column across the whole walk, which is the only thing that can tell
+// a repeat from a legitimately different row.
+//
+// The seams that can go wrong are the ones where two adjacent pages come from
+// two separate query executions: `loadEarlier()`'s OFFSET reads, and the
+// crossover in `fetchPage` where one page is counted forward and its neighbour
+// counted backward with the sort inverted. Under a sort with ties neither
+// execution is answering a question that identifies a specific set of rows.
+
+section("Paging integrity")
+
+/// Every value of `keyColumn`, in view order, from a walk out of the last page
+/// back to row 0 — what holding the scroll wheel up from the End key does.
+///
+/// Collected a page at a time as the walk goes, using `prependedRowCount` to
+/// take exactly what each backward step spliced onto the front. Reading the
+/// final `model.rows` instead would be no cheaper and would lose the seams.
+@MainActor
+func walkBackward(_ model: TableModel, keyColumn: String) async -> [String] {
+    guard let index = model.columns.firstIndex(where: { $0.name == keyColumn }) else { return [] }
+    func keys(_ rows: ArraySlice<TableModel.GridRow>) -> [String] {
+        rows.map { $0.cells[index] ?? "<null>" }
+    }
+
+    model.jumpToEnd()
+    await settle(model)
+    var seen = keys(model.rows[...])
+
+    // Bounded so a step that fails to move cannot spin: every step must take
+    // the window strictly closer to row 0.
+    while !model.reachedStart {
+        let before = model.windowStart
+        model.loadEarlier()
+        await settle(model)
+        guard model.windowStart < before, model.prependedRowCount > 0 else { break }
+        seen = keys(model.rows.prefix(model.prependedRowCount)) + seen
+    }
+    return seen
+}
+
+/// How a walk differs from the rows the result actually holds.
+func pagingDefects(walked: [String], expected: Set<String>) -> (repeats: Int, skipped: Int) {
+    var counts: [String: Int] = [:]
+    for key in walked { counts[key, default: 0] += 1 }
+    let repeats = counts.values.reduce(0) { $0 + ($1 - 1) }
+    let skipped = expected.subtracting(counts.keys).count
+    return (repeats, skipped)
+}
+
+do {
+    let model = TableModel(
+        gridSession: try DuckDBSession(engine: engine, label: "paging-grid"),
+        metaSession: try DuckDBSession(engine: engine, label: "paging-meta"),
+        countSession: try DuckDBSession(engine: engine, label: "paging-count"),
+        filterSession: try DuckDBSession(engine: engine, label: "paging-filter"),
+        cache: PreviewCache()
+    )
+
+    // 1. A hive dataset in the sort it opens in. `defaultSort(for:)` orders it
+    // by its top-level partition key alone, and a partition key is by nature
+    // very low cardinality — 3000 rows over two `year` values here — so very
+    // nearly every row ties with every other under that ORDER BY. `OFFSET n`
+    // does not name a particular set of rows when the ties are that broad.
+    model.open(.dataset(hiveDirectory))
+    await settle(model)
+    expectEqual(model.sort.map(\.column), ["year"], "the hive dataset opens on its partition key")
+    expectEqual(model.totalRowCount, 3000, "over all 3000 rows")
+    expect(model.pagesByFile, "so it pages by walking its files rather than by ORDER BY")
+
+    let hiveWalk = await walkBackward(model, keyColumn: "id")
+    let hiveExpected = Set((0..<3000).map(String.init))
+    let hiveDefects = pagingDefects(walked: hiveWalk, expected: hiveExpected)
+    expectEqual(hiveWalk.count, 3000, "the walk back visits as many rows as the dataset holds")
+    expectEqual(hiveDefects.repeats, 0,
+                "scrolling up through a hive dataset shows no row twice")
+    expectEqual(hiveDefects.skipped, 0,
+                "and skips none of them")
+
+    // The file order is a refinement of the sort in the header, not a
+    // departure from it: every row still sits inside its own partition's run,
+    // so the walk is still ordered by `year` -- it just also settles which of
+    // the rows tied on `year` come first, which is what the ORDER BY left open.
+    let yearIndex = model.columns.firstIndex { $0.name == "year" }!
+    let walkedYears = model.rows.map { $0.cells[yearIndex] ?? "" }
+    expectEqual(walkedYears.count, 3000, "the whole dataset is loaded after the walk")
+    expect(walkedYears == walkedYears.sorted(), "and is still ordered by the partition key")
+
+    // Filters. Footer row counts say how many rows a file holds, not how many
+    // a filter admits, so the index has to count per file before it can address
+    // a row by offset -- and must still land on exactly the matching rows.
+    //
+    // `value < 137` is chosen so the counts come out uneven (138, 138, 138,
+    // 136, 136, 136) and no page boundary lands on a file boundary. Unfiltered,
+    // every fixture file holds exactly one page, so every read starts at row 0
+    // of some file and the mid-file offset -- the part of the addressing with
+    // any arithmetic in it -- never runs. Here the tail window starts 46 rows
+    // into the third file.
+    let verifier = try DuckDBSession(engine: engine, label: "paging-verify")
+    let matching = try await verifier.queryAll(
+        "SELECT id FROM read_parquet($1, hive_partitioning = true, union_by_name = true) "
+        + "WHERE value < 137",
+        params: [DataSource.dataset(hiveDirectory).readPath], limit: 5000)
+    let matchingIDs = Set(matching.column("id").compactMap { $0 })
+    expect(matchingIDs.count > TableModel.pageSize,
+           "the filter leaves more than one page, so the walk has seams to get wrong")
+    expect(matchingIDs.count % TableModel.pageSize != 0,
+           "and does not divide evenly into pages, so a page must start mid-file")
+
+    model.upsert(filter: Filter(
+        column: model.column(named: "value")!, mode: .comparison(.lessThan, ["137"])))
+    await settle(model)
+    expectEqual(model.totalRowCount, matchingIDs.count, "the filter reaches DuckDB")
+    expect(model.pagesByFile, "a filtered hive dataset still pages by file")
+
+    let filteredWalk = await walkBackward(model, keyColumn: "id")
+    let filteredDefects = pagingDefects(walked: filteredWalk, expected: matchingIDs)
+    expectEqual(filteredWalk.count, matchingIDs.count,
+                "the filtered walk visits as many rows as match")
+    expectEqual(filteredDefects.repeats, 0, "a filtered hive walk shows no row twice")
+    expectEqual(filteredDefects.skipped, 0, "and skips none of the matching rows")
+    expectEqual(Set(filteredWalk), matchingIDs, "and visits exactly the rows the filter admits")
+
+    model.clearFilters()
+    await settle(model)
+
+    // A user sort takes the file order away, because it says nothing about a
+    // column that is not the partition key. The dataset goes back to being
+    // paged by ORDER BY -- which is the path the remaining known defect lives
+    // on, and why this one only asserts which path is taken.
+    model.toggleSort(column: "value")
+    await settle(model)
+    expect(!model.pagesByFile, "sorting by a data column leaves the file order behind")
+    model.open(.dataset(hiveDirectory))
+    await settle(model)
+    expect(model.pagesByFile, "and reopening the dataset returns to it")
+
+    // Neither a single file nor a plain folder of parquet files has a
+    // partition order to walk.
+    model.open(.file(smallParquet))
+    await settle(model)
+    expect(!model.pagesByFile, "a single file has no partitions to page by")
+    model.open(.dataset(fixtures))
+    await settle(model)
+    expect(!model.pagesByFile, "nor does a plain folder of parquet files")
+
+    // 2. KNOWN FAILURE, deliberately left red. The same tie problem without
+    // hive partitioning: a single file sorted by a low-cardinality column.
+    // `flagged` is a boolean, so the result is two tie groups, and the seam
+    // between the page counted forward and the page counted backward falls
+    // inside one of them — 166 rows shown twice, 166 never shown, on every run.
+    //
+    // The hive path above no longer reaches this because it does not sort at
+    // all. An ordinary file has no partition layout to page by, so the only
+    // fix is a total order: appending a tiebreaker to the ORDER BY. Measured at
+    // roughly 1.8x on a Top-N over 10M rows and confirmed by EXPLAIN to stay a
+    // Top-N, so it is affordable — what it still needs is an answer for the
+    // datasets with no unique column to tiebreak on. Until then this stands as
+    // the record of a real defect rather than being quietly deleted.
+    model.open(.file(smallParquet))
+    await settle(model)
+    model.toggleSort(column: "flagged")
+    await settle(model)
+    expectEqual(model.sortDirection(for: "flagged"), .ascending, "sorted by a two-valued column")
+
+    let flaggedWalk = await walkBackward(model, keyColumn: "id")
+    let smallExpected = Set((0..<1000).map(String.init))
+    let flaggedDefects = pagingDefects(walked: flaggedWalk, expected: smallExpected)
+    expectEqual(flaggedWalk.count, 1000, "the walk visits as many rows as the file holds")
+    expectEqual(flaggedDefects.repeats, 0,
+                "scrolling up a file sorted by a boolean shows no row twice")
+    expectEqual(flaggedDefects.skipped, 0, "and skips none of them")
+
+    // A four-valued column, where the forward/backward crossover lands on a
+    // group boundary rather than inside one.
+    model.open(.file(smallParquet))
+    await settle(model)
+    model.toggleSort(column: "category")
+    await settle(model)
+    let categoryWalk = await walkBackward(model, keyColumn: "id")
+    let categoryDefects = pagingDefects(walked: categoryWalk, expected: smallExpected)
+    expectEqual(categoryDefects.repeats, 0, "nor does a four-valued sort repeat a row")
+    expectEqual(categoryDefects.skipped, 0, "nor skip one")
+
+    // 3. An unsorted result, where `pageAddress` always counts forward because
+    // there is no order to run backward. Two `LIMIT`/`OFFSET` reads of a
+    // parquet scan are still two executions, and DuckDB may scan in parallel —
+    // so this asks whether a scan's row order is stable enough across separate
+    // queries for the offsets to line up.
+    model.open(.file(smallParquet))
+    await settle(model)
+    expect(model.sort.isEmpty, "a plain file opens unsorted")
+    let unsortedWalk = await walkBackward(model, keyColumn: "id")
+    let unsortedDefects = pagingDefects(walked: unsortedWalk, expected: smallExpected)
+    expectEqual(unsortedDefects.repeats, 0, "an unsorted walk shows no row twice")
+    expectEqual(unsortedDefects.skipped, 0, "and skips none")
+    expectEqual(unsortedWalk, (0..<1000).map(String.init),
+                "an unsorted scan pages in the file's own row order")
+
+    // A multi-file dataset unsorted, where the scan has several files to read
+    // and more room to reorder them between one query and the next.
+    model.open(.dataset(hiveDirectory))
+    await settle(model)
+    model.clearSort()
+    await settle(model)
+    expect(model.sort.isEmpty, "the dataset's opening sort can be cleared")
+    let datasetWalk = await walkBackward(model, keyColumn: "id")
+    let datasetDefects = pagingDefects(walked: datasetWalk, expected: hiveExpected)
+    expectEqual(datasetDefects.repeats, 0, "an unsorted walk over many files shows no row twice")
+    expectEqual(datasetDefects.skipped, 0, "and skips none")
+
+    // 4. Forward widening under a tied sort. `performInitialLoad` re-runs the
+    // whole query as one `LIMIT windowSize` from row 0 rather than appending,
+    // and its comment claims that is what keeps a widened window free of the
+    // duplicates OFFSET paging produces. Within a single window that holds —
+    // one query cannot return a row twice. The question this asks is the other
+    // half of it: whether the rows the reader has *already* seen are still
+    // there after the window grows, or whether widening quietly swaps them for
+    // different members of the same tie group.
+    model.open(.dataset(hiveDirectory))
+    await settle(model)
+    expectEqual(model.sort.map(\.column), ["year"], "back to the tied opening sort")
+    let idColumn = model.columns.firstIndex { $0.name == "id" }!
+    let beforeWidening = Set(model.rows.compactMap { $0.cells[idColumn] })
+    expectEqual(beforeWidening.count, TableModel.pageSize, "a full opening window to widen from")
+
+    model.loadMore()
+    await settle(model)
+    expectEqual(model.windowSize, TableModel.pageSize * 2, "the window doubled")
+    let afterWidening = Set(model.rows.compactMap { $0.cells[idColumn] })
+    let vanished = beforeWidening.subtracting(afterWidening)
+    expectEqual(vanished.count, 0,
+                "widening the window keeps the rows already read rather than "
+                + "replacing them with other rows of the same tie group")
+
+    // 5. The remaining seam is the one where the two directions would meet:
+    // a window that has been walked backward, then widened forward. It is not
+    // reachable, and that is worth pinning down rather than inferring — the
+    // only thing that moves `windowStart` off zero is `jumpToEnd()`, which
+    // anchors on the last row and so leaves `reachedEnd` set, and `loadMore()`
+    // declines to widen a window that already reaches the end. So a backward
+    // walk never has a forward widening spliced onto it, and the seam that
+    // would mix an OFFSET page with a re-run `LIMIT` window cannot form.
+    model.open(.file(smallParquet))
+    await settle(model)
+    model.toggleSort(column: "flagged")
+    await settle(model)
+    model.jumpToEnd()
+    await settle(model)
+    expect(model.reachedEnd, "a tail window is by construction at the end")
+    model.loadEarlier()
+    await settle(model)
+    expectEqual(model.windowStart, 0, "one step back from the tail of 1000 rows reaches row 0")
+    expect(model.reachedEnd, "and the tail is still the end")
+
+    let generationBeforeWidening = model.rowsGeneration
+    let rowsBeforeWidening = model.rows.count
+    model.loadMore()
+    await settle(model)
+    expectEqual(model.rowsGeneration, generationBeforeWidening,
+                "widening forward is declined on a window that already reaches the end")
+    expectEqual(model.rows.count, rowsBeforeWidening, "so the walked-back rows are left alone")
+
+    // `continuePastCap()` picks its direction from `windowStart`, and the two
+    // cases do not overlap: `loadEarlier()` refuses at row 0, so it is never
+    // the call that raised the cap there.
+    expectEqual(model.windowStart, 0, "at row 0 after the walk back")
+    expect(!model.hitRowCap, "a thousand rows is nowhere near the cap")
 
     model.clear()
 }

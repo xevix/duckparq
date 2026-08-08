@@ -121,6 +121,9 @@ public final class TableModel {
     public var reachedStart: Bool { windowStart == 0 }
 
     private let gridSession: DuckDBSession
+    /// Kept alongside `probe`, which wraps it, so the hive page index can read
+    /// footers without queueing behind the grid's own reads.
+    private let metaSession: DuckDBSession
     /// Schema and cardinality lookups.
     private let probe: Probe
     /// Row counting, deliberately on its own session.
@@ -135,6 +138,12 @@ public final class TableModel {
     private let cache: PreviewCache
 
     private var cursor: QueryCursor?
+    /// The current hive dataset's files in paging order, once read. Nil for
+    /// anything that is not a hive dataset — see `pagesByFile`.
+    private var hiveIndex: HivePageIndex?
+    /// The source `hiveIndex` describes, so a different dataset does not get
+    /// paged through the last one's file list.
+    private var hiveIndexSource: DataSource?
     /// Bumped on every reload; results from an older generation are discarded.
     private var generation = 0
     private var loadTask: Task<Void, Never>?
@@ -162,6 +171,7 @@ public final class TableModel {
         cache: PreviewCache = .shared
     ) {
         self.gridSession = gridSession
+        self.metaSession = metaSession
         self.probe = Probe(session: metaSession)
         self.counter = Probe(session: countSession)
         self.filterProbe = Probe(session: filterSession)
@@ -607,6 +617,9 @@ public final class TableModel {
         // far the last one had been widened.
         windowSize = Self.pageSize
         rowCap = Self.loadedRowCap
+        // The file list survives a reload — the files did not move — but how
+        // many rows of each one a filter admits does not.
+        hiveIndex?.invalidateCounts()
         runQuery(keepingRows: keepingRows, widening: false)
     }
 
@@ -659,6 +672,47 @@ public final class TableModel {
     /// appended to, when the next page arrives.
     private var rowsAreStale = false
 
+    // MARK: - Paging a hive dataset by file
+
+    /// Whether the grid is paging by walking the dataset's files in order
+    /// rather than by `ORDER BY` and `OFFSET`.
+    ///
+    /// True for a hive dataset still in the partition order it opened in.
+    /// `ORDER BY <partition key>` does not name a particular row — a partition
+    /// key is the thing the dataset is divided by, so under it nearly every row
+    /// ties with nearly every other, and two pages read at two offsets are two
+    /// executions free to break those ties differently. Walking the files
+    /// instead gives an order that is fixed by the paths and the scan, so
+    /// adjacent pages cannot disagree. See `HivePageIndex`.
+    ///
+    /// A user sort takes it back to `ORDER BY`: the file order says nothing
+    /// about a column that is not the partition key.
+    public var pagesByFile: Bool {
+        hiveIndex != nil && !defaultSort.isEmpty && sort == defaultSort
+    }
+
+    /// Read the current dataset's file list, unless it is already in hand.
+    ///
+    /// Footers only — no column data is touched, which is what makes it cheap
+    /// enough to do before the first page rather than alongside it. On its own
+    /// session, so it does not queue behind the grid's own reads.
+    private func ensureHiveIndex() async {
+        guard case .source(let source) = mode, case .dataset(let url) = source else {
+            hiveIndex = nil
+            hiveIndexSource = nil
+            return
+        }
+        if hiveIndexSource == source { return }
+        guard FileTree.topLevelHiveKey(of: url) != nil else {
+            // A plain folder of parquet files has no partition order to walk.
+            hiveIndex = nil
+            hiveIndexSource = source
+            return
+        }
+        hiveIndex = try? await HivePageIndex.build(source: source, session: metaSession)
+        hiveIndexSource = source
+    }
+
     private func performInitialLoad(query: BoundSQL, generation: Int, widening: Bool) async {
         if !widening {
             // A cache hit has to be settled before anything is issued, or the
@@ -681,45 +735,71 @@ public final class TableModel {
             startRowCount(generation: generation)
         }
 
+        await ensureHiveIndex()
+        guard generation == self.generation else { return }
+
         let target = windowSize
         do {
-            let cursor = try await gridSession.openCursor(
-                query.sql, params: query.params, renderAsText: rendersAsText
-            )
-            guard generation == self.generation else {
-                await cursor.close()
-                return
-            }
-            self.cursor = cursor
-
-            // Until DESCRIBE lands — and always in SQL mode, where there is no
-            // DESCRIBE to lean on — column identity comes from the result
-            // itself. Types are unknown at that point, hence VARCHAR.
-            if columns.isEmpty {
-                columns = cursor.columnNames.map { ColumnInfo(name: $0, typeName: "VARCHAR") }
-            }
-
-            // Collected in full and committed in one step. The window is a
-            // single coherent result, so the grid never shows part of the new
-            // one stitched onto part of the old — which is also what keeps a
-            // widened window free of the duplicates that `LIMIT`/`OFFSET`
-            // paging produces when a sort has ties.
-            var collected: [[String?]] = []
-            collected.reserveCapacity(target)
-            while collected.count < target {
-                let page = try await cursor.fetch(maxRows: min(Self.pageSize, target - collected.count))
+            // A hive dataset in its opening order is paged by walking its
+            // files, which needs no cursor and no ORDER BY: the file list is
+            // the order. Every other result still streams from a cursor.
+            if pagesByFile, let index = hiveIndex {
+                let page = try await index.read(
+                    start: 0, count: target, filters: filters, columnCount: columns.count
+                )
                 guard generation == self.generation else { return }
-                guard let page, page.rowCount > 0 else { break }
-                let width = max(page.columnCount, 1)
-                for row in 0..<page.rowCount {
-                    let start = row * width
-                    collected.append(Array(page.cells[start..<min(start + width, page.cells.count)]))
+                if columns.isEmpty {
+                    columns = page.columns.map { ColumnInfo(name: $0, typeName: "VARCHAR") }
                 }
+                commit(page.rows, requested: target)
+            } else {
+                let cursor = try await gridSession.openCursor(
+                    query.sql, params: query.params, renderAsText: rendersAsText
+                )
+                guard generation == self.generation else {
+                    await cursor.close()
+                    return
+                }
+                self.cursor = cursor
+
+                // Until DESCRIBE lands — and always in SQL mode, where there is no
+                // DESCRIBE to lean on — column identity comes from the result
+                // itself. Types are unknown at that point, hence VARCHAR.
+                if columns.isEmpty {
+                    columns = cursor.columnNames.map { ColumnInfo(name: $0, typeName: "VARCHAR") }
+                }
+
+                // Collected in full and committed in one step. The window is a
+                // single coherent result, so the grid never shows part of the new
+                // one stitched onto part of the old, and no row can appear twice
+                // in what is on screen.
+                //
+                // That is as far as it goes, and less far than it used to claim.
+                // One query cannot repeat a row, but two do not have to agree:
+                // where the sort has ties, widening from 500 to 1000 rows can
+                // come back with a different 500 in front, so rows the reader
+                // has already passed are silently swapped out. Measured on the
+                // hive fixture at all 500 rows replaced, in two runs out of five.
+                // A hive dataset in its opening order no longer comes through
+                // here; anything else still needs a tiebreaker in the ORDER BY
+                // to be free of it.
+                var collected: [[String?]] = []
+                collected.reserveCapacity(target)
+                while collected.count < target {
+                    let page = try await cursor.fetch(maxRows: min(Self.pageSize, target - collected.count))
+                    guard generation == self.generation else { return }
+                    guard let page, page.rowCount > 0 else { break }
+                    let width = max(page.columnCount, 1)
+                    for row in 0..<page.rowCount {
+                        let start = row * width
+                        collected.append(Array(page.cells[start..<min(start + width, page.cells.count)]))
+                    }
+                }
+                guard generation == self.generation else { return }
+                commit(collected, requested: target)
+                await cursor.close()
+                self.cursor = nil
             }
-            guard generation == self.generation else { return }
-            commit(collected, requested: target)
-            await cursor.close()
-            self.cursor = nil
         } catch {
             guard generation == self.generation else { return }
             report(error)
@@ -974,6 +1054,19 @@ public final class TableModel {
     /// forward would: both hold rows equal under the sort, but which of a tied
     /// group falls in a given page is not something `ORDER BY x` settles.
     private func fetchPage(start: Int, count: Int, total: Int?) async throws -> [[String?]] {
+        await ensureHiveIndex()
+
+        // A hive dataset in its opening order does not need either way round:
+        // the file list already says which rows sit at `[start, start + count)`,
+        // and says it the same way every time it is asked. Neither the ties nor
+        // the crossover between counting forward and counting backward — the
+        // two things the rest of this method has to trade off — arise at all.
+        if pagesByFile, let index = hiveIndex {
+            return try await index.read(
+                start: start, count: count, filters: filters, columnCount: columns.count
+            ).rows
+        }
+
         let inverted = sort.map { SortKey(column: $0.column, direction: $0.direction.inverted) }
         let address = Self.pageAddress(
             start: start, count: count, total: total, invertible: !sort.isEmpty

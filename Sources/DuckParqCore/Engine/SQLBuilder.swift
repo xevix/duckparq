@@ -78,6 +78,63 @@ public enum SQLBuilder {
         return BoundSQL(sql: sql, params: params)
     }
 
+    /// One file of a dataset, read with the dataset's own options so the
+    /// partition columns still arrive and the schema still lines up.
+    ///
+    /// `hive_partitioning` reads the `key=value` directories off each file's
+    /// own path, so a single-file read of a partitioned dataset carries the
+    /// same columns, in the same order, with the same types as reading the
+    /// whole thing. That is what lets a page be served from one file without
+    /// the grid noticing where it came from.
+    ///
+    /// Deliberately no ORDER BY. This is the read `HivePageIndex` uses, where
+    /// the order is the file list and the scan's own order within a file — an
+    /// ORDER BY here would reintroduce exactly the ties the index exists to
+    /// avoid.
+    public static func rows(
+        file path: String,
+        within source: DataSource,
+        filters: [Filter] = [],
+        limit: Int,
+        offset: Int
+    ) -> BoundSQL {
+        var params: [String] = [path]
+        var sql = "SELECT * FROM \(source.readExpression(parameterIndex: 1)) AS \(sourceAlias)"
+
+        let predicates = filters
+            .filter { $0.isEnabled && $0.isComplete }
+            .compactMap { predicate(for: $0, params: &params) }
+        if !predicates.isEmpty {
+            sql += " WHERE " + predicates.joined(separator: " AND ")
+        }
+
+        sql += " LIMIT \(max(limit, 1))"
+        if offset > 0 { sql += " OFFSET \(offset)" }
+        return BoundSQL(sql: sql, params: params)
+    }
+
+    /// Matching rows per file across a dataset, in one pass.
+    ///
+    /// `HivePageIndex` needs this only when a filter is active: unfiltered, the
+    /// parquet footers already say how many rows each file holds. It is one
+    /// grouped scan rather than a `count(*)` per file — the same work as the
+    /// total the status bar reports, so the answer is bought once.
+    public static func rowCountsByFile(source: DataSource, filters: [Filter] = []) -> BoundSQL {
+        var params: [String] = [source.readPath]
+        var sql = """
+            SELECT filename AS file_name, count(*) AS row_count \
+            FROM \(source.readExpression(parameterIndex: 1, filename: true)) AS \(sourceAlias)
+            """
+        let predicates = filters
+            .filter { $0.isEnabled && $0.isComplete }
+            .compactMap { predicate(for: $0, params: &params) }
+        if !predicates.isEmpty {
+            sql += " WHERE " + predicates.joined(separator: " AND ")
+        }
+        sql += " GROUP BY filename"
+        return BoundSQL(sql: sql, params: params)
+    }
+
     // MARK: - Editable text
 
     /// The grid's current query as standalone SQL, for handing to the editor.
