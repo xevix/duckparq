@@ -504,19 +504,69 @@ public final class TableModel {
 
     /// The query the grid is currently showing, for export and for the SQL
     /// editor's "edit this query" affordance.
+    ///
+    /// Carries the tiebreaker, so an export of the loaded rows is the rows that
+    /// were loaded. Without it, "export what I am looking at" would re-run an
+    /// ORDER BY with ties and write out a different member of each tied group
+    /// than the grid happens to be showing.
+    ///
+    /// The exception is a hive dataset in its opening order, which the grid
+    /// pages by walking files rather than by this query at all — there the
+    /// export is ordered by the partition key, and rows tied on it can come out
+    /// in a different order than they sit in on screen.
     public var currentQuery: BoundSQL? { query(orderedBy: sort) }
 
     /// `currentQuery` with a different ORDER BY — the same source, filters and
-    /// shape, ordered as asked. Only `jumpToEnd()` uses anything but `sort`.
-    private func query(orderedBy order: [SortKey]) -> BoundSQL? {
+    /// shape, ordered as asked. Only `fetchPage` uses anything but `sort`, and
+    /// only it passes a descending `tiebreak`, to keep the tiebreaker pointing
+    /// the same way as the inverted keys it follows.
+    ///
+    /// A result the user has not sorted gets no tiebreaker: there is no ORDER
+    /// BY to make total, and adding one would cost the whole file — the
+    /// unsorted window is the one read DuckDB can stop after 500 rows.
+    ///
+    /// **SQL mode has no tiebreaker available.** `.sql` is the user's own text
+    /// wrapped in an ORDER BY; there is no `read_parquet` call to switch
+    /// `file_row_number` on in, and it may not read parquet at all. A window
+    /// function over the result would answer, but only by materialising it —
+    /// the Top-N is gone, and its numbering is no more stable across two
+    /// executions than the ties were. So a `.sql` result sorted by a column
+    /// with broad ties can still page inconsistently. Sorting in the query
+    /// itself, on keys that identify a row, is the answer there.
+    private func query(orderedBy order: [SortKey], tiebreak: SortDirection = .ascending) -> BoundSQL? {
         switch mode {
         case .empty:
             return nil
         case .source(let source):
-            return SQLBuilder.rows(source: source, filters: filters, sort: order)
+            return SQLBuilder.rows(
+                source: source, filters: filters, sort: order,
+                tiebreak: tiebreaker(for: order, direction: tiebreak)
+            )
         case .sql(let text):
             return BoundSQL(sql: SQLBuilder.sorted(rawSQL: text, sort: order), params: [])
         }
+    }
+
+    /// The direction the row-identity tiebreaker follows for `order`, or nil
+    /// when this view does not get one.
+    private func tiebreaker(for order: [SortKey], direction: SortDirection) -> SortDirection? {
+        guard !order.isEmpty, canTiebreak else { return nil }
+        return direction
+    }
+
+    /// Whether `file_row_number` can be switched on for the loaded source.
+    ///
+    /// DuckDB refuses the option outright — a bind error, not a shadowed column
+    /// — on a file that already has a column of that name, and the option takes
+    /// a bool rather than a name, so there is nothing to rename it to. Such a
+    /// file keeps the untiebroken ORDER BY and the tie defect that comes with
+    /// it, which is a great deal better than failing to open.
+    ///
+    /// Read off the loaded schema. Empty columns answer "yes", which is only
+    /// reachable before the first DESCRIBE lands — and the sorts that get here
+    /// come from clicking a header that does not exist until it has.
+    private var canTiebreak: Bool {
+        !columns.contains { $0.name == DataSource.rowNumberColumn }
     }
 
     /// `currentQuery` bounded to the window the grid is showing.
@@ -555,7 +605,10 @@ public final class TableModel {
         case .empty:
             return nil
         case .source(let source):
-            return SQLBuilder.editableRows(source: source, filters: filters, sort: sort)
+            return SQLBuilder.editableRows(
+                source: source, filters: filters, sort: sort,
+                tiebreak: tiebreaker(for: sort, direction: .ascending)
+            )
         case .sql(let text):
             return text
         }
@@ -774,15 +827,16 @@ public final class TableModel {
                 // one stitched onto part of the old, and no row can appear twice
                 // in what is on screen.
                 //
-                // That is as far as it goes, and less far than it used to claim.
-                // One query cannot repeat a row, but two do not have to agree:
-                // where the sort has ties, widening from 500 to 1000 rows can
-                // come back with a different 500 in front, so rows the reader
-                // has already passed are silently swapped out. Measured on the
-                // hive fixture at all 500 rows replaced, in two runs out of five.
-                // A hive dataset in its opening order no longer comes through
-                // here; anything else still needs a tiebreaker in the ORDER BY
-                // to be free of it.
+                // One query cannot repeat a row, but two need not agree, and
+                // widening is two: where the sort had ties, growing from 500 to
+                // 1000 rows used to come back with a different 500 in front, so
+                // rows the reader had already passed were silently swapped out —
+                // measured on the hive fixture at all 500 replaced, in two runs
+                // out of five. The tiebreaker in the ORDER BY settles it: with a
+                // total order the first 500 rows of a 1000-row window are the
+                // same 500 the narrower window returned. A hive dataset in its
+                // opening order does not come through here at all, and an
+                // unsorted one has nothing to widen inconsistently.
                 var collected: [[String?]] = []
                 collected.reserveCapacity(target)
                 while collected.count < target {
@@ -1050,9 +1104,14 @@ public final class TableModel {
     /// — so those are counted forward however far in they are. That is the
     /// case a hive dataset sidesteps by opening ordered by its partition key.
     ///
-    /// Where the sort has ties this can return a different page than counting
-    /// forward would: both hold rows equal under the sort, but which of a tied
-    /// group falls in a given page is not something `ORDER BY x` settles.
+    /// The two ends only address the same rows because the order is total.
+    /// Under `ORDER BY x` alone, both directions return rows equal under the
+    /// sort, but which of a tied group falls in a given page is not something
+    /// `ORDER BY x` settles — so the page counted forward and the page counted
+    /// backward overlapped, by 166 rows on a thousand-row file sorted by a
+    /// boolean, and 166 other rows were never reachable from either. The
+    /// tiebreaker `query(orderedBy:tiebreak:)` appends is what makes "row 500"
+    /// name one particular row whichever end it is counted from.
     private func fetchPage(start: Int, count: Int, total: Int?) async throws -> [[String?]] {
         await ensureHiveIndex()
 
@@ -1079,7 +1138,11 @@ public final class TableModel {
             source = currentQuery
             offset = forwardOffset
         case .reversed(let reversedOffset):
-            source = query(orderedBy: inverted)
+            // The tiebreaker inverts with the keys it follows. Left ascending
+            // it would describe a different sequence than the forward query,
+            // and the two ends would disagree again — about single rows this
+            // time rather than whole tie groups, but disagree all the same.
+            source = query(orderedBy: inverted, tiebreak: .descending)
             offset = reversedOffset
         }
         guard let source else { return [] }

@@ -2505,6 +2505,221 @@ do {
     model.clear()
 }
 
+// MARK: - Total order (the tiebreaker that makes a page mean one set of rows)
+
+// `ORDER BY x` names a sequence only as far as x is unique. Where it ties, two
+// executions asked for two different windows are free to break the tie two
+// different ways, and the pages they return then overlap and leave gaps. The
+// grid's answer is to append `read_parquet`'s virtual `file_row_number` — and,
+// on a source of several files, `filename` in front of it — so the order is
+// total and every window agrees about where each row sits.
+//
+// These checks are about the SQL and its plan. That the ordering actually holds
+// end to end is "Paging integrity" below.
+
+section("Total order")
+
+do {
+    let sorted = [SortKey(column: "flagged", direction: .ascending)]
+
+    let plain = SQLBuilder.rows(source: .file(smallParquet), sort: sorted)
+    expect(!plain.sql.contains("file_row_number"),
+           "no tiebreaker is added unless one is asked for")
+    expect(plain.sql.hasPrefix("SELECT * FROM"), "so the projection stays a plain SELECT *")
+
+    let tiebroken = SQLBuilder.rows(source: .file(smallParquet), sort: sorted, tiebreak: .ascending)
+    expect(tiebroken.sql.contains("file_row_number = true"),
+           "the tiebreaker switches the virtual column on at the reader")
+    expect(tiebroken.sql.hasSuffix("ORDER BY t.\"flagged\" ASC, t.\"file_row_number\" ASC"),
+           "and follows the user's keys rather than replacing them")
+    expect(tiebroken.sql.hasPrefix("SELECT * EXCLUDE (\"file_row_number\") FROM"),
+           "while being projected away, so it is orderable but not a column of the grid")
+    expectEqual(tiebroken.params, plain.params, "the tiebreaker binds no new parameters")
+
+    // A single file needs no filename: `file_row_number` is already unique
+    // within one, and switching the option on would only widen the read.
+    expect(!tiebroken.sql.contains("filename"), "a single file tiebreaks on the row number alone")
+
+    // Several files do. `file_row_number` restarts at 0 in each of them, so on
+    // its own it is not a row's name but a name shared by one row per file.
+    let dataset = SQLBuilder.rows(
+        source: .dataset(hiveDirectory),
+        sort: [SortKey(column: "region", direction: .ascending)],
+        tiebreak: .ascending
+    )
+    expect(dataset.sql.contains("filename = '__duckparq_filename'"),
+           "a multi-file source names the file each row came from")
+    expect(dataset.sql.hasSuffix(
+        "ORDER BY t.\"region\" ASC, t.\"__duckparq_filename\" ASC, t.\"file_row_number\" ASC"),
+           "and puts it ahead of the per-file row number, which only means anything within one")
+    expect(dataset.sql.contains("EXCLUDE (\"__duckparq_filename\", \"file_row_number\")"),
+           "both are projected away")
+
+    // Renamed rather than left as `filename` because `filename` is an ordinary
+    // thing for a column to be called and DuckDB refuses to shadow one. The
+    // per-file row count uses the same name for the same reason.
+    expect(SQLBuilder.rowCountsByFile(source: .dataset(hiveDirectory)).sql
+        .contains("filename = '__duckparq_filename'"),
+           "the per-file count uses the same out-of-the-way name")
+
+    // `fetchPage` reads a page near the end by turning the ORDER BY around. The
+    // tiebreaker has to turn with it, or the inverted query describes a
+    // different sequence than the forward one and the two ends disagree again.
+    let inverted = SQLBuilder.rows(
+        source: .file(smallParquet),
+        sort: [SortKey(column: "flagged", direction: .descending)],
+        tiebreak: .descending
+    )
+    expect(inverted.sql.hasSuffix("ORDER BY t.\"flagged\" DESC, t.\"file_row_number\" DESC"),
+           "inverting the sort inverts the tiebreaker with it")
+
+    // The hard constraint: a tiebroken window must still plan as a Top-N. The
+    // whole reason sorting a file too large to sort is usable is that DuckDB
+    // keeps `limit` rows as it scans instead of ordering the file — and a
+    // second ORDER BY term is exactly the sort of thing that could cost that.
+    func plan(_ query: BoundSQL) async throws -> String {
+        let cursor = try await session.openCursor(
+            "EXPLAIN " + query.sql, params: query.params, renderAsText: false)
+        var text = ""
+        while let page = try await cursor.fetch(maxRows: 256) {
+            text += page.cells.compactMap { $0 }.joined(separator: "\n")
+        }
+        await cursor.close()
+        return text
+    }
+
+    let windowPlan = try await plan(SQLBuilder.windowed(tiebroken, limit: TableModel.pageSize))
+    expect(windowPlan.contains("TOP_N"), "a tiebroken window still plans as Top-N")
+    expect(!windowPlan.contains("ORDER_BY"), "with no separate full ordering left in the plan")
+    expect(windowPlan.contains("t.flagged ASC"), "on the user's key")
+
+    // And the same in the `OFFSET` form, which is what `loadEarlier()` issues.
+    // Top-N handles an offset by keeping `limit + offset` rows, so the clause
+    // survives; it is worth pinning because a plan that dropped to a full sort
+    // here would only show up as a slow scroll on a file nobody tests with.
+    let offsetPlan = try await plan(
+        SQLBuilder.windowed(tiebroken, limit: TableModel.pageSize, offset: TableModel.pageSize))
+    expect(offsetPlan.contains("TOP_N"), "and so does a tiebroken window read at an offset")
+    expect(!offsetPlan.contains("ORDER_BY"), "which is the read a backward step makes")
+
+    // It runs, and the grid gets the columns it had before, in the same order.
+    let read = try await session.queryAll(
+        SQLBuilder.windowed(tiebroken, limit: 5).sql, params: tiebroken.params, limit: 5)
+    expectEqual(read.columns, ["id", "category", "score", "flagged", "day", "label"],
+                "the tiebreaker does not arrive as a column of the result")
+
+    let datasetRead = try await session.queryAll(
+        SQLBuilder.windowed(dataset, limit: 5).sql, params: dataset.params, limit: 5)
+    expect(!datasetRead.columns.contains("__duckparq_filename"),
+           "nor does the file name on a dataset")
+    expect(datasetRead.columns.contains("year") && datasetRead.columns.contains("region"),
+           "and excluding it leaves the hive partition columns alone")
+}
+
+// What the tiebreaker is allowed to reach. It belongs to every query that
+// produces rows — the grid's window, the pages either end of it, and the export
+// — because those all have to agree about which rows they are talking about.
+do {
+    let model = TableModel(
+        gridSession: try DuckDBSession(engine: engine, label: "order-grid"),
+        metaSession: try DuckDBSession(engine: engine, label: "order-meta"),
+        countSession: try DuckDBSession(engine: engine, label: "order-count"),
+        filterSession: try DuckDBSession(engine: engine, label: "order-filter"),
+        cache: PreviewCache()
+    )
+    model.open(.file(smallParquet))
+    await settle(model)
+    expect(model.currentQuery?.sql.contains("file_row_number") == false,
+           "an unsorted view has no ORDER BY to make total, so it carries no tiebreaker")
+
+    model.toggleSort(column: "flagged")
+    await settle(model)
+    expect(model.currentQuery?.sql.contains("file_row_number = true") == true,
+           "a sorted view carries it")
+
+    // Export. `limit` is the loaded row count — "write out what I am looking
+    // at" — so an export ordering its ties differently from the grid would
+    // silently write a different set of rows than the one on screen.
+    let destination = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("duckparq-selftest-tiebreak.csv")
+    try? FileManager.default.removeItem(at: destination)
+    let copy = SQLBuilder.export(
+        query: model.currentQuery!, to: destination, format: .csv, limit: model.rows.count)
+    try await session.execute(copy.sql, params: copy.params)
+
+    let written = try String(contentsOf: destination, encoding: .utf8)
+        .split(separator: "\n").dropFirst()
+        .map { String($0.split(separator: ",", maxSplits: 1)[0]) }
+    let onScreen = model.rows.map { $0.cells[0] ?? "" }
+    expectEqual(written.count, onScreen.count, "the export writes the loaded rows")
+    expectEqual(written, onScreen, "and writes exactly the rows on screen, in that order")
+    try? FileManager.default.removeItem(at: destination)
+
+    // The editor. The text names a column the user cannot see, which is a fair
+    // objection — but it is part of what decides the rows on screen, and text
+    // that leaves it out describes a different page than the one it claims to.
+    let editable = model.editableSQL!
+    expect(editable.contains("file_row_number"), "the editable SQL says so rather than hiding it")
+    let rerun = try await session.queryAll(
+        "SELECT * FROM (\(editable)) LIMIT \(model.rows.count)", limit: model.rows.count)
+    expectEqual(rerun.column("id").map { $0 ?? "" }, onScreen,
+                "and running it gives back the grid, which is the point of offering it")
+
+    model.clear()
+}
+
+// A source whose data already has a column called `file_row_number`.
+//
+// `read_parquet` refuses the option outright on one — it takes a bool, so there
+// is no name to move it out of the way to, the way `filename` has. The grid
+// therefore has to notice and go without, because the alternative is a file
+// that cannot be sorted at all.
+do {
+    let clashing = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("duckparq-selftest-file-row-number.parquet")
+    try? FileManager.default.removeItem(at: clashing)
+    try await session.execute(
+        "COPY (SELECT i AS id, (i % 2) = 0 AS flagged, i AS file_row_number FROM range(20) t(i)) "
+        + "TO $1 (FORMAT parquet)",
+        params: [clashing.path])
+
+    // First that the option really is refused, so what follows is guarding
+    // against DuckDB's behaviour rather than against a guess about it.
+    do {
+        _ = try await session.queryAll(
+            "SELECT * FROM read_parquet($1, file_row_number = true)",
+            params: [clashing.path], limit: 1)
+        expect(false, "reading such a file with the option on is expected to fail")
+    } catch {
+        expect(true, "read_parquet refuses file_row_number on a file that has that column")
+    }
+
+    let model = TableModel(
+        gridSession: try DuckDBSession(engine: engine, label: "clash-grid"),
+        metaSession: try DuckDBSession(engine: engine, label: "clash-meta"),
+        countSession: try DuckDBSession(engine: engine, label: "clash-count"),
+        filterSession: try DuckDBSession(engine: engine, label: "clash-filter"),
+        cache: PreviewCache()
+    )
+    model.open(.file(clashing))
+    await settle(model)
+    expectEqual(model.errorMessage, String?.none, "the file opens")
+    expectEqual(model.rows.count, 20, "with its rows")
+
+    model.toggleSort(column: "flagged")
+    await settle(model)
+    expectEqual(model.errorMessage, String?.none,
+                "and sorting it does not fail for want of a tiebreaker")
+    expectEqual(model.rows.count, 20, "the sorted rows are still all there")
+    expect(model.currentQuery?.sql.contains("file_row_number = true") == false,
+           "because the tiebreaker is declined on a source that already has the column")
+    expect(model.editableSQL?.contains("EXCLUDE") == false,
+           "and the SQL the editor is offered does not mention one either")
+
+    model.clear()
+    try? FileManager.default.removeItem(at: clashing)
+}
+
 // MARK: - Paging integrity (no row shown twice, none skipped)
 
 // Scrolling through a result must show every row exactly once. The row ids the
@@ -2516,10 +2731,13 @@ do {
 // a repeat from a legitimately different row.
 //
 // The seams that can go wrong are the ones where two adjacent pages come from
-// two separate query executions: `loadEarlier()`'s OFFSET reads, and the
-// crossover in `fetchPage` where one page is counted forward and its neighbour
-// counted backward with the sort inverted. Under a sort with ties neither
-// execution is answering a question that identifies a specific set of rows.
+// two separate query executions: `loadEarlier()`'s OFFSET reads, the crossover
+// in `fetchPage` where one page is counted forward and its neighbour counted
+// backward with the sort inverted, and `loadMore()`'s re-run of the whole
+// window at twice the size. Under a sort with ties none of those executions is
+// answering a question that identifies a specific set of rows — which is why
+// two of the three ways the grid pages are given a total order to answer
+// against, and the third given no ORDER BY at all.
 
 section("Paging integrity")
 
@@ -2639,8 +2857,7 @@ do {
 
     // A user sort takes the file order away, because it says nothing about a
     // column that is not the partition key. The dataset goes back to being
-    // paged by ORDER BY -- which is the path the remaining known defect lives
-    // on, and why this one only asserts which path is taken.
+    // paged by ORDER BY, and has to be correct there too — see 2b.
     model.toggleSort(column: "value")
     await settle(model)
     expect(!model.pagesByFile, "sorting by a data column leaves the file order behind")
@@ -2657,19 +2874,17 @@ do {
     await settle(model)
     expect(!model.pagesByFile, "nor does a plain folder of parquet files")
 
-    // 2. KNOWN FAILURE, deliberately left red. The same tie problem without
-    // hive partitioning: a single file sorted by a low-cardinality column.
-    // `flagged` is a boolean, so the result is two tie groups, and the seam
-    // between the page counted forward and the page counted backward falls
-    // inside one of them — 166 rows shown twice, 166 never shown, on every run.
+    // 2. The same tie problem without hive partitioning: a single file sorted
+    // by a low-cardinality column. `flagged` is a boolean, so the result is two
+    // tie groups, and the seam between the page counted forward and the page
+    // counted backward falls inside one of them. This used to hand back 166
+    // rows twice and never show 166 others, deterministically, every run.
     //
-    // The hive path above no longer reaches this because it does not sort at
-    // all. An ordinary file has no partition layout to page by, so the only
-    // fix is a total order: appending a tiebreaker to the ORDER BY. Measured at
-    // roughly 1.8x on a Top-N over 10M rows and confirmed by EXPLAIN to stay a
-    // Top-N, so it is affordable — what it still needs is an answer for the
-    // datasets with no unique column to tiebreak on. Until then this stands as
-    // the record of a real defect rather than being quietly deleted.
+    // The hive path above sidesteps ties by not sorting at all, which an
+    // ordinary file cannot do — it has no partition layout to page by. What
+    // fixes it here is a total order: `read_parquet`'s `file_row_number`
+    // appended to the ORDER BY, which needs no unique column in the data and
+    // still plans as a Top-N (asserted in "Total order").
     model.open(.file(smallParquet))
     await settle(model)
     model.toggleSort(column: "flagged")
@@ -2684,6 +2899,14 @@ do {
                 "scrolling up a file sorted by a boolean shows no row twice")
     expectEqual(flaggedDefects.skipped, 0, "and skips none of them")
 
+    // The tiebreaker refines the user's sort rather than displacing it: the
+    // walk is still in `flagged` order, it just also settles which of the rows
+    // sharing a value come first.
+    let flaggedIndex = model.columns.firstIndex { $0.name == "flagged" }!
+    let walkedFlags = model.rows.map { $0.cells[flaggedIndex] ?? "" }
+    expectEqual(walkedFlags.count, 1000, "the whole file is loaded after the walk")
+    expect(walkedFlags == walkedFlags.sorted(), "and is still ordered by the column asked for")
+
     // A four-valued column, where the forward/backward crossover lands on a
     // group boundary rather than inside one.
     model.open(.file(smallParquet))
@@ -2694,6 +2917,53 @@ do {
     let categoryDefects = pagingDefects(walked: categoryWalk, expected: smallExpected)
     expectEqual(categoryDefects.repeats, 0, "nor does a four-valued sort repeat a row")
     expectEqual(categoryDefects.skipped, 0, "nor skip one")
+
+    // The same seam with a WHERE in front of it, so the tiebreaker is asked to
+    // order a filtered result rather than a whole file. 700 matching rows puts
+    // the tail window at offset 200 and leaves the crossover between the page
+    // counted backward and the page counted forward inside a tie group.
+    model.open(.file(smallParquet))
+    await settle(model)
+    model.toggleSort(column: "category")
+    await settle(model)
+    model.upsert(filter: Filter(
+        column: model.column(named: "score")!, mode: .comparison(.lessThan, ["700"])))
+    await settle(model)
+    expectEqual(model.totalRowCount, 700, "the filter reaches DuckDB")
+
+    let scoredWalk = await walkBackward(model, keyColumn: "id")
+    let scoredExpected = Set(try await verifier.queryAll(
+        "SELECT id FROM read_parquet($1) WHERE score < 700",
+        params: [smallParquet.path], limit: 1000).column("id").compactMap { $0 })
+    let scoredDefects = pagingDefects(walked: scoredWalk, expected: scoredExpected)
+    expectEqual(scoredWalk.count, 700, "the filtered walk visits as many rows as match")
+    expectEqual(scoredDefects.repeats, 0, "a filtered, sorted walk shows no row twice")
+    expectEqual(scoredDefects.skipped, 0, "and skips none of the matching rows")
+    expectEqual(Set(scoredWalk), scoredExpected, "and visits exactly the rows the filter admits")
+
+    // 2b. A multi-file source under a user sort — the case a single file cannot
+    // reach. `file_row_number` counts within one file, so it repeats once per
+    // file and is not a row's name on its own; the filename has to go in front
+    // of it. Six files here, `region` taking three values across all 3000 rows,
+    // so the ties are as broad as they get and every page boundary but the
+    // first falls inside one.
+    model.open(.dataset(hiveDirectory))
+    await settle(model)
+    model.toggleSort(column: "region")
+    await settle(model)
+    expect(!model.pagesByFile, "a sorted dataset is paged by ORDER BY, not by file")
+    expectEqual(model.totalRowCount, 3000, "over all 3000 rows")
+
+    let regionWalk = await walkBackward(model, keyColumn: "id")
+    let regionDefects = pagingDefects(walked: regionWalk, expected: hiveExpected)
+    expectEqual(regionWalk.count, 3000, "the walk visits as many rows as the dataset holds")
+    expectEqual(regionDefects.repeats, 0,
+                "scrolling up a sorted dataset of six files shows no row twice")
+    expectEqual(regionDefects.skipped, 0, "and skips none of them")
+
+    let regionIndex = model.columns.firstIndex { $0.name == "region" }!
+    let walkedRegions = model.rows.map { $0.cells[regionIndex] ?? "" }
+    expect(walkedRegions == walkedRegions.sorted(), "and is still ordered by region")
 
     // 3. An unsorted result, where `pageAddress` always counts forward because
     // there is no order to run backward. Two `LIMIT`/`OFFSET` reads of a
@@ -2745,6 +3015,53 @@ do {
     expectEqual(vanished.count, 0,
                 "widening the window keeps the rows already read rather than "
                 + "replacing them with other rows of the same tie group")
+
+    // The same question on the ORDER BY path, which is where widening was
+    // actually measured losing rows — all 500 replaced in two runs out of five.
+    // A dataset under a user sort, so the file walk is not what is answering.
+    //
+    // Asked twice over: no row already read has gone, and the rows already read
+    // are still in the same places. The second is the stronger claim, and the
+    // one a reader would notice breaking — a window that keeps every row but
+    // shuffles the tied ones has still moved the text under their eye.
+    @MainActor
+    func keys(_ model: TableModel, _ column: String) -> [String] {
+        guard let index = model.columns.firstIndex(where: { $0.name == column }) else { return [] }
+        return model.rows.map { $0.cells[index] ?? "<null>" }
+    }
+
+    model.open(.dataset(hiveDirectory))
+    await settle(model)
+    model.toggleSort(column: "region")
+    await settle(model)
+    expect(!model.pagesByFile, "a sorted dataset widens through the ORDER BY path")
+    let beforeSortedWidening = keys(model, "id")
+    expectEqual(beforeSortedWidening.count, TableModel.pageSize, "a full window to widen from")
+
+    model.loadMore()
+    await settle(model)
+    expectEqual(model.windowSize, TableModel.pageSize * 2, "the window doubled")
+    let afterSortedWidening = keys(model, "id")
+    expectEqual(afterSortedWidening.count, TableModel.pageSize * 2, "and came back full")
+    expectEqual(Set(beforeSortedWidening).subtracting(afterSortedWidening).count, 0,
+                "widening a sorted dataset loses none of the rows already read")
+    expectEqual(Array(afterSortedWidening.prefix(TableModel.pageSize)), beforeSortedWidening,
+                "and leaves them exactly where they were")
+
+    // And on a single file, where the tiebreaker is the row number alone.
+    model.open(.file(smallParquet))
+    await settle(model)
+    model.toggleSort(column: "flagged")
+    await settle(model)
+    let beforeFileWidening = keys(model, "id")
+    expectEqual(beforeFileWidening.count, TableModel.pageSize, "half the file to widen from")
+
+    model.loadMore()
+    await settle(model)
+    let afterFileWidening = keys(model, "id")
+    expectEqual(afterFileWidening.count, 1000, "widening to the whole file")
+    expectEqual(Array(afterFileWidening.prefix(TableModel.pageSize)), beforeFileWidening,
+                "keeps the first page exactly as it was rather than re-breaking its ties")
 
     // 5. The remaining seam is the one where the two directions would meet:
     // a window that has been walked backward, then widened forward. It is not
