@@ -2067,8 +2067,10 @@ do {
     // End: jump to the last page and anchor there, rather than reading the
     // whole file to get to the bottom.
     expectEqual(model.windowStart, 0, "starting from the opening window")
+    expectEqual(model.prependedRowCount, 0, "an opening window added nothing above itself")
     model.jumpToEnd()
     await settle(model)
+    expectEqual(model.prependedRowCount, 0, "landing on the end is not a prepend")
     expectEqual(model.rows.count, TableModel.pageSize, "jumping to the end loads one page, not the whole file")
     expectEqual(model.windowStart, 500, "the tail window starts a page before the file's last row")
     expect(model.reachedEnd, "the tail window already reaches the last row")
@@ -2105,6 +2107,17 @@ do {
     expectEqual(model.rows.map(\.id), Array(0..<1000), "row ids stay contiguous across a prepend")
     expectEqual(model.rows.first?.cells[idIndex], "0", "the first row loaded is the file's actual first row")
 
+    // How many rows arrived above the ones already there, which is what the
+    // grid shifts its viewport by to stay where it was. Without that shift the
+    // rows being read jump backward by a page, and — since scrolling up to the
+    // top is how the page was asked for in the first place — the viewport is
+    // left against the top of the content with no further "up" to report, so
+    // the page after it could not be asked for until the user scrolled back
+    // down. Reported as exactly that: scrolling up loads once, then needs a
+    // scroll down before it will load again.
+    expectEqual(model.prependedRowCount, TableModel.pageSize,
+                "a backward page reports the rows it put above the window")
+
     // Home after End: jumping back to the front reads a fresh opening page,
     // the same one `reload()` reads for a newly opened file -- not the whole
     // file, even though the whole file happens to be loaded right now from
@@ -2118,12 +2131,32 @@ do {
     expectEqual(model.rows.count, TableModel.pageSize, "Home loads a single page, not the whole file")
     expectEqual(model.rows.map(\.id), Array(0..<TableModel.pageSize), "back to the opening window's row ids")
     expectEqual(model.rows.first?.cells[idIndex], "0", "the opening window starts at the file's first row")
+    expectEqual(model.prependedRowCount, 0,
+                "a window read from row 0 replaced the rows rather than growing above them")
 
     // Home is a no-op, query-wise, when row 0 is already loaded.
     let generationAtStart = model.rowsGeneration
     model.jumpToStart()
     expectEqual(model.rowsGeneration, generationAtStart,
                 "jumpToStart does nothing when the window already reaches row 0")
+
+    // The shift the grid applies has to match the page it actually got, which
+    // is not always a full one: the last step back to row 0 is however much of
+    // a page is left. A filtered result of 700 rows anchors its tail window at
+    // 200, so stepping back from it prepends 200 rows and not 500.
+    model.upsert(filter: Filter(column: model.column(named: "id")!, mode: .comparison(.lessThan, ["700"])))
+    await settle(model)
+    expectEqual(model.totalRowCount, 700, "the filter leaves a result that is not a whole number of pages")
+    model.jumpToEnd()
+    await settle(model)
+    expectEqual(model.windowStart, 200, "the tail window of 700 rows starts a page before the last")
+    model.loadEarlier()
+    await settle(model)
+    expectEqual(model.windowStart, 0, "stepping back from it reaches row 0")
+    expectEqual(model.prependedRowCount, 200, "and reports the short page it actually prepended")
+    expectEqual(model.rows.count, 700, "which joins the tail window to make the whole result")
+    model.clearFilters()
+    await settle(model)
 
     // A sorted End reads the tail by inverting the ORDER BY and turning the
     // page back over, rather than ordering the whole result to skip past it.

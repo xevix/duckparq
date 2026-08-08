@@ -40,6 +40,17 @@ enum GridTrace {
     }
 }
 
+/// Where the rows are scrolled to, kept out of SwiftUI's dependency graph.
+///
+/// The grid needs the last known vertical offset when a page of earlier rows
+/// arrives, and never needs it to draw anything. A reference the view holds is
+/// the way to remember it without every scroll tick invalidating a body that
+/// builds a screenful of cells.
+@MainActor
+private final class ScrollOffset {
+    var distanceFromTop: CGFloat = 0
+}
+
 struct DataGridView: View {
     @Environment(AppModel.self) private var app
 
@@ -67,6 +78,15 @@ struct DataGridView: View {
     /// Horizontal scroll offset, mirrored onto the header so it tracks the
     /// columns it labels.
     @State private var scrollX: CGFloat = 0
+    /// How far down the rows the viewport currently is, for holding that place
+    /// across a prepend.
+    ///
+    /// A box rather than a `CGFloat` state, because nothing drawn depends on
+    /// it: it is read when a page of earlier rows lands and at no other time.
+    /// Held as state it would invalidate the whole grid on every vertical
+    /// scroll tick — which is what `scrollX` costs, and `scrollX` at least buys
+    /// a header that tracks its columns.
+    @State private var scrollY = ScrollOffset()
     /// Measured column widths, and the prefix sums used to find which columns
     /// the viewport is over.
     ///
@@ -92,7 +112,13 @@ struct DataGridView: View {
     }
 
     /// Height of one data row, and of everything the rows are not.
-    private static let rowHeight: CGFloat = 20
+    ///
+    /// Taken from the row itself rather than restated, because this is how the
+    /// grid converts a number of rows into a distance — how far the viewport
+    /// must move to hold its place across a prepend, and how near the top
+    /// counts as near enough to page backward. A second 20 that drifted from
+    /// the row's own would land both somewhere else.
+    private static let rowHeight: CGFloat = RowCanvas.height
     private static let chromeHeight: CGFloat = 44
 
     var body: some View {
@@ -285,9 +311,16 @@ struct DataGridView: View {
                 // reports anything. Requiring the offset to have *decreased*
                 // makes it narrower still: the user has to be scrolling toward
                 // the top for this to fire at all.
+                //
+                // Which is also why the page that lands has to be paid for with
+                // a shift of the viewport — see `holdPlaceAcrossPrepend()`.
+                // Without one, the offset that asked for a page is left pinned
+                // against the top of the content it just grew, and an offset
+                // already at zero cannot decrease again.
                 .onScrollGeometryChange(for: CGFloat.self) { geometry in
                     max(geometry.contentOffset.y + geometry.contentInsets.top, 0)
                 } action: { previousTop, distanceFromTop in
+                    scrollY.distanceFromTop = distanceFromTop
                     guard distanceFromTop < previousTop else { return }
                     guard distanceFromTop < Self.rowHeight * CGFloat(TableModel.prefetchDistance) else {
                         return
@@ -372,9 +405,50 @@ struct DataGridView: View {
             commit: rows \(table.rows.count) windowStart \(table.windowStart) \
             reachedEnd \(table.reachedEnd) intent \(pendingScrollIntent.map(String.init(describing:)) ?? "none")
             """, dedupe: false)
-        guard let intent = pendingScrollIntent else { return }
+        guard let intent = pendingScrollIntent else {
+            holdPlaceAcrossPrepend()
+            return
+        }
         pendingScrollIntent = nil
         Task { @MainActor in scroll(to: intent) }
+    }
+
+    /// Keep the rows under the eye where they were when earlier ones are
+    /// spliced in above them.
+    ///
+    /// The scroll view is anchored to the top of its content, so inserting rows
+    /// above the viewport leaves the offset alone and moves every row already
+    /// on screen down by the height of what arrived. Two things follow, and the
+    /// second is the one that reads as a bug: the rows being read jump away, and
+    /// an offset that had reached zero — which is where scrolling up to ask for
+    /// the page leaves it — has no further "up" to report, so the page after
+    /// that could not be asked for without scrolling back down first.
+    ///
+    /// Moving the viewport down by exactly the height of the new rows undoes
+    /// both: same rows under the eye, and the newly loaded ones sitting above
+    /// as somewhere left to scroll.
+    private func holdPlaceAcrossPrepend() {
+        guard table.prependedRowCount > 0 else { return }
+        let restored = scrollY.distanceFromTop
+            + CGFloat(table.prependedRowCount) * Self.rowHeight
+        GridTrace.log("""
+            prepended \(table.prependedRowCount) rows: \
+            \(scrollY.distanceFromTop.rounded()) -> \(restored.rounded())
+            """, dedupe: false)
+        scrollY.distanceFromTop = restored
+        // A point rather than `scrollTo(y:)`, which does not leave the other
+        // axis where it was: it returns the columns to the left edge, so a
+        // page of earlier rows on a wide file would carry the view back to
+        // column one. Naming both axes says where the viewport goes, and `x`
+        // is the offset the header is already mirroring, so nothing moves
+        // sideways.
+        //
+        // Not animated, and not deferred a turn the way a Home/End landing is:
+        // this is a correction for content that arrived in this very update,
+        // and the scroll view applies it against the new content once laid out.
+        // A frame spent at the uncorrected offset is a frame of the jump this
+        // exists to remove.
+        scrollPosition.scrollTo(point: CGPoint(x: scrollX, y: restored))
     }
 
     /// Scroll to an edge of the content, leaving the other axis alone — a

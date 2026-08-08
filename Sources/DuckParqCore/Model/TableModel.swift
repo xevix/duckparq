@@ -50,6 +50,20 @@ public final class TableModel {
     /// repeated for every row on screen. Comparing this instead makes it O(1).
     public private(set) var rowsGeneration = 0
 
+    /// How many rows the last bump of `rowsGeneration` spliced onto the *front*
+    /// of `rows`. Zero for every other kind of change.
+    ///
+    /// The grid holds its place with this. A scroll view keeps its offset when
+    /// content is inserted above the viewport, so a prepend on its own moves
+    /// the reader backward by the height of what arrived — and, if they had
+    /// scrolled to the top of the window to ask for it, leaves them pinned
+    /// against the top of the content with no further "up" left to scroll. That
+    /// is what made the second page backward need a scroll *down* before it
+    /// could be asked for again. Shifting the viewport by exactly this many
+    /// rows keeps the rows under the eye still and leaves the newly loaded ones
+    /// above to scroll up into.
+    public private(set) var prependedRowCount = 0
+
     public private(set) var isLoading = false
     public private(set) var isLoadingMore = false
     /// A backward step is in flight — `loadEarlier()`'s counterpart to
@@ -291,6 +305,7 @@ public final class TableModel {
         defaultSort = []
         windowSize = Self.pageSize
         windowStart = 0
+        prependedRowCount = 0
         rowCap = Self.loadedRowCap
         isLoading = false
         isLoadingMore = false
@@ -720,6 +735,7 @@ public final class TableModel {
     private func commit(_ cells: [[String?]], requested: Int) {
         rows = cells.enumerated().map { GridRow(id: $0.offset, cells: $0.element) }
         rowsGeneration += 1
+        prependedRowCount = 0
         rowsAreStale = false
         // Fewer rows than asked for means the result really is exhausted; the
         // limit is what stopped it otherwise.
@@ -857,6 +873,7 @@ public final class TableModel {
         let earlier = cells.enumerated().map { GridRow(id: start + $0.offset, cells: $0.element) }
         rows = earlier + rows
         rowsGeneration += 1
+        prependedRowCount = earlier.count
         windowStart = start
     }
 
@@ -906,6 +923,7 @@ public final class TableModel {
         guard total > 0 else {
             rows = []
             rowsGeneration += 1
+            prependedRowCount = 0
             windowStart = 0
             reachedEnd = true
             isLoading = false
@@ -1014,6 +1032,7 @@ public final class TableModel {
     private func commitTail(_ cells: [[String?]], offset: Int) {
         rows = cells.enumerated().map { GridRow(id: offset + $0.offset, cells: $0.element) }
         rowsGeneration += 1
+        prependedRowCount = 0
         rowsAreStale = false
         windowStart = offset
         windowSize = max(cells.count, Self.pageSize)
@@ -1134,6 +1153,7 @@ public final class TableModel {
         if case .source(let source) = mode { loadedSource = source }
         rows = cached.rows.enumerated().map { GridRow(id: $0.offset, cells: $0.element) }
         rowsGeneration += 1
+        prependedRowCount = 0
         rowsAreStale = false
         windowStart = 0
         totalRowCount = cached.totalRowCount
