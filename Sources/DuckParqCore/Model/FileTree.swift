@@ -4,7 +4,8 @@ public struct FileNode: Identifiable, Hashable, Sendable {
     public let url: URL
     public let isDirectory: Bool
     /// A directory that reads as one parquet dataset — either hive-partitioned
-    /// (`key=value` subdirectories) or simply holding parquet files.
+    /// (`key=value` subdirectories) or holding parquet files that agree on a
+    /// schema. See `FileTree.looksLikeDataset`.
     public let isDataset: Bool
     public let byteSize: Int64?
     public let modified: Date?
@@ -19,6 +20,19 @@ public struct FileNode: Identifiable, Hashable, Sendable {
 
     public var id: URL { url }
     public var name: String { url.lastPathComponent }
+
+    /// The same node with the dataset question answered.
+    ///
+    /// Deciding it costs a read of every file's schema, so it is not something a
+    /// directory listing can do for every row it produces — see
+    /// `FileTree.children(of:)`. The listing describes what is on disk and this
+    /// stamps on what DuckDB said about it.
+    public func classified(asDataset isDataset: Bool) -> FileNode {
+        FileNode(
+            url: url, isDirectory: isDirectory, isDataset: isDataset,
+            byteSize: byteSize, modified: modified
+        )
+    }
 
     public var dataSource: DataSource? {
         if isDirectory { return isDataset ? .dataset(url) : nil }
@@ -68,10 +82,41 @@ public enum FileTree {
         public let outcome: ListingOutcome
     }
 
-    /// Directory contents, distinguishing "nothing here" from "not allowed to
-    /// look" so the sidebar can offer the right remedy instead of silently
-    /// showing an empty folder.
-    public static func listing(of url: URL) -> Listing {
+    /// Directory contents with each sub-folder classified — what the sidebar
+    /// draws.
+    ///
+    /// Async because classifying a folder means asking DuckDB whether its files
+    /// read as one table; see `looksLikeDataset`. `children(of:)` is the same
+    /// listing without that question, for the callers that walk the tree rather
+    /// than draw it.
+    public static func listing(of url: URL) async -> Listing {
+        let listing = contents(of: url)
+        var nodes = listing.nodes
+        for index in nodes.indices where nodes[index].isDirectory {
+            nodes[index] = nodes[index].classified(
+                asDataset: await looksLikeDataset(nodes[index].url)
+            )
+        }
+        return Listing(nodes: nodes, outcome: listing.outcome)
+    }
+
+    /// Directory contents: sub-directories and parquet files, directories first,
+    /// each side alphabetical. Everything else is hidden — this is a parquet
+    /// browser, not a file manager.
+    ///
+    /// Every directory node comes back `isDataset: false`, because that question
+    /// costs a read of every file's schema and this is what the tree walks are
+    /// built on — Expand All, and the sidebar's filter. Both want names and
+    /// which rows are folders; the filter classifies the handful it is actually
+    /// about to show.
+    public static func children(of url: URL) -> [FileNode] {
+        contents(of: url).nodes
+    }
+
+    /// The listing as it comes off the filesystem, distinguishing "nothing here"
+    /// from "not allowed to look" so the sidebar can offer the right remedy
+    /// instead of silently showing an empty folder.
+    private static func contents(of url: URL) -> Listing {
         let keys: [URLResourceKey] = [
             .isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .isHiddenKey,
         ]
@@ -95,13 +140,6 @@ public enum FileTree {
         }
     }
 
-    /// Directory contents: sub-directories and parquet files, directories first,
-    /// each side alphabetical. Everything else is hidden — this is a parquet
-    /// browser, not a file manager.
-    public static func children(of url: URL) -> [FileNode] {
-        listing(of: url).nodes
-    }
-
     private static func nodes(
         from entries: [URL],
         keys: [URLResourceKey],
@@ -118,7 +156,7 @@ public enum FileTree {
                 nodes.append(FileNode(
                     url: entry,
                     isDirectory: true,
-                    isDataset: looksLikeDataset(entry),
+                    isDataset: false,
                     byteSize: nil,
                     modified: values?.contentModificationDate
                 ))
@@ -139,25 +177,40 @@ public enum FileTree {
         }
     }
 
-    /// Whether a directory should offer to open as a single dataset.
+    /// Whether a directory should offer to open as a single dataset rather than
+    /// as a folder to browse.
     ///
-    /// Deliberately a shallow, first-level check: this runs for every directory
-    /// the sidebar draws, so it must not walk the tree. A hive layout is
-    /// recognised by `key=value` directory names, which is how DuckDB's
-    /// `hive_partitioning` reads them too.
-    public static func looksLikeDataset(_ url: URL) -> Bool {
+    /// Two ways to qualify, in cost order:
+    ///
+    /// 1. **A hive layout.** `key=value` sub-directories are partition columns
+    ///    of one table — which is how DuckDB's `hive_partitioning` reads them,
+    ///    so it is how they are read here. Settled from the names alone.
+    /// 2. **Files that agree on a schema**, so that one glob covers them without
+    ///    `union_by_name = true`. Nothing in a folder's names says whether its
+    ///    files agree, so this half is asked of DuckDB — see `DatasetIndex`.
+    ///
+    /// The second test is only reached for a folder holding parquet files of its
+    /// own. A folder of folders stays a folder: it has no files to agree about,
+    /// and badging one as a dataset would take a whole tree's worth of browsing
+    /// away on the strength of what happens to be nested below it.
+    public static func looksLikeDataset(_ url: URL) async -> Bool {
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
         ) else { return false }
 
-        for entry in entries.prefix(64) {
-            if parquetExtensions.contains(entry.pathExtension.lowercased()) { return true }
-            if isHivePartitionName(entry.lastPathComponent),
-               (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
-                return true
-            }
+        if containsHivePartitions(entries) { return true }
+        guard containsParquetFile(entries) else { return false }
+        return await DatasetIndex.shared.readsAsOneTable(url)
+    }
+
+    /// Whether any of these entries is a parquet file — the cheap precondition
+    /// that keeps an ordinary folder from ever reaching DuckDB. Short-circuits,
+    /// so a folder whose first entry is a parquet file costs one `stat`.
+    private static func containsParquetFile(_ entries: [URL]) -> Bool {
+        entries.contains { entry in
+            parquetExtensions.contains(entry.pathExtension.lowercased())
+                && (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory != true
         }
-        return false
     }
 
     /// A `key=value` directory name — the shape DuckDB's `hive_partitioning`
@@ -317,7 +370,13 @@ public enum FileTree {
 
     /// Recursive name search, used by the sidebar's filter field. Bounded so a
     /// search over a huge tree can't hang the UI.
-    public static func search(root: URL, query: String, limit: Int = 300) -> [FileNode] {
+    ///
+    /// The walk itself is unclassified — twenty thousand folders is far too many
+    /// to ask DuckDB about, and the answer would be thrown away for all but the
+    /// few whose names match. Only a folder that matched, and so is about to be
+    /// shown, is classified; a folder that turns out not to be a dataset is not
+    /// a result at all, because there is nothing to open it as.
+    public static func search(root: URL, query: String, limit: Int = 300) async -> [FileNode] {
         let needle = query.lowercased()
         guard !needle.isEmpty else { return [] }
 
@@ -331,8 +390,8 @@ public enum FileTree {
                 visited += 1
                 if node.isDirectory {
                     queue.append(node.url)
-                    if node.isDataset, node.name.lowercased().contains(needle) {
-                        results.append(node)
+                    if node.name.lowercased().contains(needle), await looksLikeDataset(node.url) {
+                        results.append(node.classified(asDataset: true))
                     }
                 } else if node.name.lowercased().contains(needle) {
                     results.append(node)

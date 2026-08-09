@@ -63,6 +63,37 @@ COPY (
   FROM range(3000) t(i)
 ) TO '$FIX/hive' (FORMAT parquet, PARTITION_BY (year, region));"
 
+# A folder is a dataset when one glob covers its files without union_by_name.
+# These three folders are the cases that decides: files that agree, files that
+# do not, and files that agree on everything but the order of their columns --
+# which DuckDB matches by name, so it globs them and they are a dataset too.
+echo "==> uniform/ (a folder of files that agree on a schema)"
+rm -rf "$FIX/uniform"
+mkdir -p "$FIX/uniform"
+run_sql "
+COPY (SELECT i AS id, 'row-' || i AS label FROM range(500) t(i))
+  TO '$FIX/uniform/part-0.parquet' (FORMAT parquet);
+COPY (SELECT i AS id, 'row-' || i AS label FROM range(500, 1000) t(i))
+  TO '$FIX/uniform/part-1.parquet' (FORMAT parquet);"
+
+echo "==> mixed/ (a folder of files that do not)"
+rm -rf "$FIX/mixed"
+mkdir -p "$FIX/mixed"
+run_sql "
+COPY (SELECT i AS id, 'row-' || i AS label FROM range(100) t(i))
+  TO '$FIX/mixed/labelled.parquet' (FORMAT parquet);
+COPY (SELECT i AS id, i * 1.5 AS amount FROM range(100) t(i))
+  TO '$FIX/mixed/priced.parquet' (FORMAT parquet);"
+
+echo "==> reordered/ (same columns, different order)"
+rm -rf "$FIX/reordered"
+mkdir -p "$FIX/reordered"
+run_sql "
+COPY (SELECT i AS id, 'row-' || i AS label FROM range(100) t(i))
+  TO '$FIX/reordered/id-first.parquet' (FORMAT parquet);
+COPY (SELECT 'row-' || i AS label, i AS id FROM range(100) t(i))
+  TO '$FIX/reordered/label-first.parquet' (FORMAT parquet);"
+
 echo "==> corrupt.parquet (invalid file, for error paths)"
 printf 'PAR1this is not a valid parquet file' > "$FIX/corrupt.parquet"
 

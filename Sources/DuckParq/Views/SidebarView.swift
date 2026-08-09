@@ -27,13 +27,7 @@ struct SidebarView: View {
                         ForEach(app.roots, id: \.self) { root in
                             Section {
                                 if app.isExpanded(root) {
-                                    // A folder you added is often the dataset
-                                    // itself, so offer it directly rather than
-                                    // making you find a file inside it first.
-                                    if FileTree.looksLikeDataset(root) {
-                                        RootDatasetRow(url: root)
-                                    }
-                                    DirectoryContents(url: root, depth: 0)
+                                    RootContents(url: root)
                                 }
                             } header: {
                                 RootHeader(url: root)
@@ -75,8 +69,21 @@ struct SidebarView: View {
             }
         }
         .searchable(text: $app.searchQuery, placement: .sidebar, prompt: "Filter by name")
-        .onChange(of: app.searchQuery) { _, query in
-            searchResults = app.roots.flatMap { FileTree.search(root: $0, query: query) }
+        // A task rather than onChange: the walk is async now that a matching
+        // folder has to be classified before it can be offered, and typing on
+        // must cancel the search for what was typed before it.
+        .task(id: app.searchQuery) {
+            let query = app.searchQuery
+            guard !query.isEmpty else {
+                searchResults = []
+                return
+            }
+            var found: [FileNode] = []
+            for root in app.roots {
+                found += await FileTree.search(root: root, query: query)
+            }
+            guard !Task.isCancelled else { return }
+            searchResults = found
         }
         .toolbar {
             ToolbarItemGroup {
@@ -272,6 +279,29 @@ private struct RootHeader: View {
     }
 }
 
+/// What an added folder shows when it is open.
+///
+/// A folder you added is often the dataset itself, so it is offered directly
+/// rather than making you find a file inside it first — but only once DuckDB
+/// has said the files read as one table, which is a question with a query
+/// behind it. Held in `@State` rather than asked in `body`, because a view's
+/// body runs on every redraw and this must not.
+private struct RootContents: View {
+    let url: URL
+
+    @State private var isDataset = false
+
+    var body: some View {
+        if isDataset { RootDatasetRow(url: url) }
+        // The task hangs off the contents rather than the row above it, for the
+        // same reason `DirectoryContents` always draws something: a modifier
+        // needs a view to live on, and the row it would decide the existence of
+        // is not there to host the decision.
+        DirectoryContents(url: url, depth: 0)
+            .task(id: url) { isDataset = await FileTree.looksLikeDataset(url) }
+    }
+}
+
 /// One level of a directory, loaded on first appearance.
 private struct DirectoryContents: View {
     let url: URL
@@ -360,12 +390,11 @@ private struct DirectoryContents: View {
     }
 
     private func load() async {
-        let url = self.url
-        // Directory reads can be slow on network volumes; keep them off the
-        // main actor so the sidebar stays responsive.
-        let listing = await Task.detached(priority: .userInitiated) {
-            FileTree.listing(of: url)
-        }.value
+        // `listing` is nonisolated, so both halves of it — the directory read,
+        // which is slow on a network volume, and the schema probe behind each
+        // sub-folder's badge — run off the main actor and the sidebar stays
+        // responsive while they do.
+        let listing = await FileTree.listing(of: url)
         children = listing.nodes
         outcome = listing.outcome
         isLoaded = true
@@ -423,8 +452,9 @@ private struct DirectoryRow: View {
                     .foregroundStyle(node.isDataset ? Color.accentColor : .secondary)
                 Text(node.name).lineLimit(1)
                 if node.isDataset {
-                    // Hive layouts and folders of parquet files can be read as
-                    // one table; the badge is also the affordance for doing so.
+                    // Hive layouts, and folders whose files agree on a schema,
+                    // can be read as one table; the badge is also the
+                    // affordance for doing so.
                     Text("dataset")
                         .font(.system(size: 9, weight: .semibold))
                         .padding(.horizontal, 4)

@@ -45,7 +45,10 @@ $(VENDOR_STAMP):
 
 fixtures: $(FIXTURES)/small.parquet
 
-$(FIXTURES)/small.parquet:
+# Depends on the script, not just on the stamp file: a checkout that already has
+# fixtures needs to pick up ones added since, or `make test` runs against a set
+# the tests no longer describe.
+$(FIXTURES)/small.parquet: scripts/make-fixtures.sh
 	@./scripts/make-fixtures.sh
 
 ## smoke: go/no-go gate -- proves the vendored static archives link AND that

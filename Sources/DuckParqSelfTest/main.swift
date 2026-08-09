@@ -42,9 +42,14 @@ let fixtures = packageRoot.appendingPathComponent(".fixtures")
 let smallParquet = fixtures.appendingPathComponent("small.parquet")
 let typesParquet = fixtures.appendingPathComponent("types.parquet")
 let hiveDirectory = fixtures.appendingPathComponent("hive")
+let uniformDirectory = fixtures.appendingPathComponent("uniform")
+let mixedDirectory = fixtures.appendingPathComponent("mixed")
+let reorderedDirectory = fixtures.appendingPathComponent("reordered")
 let corruptParquet = fixtures.appendingPathComponent("corrupt.parquet")
 
-guard FileManager.default.fileExists(atPath: smallParquet.path) else {
+guard FileManager.default.fileExists(atPath: smallParquet.path),
+      FileManager.default.fileExists(atPath: mixedDirectory.path)
+else {
     FileHandle.standardError.write("fixtures missing — run `make fixtures`\n".data(using: .utf8)!)
     exit(2)
 }
@@ -147,12 +152,22 @@ do {
 section("File tree")
 
 do {
-    let listing = FileTree.listing(of: fixtures)
+    let listing = await FileTree.listing(of: fixtures)
     expectEqual(listing.outcome, .ok, "a readable directory lists successfully")
     expect(listing.nodes.contains { $0.name == "small.parquet" }, "parquet files are listed")
     expect(listing.nodes.contains { $0.name == "hive" && $0.isDataset },
            "a hive directory is flagged as a dataset")
+    expect(listing.nodes.contains { $0.name == "uniform" && $0.isDataset },
+           "so is a folder whose files agree on a schema")
+    expect(listing.nodes.contains { $0.name == "mixed" && !$0.isDataset },
+           "a folder whose files disagree is listed as a folder")
     expect(!listing.nodes.contains { $0.name.hasSuffix(".ips") }, "non-parquet files are hidden")
+
+    // The listing is what carries the answer; a bare directory walk does not
+    // pay for it, because the tree walks behind Expand All and the filter field
+    // would otherwise probe every folder they pass.
+    expect(FileTree.children(of: fixtures).allSatisfy { !$0.isDataset },
+           "a plain directory walk classifies nothing")
 
     // Directories sort before files, so the tree reads top-down.
     let firstFileIndex = listing.nodes.firstIndex { !$0.isDirectory } ?? listing.nodes.count
@@ -162,18 +177,15 @@ do {
     // An unreadable directory must be distinguishable from an empty one —
     // otherwise the sidebar silently shows "no parquet files" when the real
     // problem is that macOS refused access.
-    let missing = FileTree.listing(of: fixtures.appendingPathComponent("does-not-exist"))
+    let missing = await FileTree.listing(of: fixtures.appendingPathComponent("does-not-exist"))
     expect(missing.outcome != .ok, "an unreadable directory reports why, not just an empty list")
     expect(missing.nodes.isEmpty, "a failed listing yields no nodes")
-
-    expect(FileTree.looksLikeDataset(fixtures), "a folder holding parquet files reads as a dataset")
-    expect(FileTree.looksLikeDataset(hiveDirectory), "a hive-partitioned folder reads as a dataset")
 
     // A hive layout is one table whose partitions are columns. Listing
     // `year=2024/` as a folder invites opening a slice of a dataset as though
     // it were a thing in its own right, so the partitions are withheld and the
     // folder is offered whole.
-    let hiveListing = FileTree.listing(of: hiveDirectory)
+    let hiveListing = await FileTree.listing(of: hiveDirectory)
     expectEqual(hiveListing.outcome, .hivePartitioned, "a hive folder says why it lists no sub-folders")
     expect(!hiveListing.nodes.contains { $0.isDirectory }, "partition directories are withheld")
     expect(FileTree.isHivePartitioned(hiveDirectory), "the hive layout is detected")
@@ -196,8 +208,16 @@ do {
 
     // Search must not descend into partitions either, or a hive dataset floods
     // the results with a file per partition.
-    expect(FileTree.search(root: hiveDirectory, query: "data").isEmpty,
+    expect(await FileTree.search(root: hiveDirectory, query: "data").isEmpty,
            "search does not reach into hive partitions")
+
+    // A folder that matched by name is only a result if it is something the
+    // sidebar can open — there is nothing to do with a row for a plain folder.
+    let found = await FileTree.search(root: fixtures, query: "iform")
+    expectEqual(found.map(\.name), ["uniform"], "a matching dataset folder is a search result")
+    expect(found.allSatisfy(\.isDataset), "and comes back classified, unlike a bare walk")
+    expect(await FileTree.search(root: fixtures, query: "mixed").isEmpty,
+           "a matching folder that is not a dataset is not offered")
 
     let datasetSource = DataSource.dataset(hiveDirectory)
     expect(datasetSource.readPath.hasSuffix("/**/*.parquet"), "datasets read recursively")
@@ -209,6 +229,101 @@ do {
                                  byteSize: nil, modified: nil)
     expectEqual(hiveNoteNode.dataSource, .dataset(hiveDirectory),
                 "tapping the hive-partitioned note opens the whole folder as one dataset")
+}
+
+// MARK: - Folder or dataset
+//
+// A folder is a dataset when it is hive-partitioned, or when one glob covers
+// its files without `union_by_name = true`. The second half is not a question
+// about names on disk, so it is put to DuckDB rather than guessed at — which
+// means these check the answers the reader actually gives, including where they
+// are more generous than "the schemas are identical" would be.
+
+section("Folder or dataset")
+
+do {
+    expect(await FileTree.looksLikeDataset(hiveDirectory),
+           "a hive-partitioned folder reads as a dataset, from its names alone")
+    expect(await FileTree.looksLikeDataset(uniformDirectory),
+           "so does a folder whose files agree on a schema")
+
+    // The rule that changed: holding parquet files is no longer enough. The
+    // fixtures directory holds three files with nothing in common, and a glob
+    // over it needs union_by_name — so it is a folder to browse.
+    expect(!(await FileTree.looksLikeDataset(fixtures)),
+           "a folder of unrelated parquet files is a folder, not a dataset")
+    expect(!(await FileTree.looksLikeDataset(mixedDirectory)),
+           "two files that disagree on their columns make a folder")
+
+    // Not "byte-identical schemas": the question is what the reader will accept,
+    // and DuckDB matches a glob's columns by name. Files that list the same
+    // columns in a different order glob fine, so they are one dataset.
+    expect(await FileTree.looksLikeDataset(reorderedDirectory),
+           "columns in a different order still glob, so the folder is a dataset")
+
+    // Nothing to be uniform about is not uniformity, and neither is a folder
+    // that cannot be read at all.
+    let empty = fixtures.appendingPathComponent("empty-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: empty) }
+    expect(!(await FileTree.looksLikeDataset(empty)), "an empty folder is not a dataset")
+    expect(!(await FileTree.looksLikeDataset(fixtures.appendingPathComponent("nope"))),
+           "nor is a folder that does not exist")
+
+    // A folder of folders has no files of its own to agree about. Browsing into
+    // it is the whole point of it, so it must not be badged as one table.
+    let nested = fixtures.appendingPathComponent("nested-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(
+        at: nested.appendingPathComponent("inner"), withIntermediateDirectories: true)
+    try? FileManager.default.copyItem(
+        at: smallParquet, to: nested.appendingPathComponent("inner/small.parquet"))
+    defer { try? FileManager.default.removeItem(at: nested) }
+    expect(!(await FileTree.looksLikeDataset(nested)),
+           "a folder whose parquet files are all further down stays a folder")
+
+    // A file DuckDB cannot read leaves the question unanswered, and an
+    // unanswered question is not a dataset — the badge says the folder opens as
+    // one table, so it may only appear once that has been shown.
+    let broken = fixtures.appendingPathComponent("broken-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: broken, withIntermediateDirectories: true)
+    try? FileManager.default.copyItem(at: smallParquet, to: broken.appendingPathComponent("a.parquet"))
+    try? FileManager.default.copyItem(at: corruptParquet, to: broken.appendingPathComponent("b.parquet"))
+    defer { try? FileManager.default.removeItem(at: broken) }
+    expect(!(await FileTree.looksLikeDataset(broken)),
+           "a folder holding a file that will not read is not a dataset")
+
+    // The probe reads no rows: `file_row_number` is generated by the reader and
+    // starts at zero, so the filter drops every row group before a page is
+    // touched. That is what makes it affordable to ask per folder.
+    let probe = SQLBuilder.schemaAgreement(under: uniformDirectory)
+    expect(probe.sql.contains("file_row_number = true"), "the probe asks for the generated column")
+    expect(probe.sql.contains("< 0"), "and filters it to nothing, so no data page is read")
+    expect(!probe.sql.contains("union_by_name"),
+           "and never with union_by_name, which is the option that would hide a mismatch")
+    expectEqual(probe.params, [DataSource.dataset(uniformDirectory).readPath],
+                "over the same glob opening the folder would use")
+}
+
+do {
+    // A folder whose files already have a column called `file_row_number`
+    // cannot be read with the option on at all. That refusal says nothing about
+    // whether the schemas agree, so it must not be mistaken for a mismatch.
+    let collides = fixtures.appendingPathComponent("collides-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: collides, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: collides) }
+
+    let session = try DuckDBSession(engine: .shared, label: "test-collides")
+    for (name, start) in [("a", 0), ("b", 50)] {
+        let write = """
+            COPY (SELECT i AS file_row_number, 'row-' || i AS label \
+            FROM range(\(start), \(start + 50)) t(i)) \
+            TO '\(collides.appendingPathComponent("\(name).parquet").path)' (FORMAT parquet)
+            """
+        try await session.execute(write)
+    }
+
+    expect(await FileTree.looksLikeDataset(collides),
+           "a folder of files with their own file_row_number column is still a dataset")
 }
 
 // MARK: - Sifting a drop
