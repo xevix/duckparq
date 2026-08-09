@@ -324,6 +324,57 @@ do {
 
     expect(await FileTree.looksLikeDataset(collides),
            "a folder of files with their own file_row_number column is still a dataset")
+
+    // And it is the refusal itself that has to say so, not merely the answer:
+    // the fallback probe is only reached by classifying this error, so ask
+    // DuckDB for it and put the real text to the test.
+    let probe = SQLBuilder.schemaAgreement(under: collides)
+    do {
+        _ = try await session.queryAll(probe.sql, params: probe.params, limit: 1)
+        expect(false, "the probe must refuse a folder it cannot use the option on")
+    } catch let error as DuckDBError {
+        expect(error.isRowNumberCollision,
+               "the refusal for the option's own name is read as a collision")
+    }
+}
+
+do {
+    // The other half, and the one a name test gets wrong: an ordinary schema
+    // mismatch lists the columns the read could have bound to, and the probe's
+    // own generated column is among them —
+    //
+    //     Candidate names: id, amount, file_row_number
+    //
+    // so a message merely mentioning `file_row_number` proves nothing. Read as
+    // a collision it would send every non-dataset folder through the slow
+    // fallback, which the sidebar pays for on each folder it draws.
+    let mismatch = fixtures.appendingPathComponent("mismatch-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: mismatch, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: mismatch) }
+
+    let session = try DuckDBSession(engine: .shared, label: "test-mismatch")
+    let files = [
+        ("part-0", "SELECT i AS id, i * 2 AS amount, 'row-' || i AS label FROM range(0, 50) t(i)"),
+        ("priced", "SELECT i AS id, i * 2 AS amount FROM range(0, 50) t(i)"),
+    ]
+    for (name, select) in files {
+        let path = mismatch.appendingPathComponent("\(name).parquet").path
+        try await session.execute("COPY (\(select)) TO '\(path)' (FORMAT parquet)")
+    }
+
+    let probe = SQLBuilder.schemaAgreement(under: mismatch)
+    do {
+        _ = try await session.queryAll(probe.sql, params: probe.params, limit: 1)
+        expect(false, "files that disagree on their columns must fail the probe")
+    } catch let error as DuckDBError {
+        expect(!error.isRowNumberCollision,
+               "a mismatch naming the generated column among its candidates is still a mismatch")
+        expect(error.localizedDescription.contains(DataSource.rowNumberColumn),
+               "and it does name it, which is why the name alone cannot decide this")
+    }
+
+    expect(!(await FileTree.looksLikeDataset(mismatch)),
+           "so the folder is answered from the first probe, and is not a dataset")
 }
 
 // MARK: - Sifting a drop

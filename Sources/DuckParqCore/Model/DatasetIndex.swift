@@ -103,14 +103,31 @@ public actor DatasetIndex {
 
 extension DuckDBError {
     /// The refusal DuckDB gives for `file_row_number = true` on a file that
-    /// already has a column of that name.
+    /// already has a column of that name:
+    ///
+    ///     Using file_row_number option on file with column named
+    ///     file_row_number is not supported
     ///
     /// Told apart from a schema mismatch because the two mean opposite things:
     /// a mismatch says the files disagree, this says the question was never
     /// asked. See `DataSource.rowNumberColumn` — the option takes a bool, so
     /// the name is not ours to move out of the way.
-    var isRowNumberCollision: Bool {
+    ///
+    /// Telling them apart takes more than the column's name. A mismatch lists
+    /// the columns it *could* have bound to, and the generated one is among
+    /// them — "Candidate names: id, amount, file_row_number" — so the bare name
+    /// appears in both errors. What only the refusal says is that the option
+    /// itself was the problem, and a mismatch is ruled out by its own wording
+    /// besides: two readings of the same message rather than one, because
+    /// getting this wrong costs a wasted glob on every folder that is not a
+    /// dataset.
+    public var isRowNumberCollision: Bool {
         guard case .engine(let message) = self else { return false }
-        return message.contains(DataSource.rowNumberColumn)
+        guard !message.contains(Self.schemaMismatch) else { return false }
+        return message.contains("\(DataSource.rowNumberColumn) option")
     }
+
+    /// The wording DuckDB uses when a glob's files disagree on their columns —
+    /// the failure `DatasetIndex` is asking for, and never a collision.
+    private static let schemaMismatch = "schema mismatch in glob"
 }
