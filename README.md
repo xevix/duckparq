@@ -23,7 +23,10 @@ Xcode is not required — Command Line Tools are enough (`xcode-select
 ## Adding a folder
 
 **File ▸ Add Folder…** (⌘O), the **+** in the sidebar, or a folder dragged onto
-the window. The folder joins the sidebar and stays there between launches.
+the window. The folder joins the sidebar and stays there between launches, open
+to whatever you last had open inside it — folders and datasets you expanded are
+still expanded next launch, and a tree you collapsed stays collapsed. Folders
+deleted or removed from the sidebar in the meantime are quietly forgotten.
 
 A folder in the sidebar is a view of a directory rather than a photograph of it
 taken when it was added. DuckParq watches every added folder, so a file written
