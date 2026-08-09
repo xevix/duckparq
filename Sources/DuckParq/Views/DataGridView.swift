@@ -65,7 +65,6 @@ struct DataGridView: View {
     /// Widths the user has dragged, keyed by column name. Anything absent is
     /// measured from the content.
     @State private var widthOverrides: [String: CGFloat] = [:]
-    @State private var selectedRow: Int?
     /// Whether the grid has keyboard focus, so Home/End reach it rather than
     /// whatever text field last had it.
     @FocusState private var isGridFocused: Bool
@@ -107,6 +106,10 @@ struct DataGridView: View {
 
     private var table: TableModel { app.table }
 
+    /// The highlighted row, which lives in `AppModel` because clearing it is
+    /// the sidebar's job as much as the grid's — see `AppModel.selectedGridRow`.
+    private var selectedRow: Int? { app.selectedGridRow }
+
     /// How much width an always-visible vertical scroller takes out of the
     /// scroll view's viewport.
     ///
@@ -144,7 +147,7 @@ struct DataGridView: View {
             // New shape of result: measure column widths again.
             if signature != measuredSignature {
                 widthOverrides = [:]
-                selectedRow = nil
+                app.selectedGridRow = nil
                 measuredSignature = signature
             }
             remeasure()
@@ -244,7 +247,7 @@ struct DataGridView: View {
                             )
                             .equatable()
                             .onTapGesture {
-                                selectedRow = row.id
+                                app.selectedGridRow = row.id
                                 isGridFocused = true
                             }
                             .onAppear { table.loadMoreIfNeeded(displayedIndex: row.id) }
@@ -381,7 +384,28 @@ struct DataGridView: View {
                     handlePageKey(.down)
                     return .handled
                 }
+                .onKeyPress(.upArrow) {
+                    handleArrowKey(.up)
+                    return .handled
+                }
+                .onKeyPress(.downArrow) {
+                    handleArrowKey(.down)
+                    return .handled
+                }
+                .onKeyPress(.leftArrow) {
+                    handleArrowKey(.left)
+                    return .handled
+                }
+                .onKeyPress(.rightArrow) {
+                    handleArrowKey(.right)
+                    return .handled
+                }
                 .onChange(of: table.rowsGeneration) { _, _ in landAfterCommit() }
+                // Something outside the grid has handed the keyboard back —
+                // clicking an empty part of the sidebar, which also lets go of
+                // the selected row. Both together are what put the arrows back
+                // to scrolling the grid rather than stepping through its rows.
+                .onChange(of: app.gridFocusNonce) { _, _ in isGridFocused = true }
                 .onAppear { isGridFocused = true }
             }
         }
@@ -458,6 +482,106 @@ struct DataGridView: View {
             table.loadEarlier()
             return
         }
+        scrollPosition.scrollTo(point: CGPoint(x: landing.x, y: landing.y))
+    }
+
+    // MARK: - Arrows
+
+    /// An arrow press, which means one of two things depending on whether a row
+    /// is selected.
+    ///
+    /// Nothing selected: the grid is something you are looking at, and the
+    /// arrows move the view over it — a row at a time down, a nudge at a time
+    /// across.
+    ///
+    /// A row selected: the grid is a list, and up and down move through it the
+    /// way they move through any list on the platform. Left and right still
+    /// scroll, because a selected row does not make the columns any narrower —
+    /// on a wide file the selection is the thing you want to *keep* while
+    /// looking along it.
+    ///
+    /// Handled rather than passed on either way. A scroll view of its own accord
+    /// scrolls by an amount unrelated to a row, and would do it while the grid
+    /// was also moving a selection.
+    private func handleArrowKey(_ direction: GridScroll.ArrowDirection) {
+        switch direction {
+        case .up where selectedRow != nil:
+            moveSelection(.up)
+        case .down where selectedRow != nil:
+            moveSelection(.down)
+        default:
+            scrollByArrow(direction)
+        }
+    }
+
+    /// Move the view by one arrow press.
+    private func scrollByArrow(_ direction: GridScroll.ArrowDirection) {
+        let landing = GridScroll.arrow(
+            direction,
+            fromY: scrollY.distanceFromTop,
+            x: scrollX,
+            rowHeight: Self.rowHeight
+        )
+        // The same case Page Up has, and for the same reason: pressed against
+        // the top of a window that does not begin at row 0 there is nothing
+        // above the viewport to move into, and an offset already at zero has no
+        // smaller value with which to ask the geometry observer for earlier
+        // rows. `loadEarlier()` decides for itself whether there are any.
+        if direction == .up, landing.y >= scrollY.distanceFromTop {
+            table.loadEarlier()
+            return
+        }
+        scrollPosition.scrollTo(point: CGPoint(x: landing.x, y: landing.y))
+    }
+
+    /// Step the selection one row, bringing it into view if it has left.
+    private func moveSelection(_ step: GridSelection.Step) {
+        guard let selected = selectedRow else { return }
+        let move = GridSelection.move(
+            step,
+            from: selected,
+            windowStart: table.windowStart,
+            loadedRows: table.rows.count
+        )
+        GridTrace.log("""
+            ARROW \(step == .up ? "UP" : "DOWN"): row \(selected) -> \(move) \
+            (windowStart \(table.windowStart) rows \(table.rows.count))
+            """, dedupe: false)
+
+        switch move {
+        case .loadEarlier:
+            table.loadEarlier()
+        case .stay:
+            // Only reachable at an end of the loaded window. At the far end that
+            // is not the end of the result, so the press is also the moment to
+            // ask for the next page — the model ignores this unless the
+            // selection really is near enough to the end to need one.
+            table.loadMoreIfNeeded(displayedIndex: selected)
+        case .select(let row):
+            app.selectedGridRow = row
+            table.loadMoreIfNeeded(displayedIndex: row)
+            reveal(row: row)
+        }
+    }
+
+    /// Scroll the newly selected row back inside the viewport, if the step took
+    /// it out.
+    ///
+    /// Not animated: a held arrow key repeats faster than an animation finishes,
+    /// and each press reads the offset the last one left — mid-animation that is
+    /// a partway value, so the rows would move by less the harder the key was
+    /// leaned on. `scrollY` is written here for the same reason, rather than
+    /// waiting for the geometry observer a frame later.
+    private func reveal(row: Int) {
+        guard let landing = GridScroll.reveal(
+            rowAt: row,
+            windowStart: table.windowStart,
+            rowHeight: Self.rowHeight,
+            distanceFromTop: scrollY.distanceFromTop,
+            viewportHeight: scrollY.viewportHeight,
+            keepingX: scrollX
+        ) else { return }
+        scrollY.distanceFromTop = landing.y
         scrollPosition.scrollTo(point: CGPoint(x: landing.x, y: landing.y))
     }
 

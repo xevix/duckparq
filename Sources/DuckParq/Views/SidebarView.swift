@@ -45,6 +45,17 @@ struct SidebarView: View {
                     }
                 }
                 .listStyle(.sidebar)
+                // Clicking past the end of the rows drops the grid's selected
+                // row, which is how the arrow keys go back to scrolling the grid
+                // instead of stepping through it. Which is also why that
+                // selection lives in `AppModel`: the sidebar has no other way to
+                // reach into the grid.
+                //
+                // A watcher rather than an `.onTapGesture` on this List, which
+                // is the obvious spelling and is silent — see `SidebarHit` for
+                // why a SwiftUI gesture never hears about a click on a list's
+                // own background.
+                .background { EmptyAreaClicks { app.releaseGridRow() } }
                 // Keyed on the nonce, not the route: revealing the same file
                 // twice has to scroll twice.
                 .onChange(of: app.revealNonce) { _, _ in
@@ -137,6 +148,102 @@ struct SidebarView: View {
                 if Task.isCancelled { return }
                 if app.isDirectoryListed(url) { break }
             }
+        }
+    }
+}
+
+/// Calls `action` when a click lands on the sidebar list but on none of its
+/// rows.
+///
+/// Nothing is drawn and nothing is intercepted. The view exists to be somewhere
+/// in the sidebar's hierarchy — which is how the list beside it is found — and
+/// the clicks are read from a local event monitor, which sees a mouse-down
+/// before it is dispatched and hands it straight on. Watching rather than
+/// catching is the point: the list must go on answering clicks exactly as it
+/// did, and this must hear about the ones it answers by doing nothing.
+private struct EmptyAreaClicks: NSViewRepresentable {
+    let action: () -> Void
+
+    func makeNSView(context: Context) -> NSView { context.coordinator.anchor }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.action = action
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    /// Where the monitor is taken down. A `deinit` cannot: it is nonisolated,
+    /// and the token `addLocalMonitorForEvents` hands back is not `Sendable`, so
+    /// reaching it from one is the thing Swift 6 will not allow. This runs on
+    /// the main actor, which is where the monitor was made.
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.stop()
+    }
+
+    @MainActor
+    final class Coordinator {
+        /// Invisible to the mouse as well as to the eye: `hitTest` returning nil
+        /// keeps a view that exists only as a landmark from ever being the
+        /// answer to "what was clicked".
+        final class Anchor: NSView {
+            override func hitTest(_ point: NSPoint) -> NSView? { nil }
+        }
+
+        let anchor = Anchor()
+        var action: () -> Void = {}
+        private var monitor: Any?
+
+        init() {
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+                self?.handle(event)
+                return event
+            }
+        }
+
+        func stop() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+        }
+
+        private func handle(_ event: NSEvent) {
+            // The monitor is the app's, not the window's, so clicks in another
+            // of its windows are not this sidebar's business.
+            guard let window = anchor.window, event.window === window,
+                  let rows = Self.list(near: anchor)?.documentView as? NSTableView
+            else { return }
+            let point = rows.convert(event.locationInWindow, from: nil)
+            guard SidebarHit.isEmptyArea(point, in: rows) else { return }
+            // After the click rather than during it. A monitor sees a mouse-down
+            // before it is dispatched, and dispatching it is what makes the
+            // clicked list the first responder — so a grid asked for the
+            // keyboard here would have it taken away again a moment later, by
+            // the very click that asked. The main queue cannot run this until
+            // the event has been delivered, which is exactly the wait wanted.
+            DispatchQueue.main.async { [action] in action() }
+        }
+
+        /// The sidebar's list, found from the anchor beside it.
+        ///
+        /// Searched for rather than held, because SwiftUI owns that view and
+        /// rebuilds it as it likes. The walk starts at the anchor and widens a
+        /// step at a time, so the list it finds is the nearest one — the app has
+        /// others, and the schema inspector's must never be mistaken for this.
+        private static func list(near anchor: NSView) -> NSScrollView? {
+            var ancestor = anchor.superview
+            for _ in 0..<4 {
+                guard let current = ancestor else { return nil }
+                if let scroll = scrollView(in: current) { return scroll }
+                ancestor = current.superview
+            }
+            return nil
+        }
+
+        private static func scrollView(in view: NSView) -> NSScrollView? {
+            if let scroll = view as? NSScrollView { return scroll }
+            for subview in view.subviews {
+                if let found = scrollView(in: subview) { return found }
+            }
+            return nil
         }
     }
 }

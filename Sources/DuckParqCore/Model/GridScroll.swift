@@ -111,6 +111,98 @@ public enum GridScroll {
         }
     }
 
+    /// Which way an arrow key moves the viewport.
+    ///
+    /// Four cases where a page has two, because an arrow is the only key the
+    /// grid answers that moves it *sideways*. Home, End, Page Up and Page Down
+    /// all say something about the rows and nothing about the columns; the left
+    /// and right arrows say the opposite, and are how a file far wider than the
+    /// window is walked across without a trackpad.
+    public enum ArrowDirection: Sendable, Equatable {
+        case up
+        case down
+        case left
+        case right
+    }
+
+    /// How far one left or right arrow press moves the columns.
+    ///
+    /// A distance rather than a column, because the columns here are of wildly
+    /// different widths: a step of one column would cross half a screen on a
+    /// wide text column and barely register on a narrow integer one, so the same
+    /// key would move by an amount the user cannot predict. Roughly six
+    /// characters of the 11pt monospaced cell font — small enough to aim with,
+    /// large enough that holding the key gets somewhere.
+    public static let arrowColumnStep: CGFloat = 40
+
+    /// Where the viewport goes for one arrow-key press.
+    ///
+    /// This is the grid *without* a selected row, where the arrows are a way to
+    /// move the view rather than a way to move through the rows. Vertically the
+    /// step is one row — the smallest move that leaves the grid on a row
+    /// boundary, so a column of values does not end up sliced in half across the
+    /// top edge.
+    ///
+    /// Clamped at zero on both axes and unclamped at the far ends, which is the
+    /// same bargain `page` makes: the near edge is a bound this can be sure of,
+    /// while the far one belongs to the scroll view, which measures it against
+    /// the rows and columns as actually laid out rather than as they were when
+    /// the key was pressed.
+    public static func arrow(
+        _ direction: ArrowDirection,
+        fromY y: CGFloat,
+        x: CGFloat,
+        rowHeight: CGFloat
+    ) -> Landing {
+        switch direction {
+        case .up:
+            return Landing(x: x, y: max(y - rowHeight, 0))
+        case .down:
+            return Landing(x: x, y: y + rowHeight)
+        case .left:
+            return Landing(x: max(x - arrowColumnStep, 0), y: y)
+        case .right:
+            return Landing(x: x + arrowColumnStep, y: y)
+        }
+    }
+
+    /// Where the viewport must go for the row at `index` to be wholly on screen,
+    /// or nil if it already is.
+    ///
+    /// Nil rather than the current offset, and the difference matters: arrowing
+    /// through rows in the middle of a screenful should leave the view perfectly
+    /// still, and a scroll "to where it already is" is not still — it cancels a
+    /// momentum scroll and fights any animation in flight. So the answer to
+    /// "does this need scrolling" is a value, not a comparison the caller has to
+    /// make afterward.
+    ///
+    /// `index` is a row id — an offset into the whole result — so it is measured
+    /// from `windowStart` rather than assumed to be a position in the loaded
+    /// rows.
+    ///
+    /// The row is brought just inside the edge it fell outside, rather than
+    /// centred: a selection moving down one row at a time should scroll one row
+    /// at a time, not jump half a screen every time it reaches the bottom.
+    public static func reveal(
+        rowAt index: Int,
+        windowStart: Int,
+        rowHeight: CGFloat,
+        distanceFromTop: CGFloat,
+        viewportHeight: CGFloat,
+        keepingX x: CGFloat
+    ) -> Landing? {
+        let top = max(CGFloat(index - windowStart) * rowHeight, 0)
+        if top < distanceFromTop { return Landing(x: x, y: top) }
+        // A viewport that cannot hold a whole row — including the zero-height
+        // one the grid reports before the scroll view has been laid out — has no
+        // "just inside the bottom edge" to land on, so the row's own top is the
+        // only sensible place to put it.
+        guard viewportHeight >= rowHeight else { return Landing(x: x, y: top) }
+        let bottom = top + rowHeight
+        guard bottom > distanceFromTop + viewportHeight else { return nil }
+        return Landing(x: x, y: bottom - viewportHeight)
+    }
+
     /// Where the viewport must move to hold its rows still when `prepended`
     /// rows are spliced in above it.
     ///

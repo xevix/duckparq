@@ -35,6 +35,21 @@ final class AppModel {
         }
     }
     var selection: FileNode?
+    /// The id of the highlighted row in the grid, if any.
+    ///
+    /// Here rather than in the grid's own `@State` because it is what the arrow
+    /// keys mean: with a row selected they step through the rows, and with
+    /// nothing selected they scroll. Clicking an empty part of the sidebar is
+    /// how you get back to the second of those, and the sidebar cannot reach
+    /// state that lives inside the grid.
+    var selectedGridRow: Int?
+    /// Changes whenever the grid should take the keyboard back.
+    ///
+    /// A nonce rather than a flag, for the reason `revealNonce` is one: asking
+    /// twice has to count twice. The second click on an empty part of the
+    /// sidebar hands the keyboard over exactly as the first did, and a flag that
+    /// was already true would say nothing had happened.
+    private(set) var gridFocusNonce = 0
     var searchQuery: String = ""
 
     /// Folders the sidebar is showing the inside of. Held here rather than in
@@ -466,6 +481,18 @@ final class AppModel {
     }
 
     // MARK: - Selection
+
+    /// Let go of the grid's highlighted row and hand the grid the keyboard.
+    ///
+    /// Both halves, because one without the other is not what the click means.
+    /// Dropping the row is what puts the arrows back to scrolling rather than
+    /// stepping through rows; leaving the keyboard with the list that was
+    /// clicked means the arrows do nothing at all, so the grid would be back in
+    /// the state the click asked for and unable to show it.
+    func releaseGridRow() {
+        selectedGridRow = nil
+        gridFocusNonce += 1
+    }
 
     func select(_ node: FileNode) {
         // Clicking the row that is already selected changes nothing on screen,

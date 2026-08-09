@@ -1,3 +1,4 @@
+import AppKit
 import DuckParqCore
 import Foundation
 
@@ -32,6 +33,15 @@ func expectEqual<T: Equatable>(_ actual: T, _ expected: T, _ description: String
 
 func section(_ name: String) {
     print("\n— \(name)")
+}
+
+/// Enough of a data source for a table view to have three rows to be clicked on
+/// or missed — see the sidebar hit tests.
+@MainActor
+final class ThreeRows: NSObject, NSTableViewDataSource {
+    static let shared = ThreeRows()
+
+    func numberOfRows(in tableView: NSTableView) -> Int { 3 }
 }
 
 let packageRoot = URL(fileURLWithPath: #filePath)
@@ -2409,6 +2419,185 @@ do {
                                 rowHeight: row, keepingX: 0).y,
                 10_480,
                 "Page Down asks past the end and lets the scroll view stop it at the real one")
+}
+
+do {
+    // The arrows with no row selected: a way to move the view, and the only key
+    // the grid answers that moves it sideways. Vertically the step is one row,
+    // so the top edge always lands on a row boundary rather than slicing one.
+    let columns: CGFloat = 268
+    let row: CGFloat = 20
+    let step = GridScroll.arrowColumnStep
+
+    expectEqual(GridScroll.arrow(.down, fromY: 100, x: columns, rowHeight: row),
+                GridScroll.Landing(x: columns, y: 120),
+                "the down arrow moves one row down and leaves the columns where they were")
+    expectEqual(GridScroll.arrow(.up, fromY: 100, x: columns, rowHeight: row),
+                GridScroll.Landing(x: columns, y: 80),
+                "and the up arrow moves one row back")
+    expectEqual(GridScroll.arrow(.up, fromY: 0, x: columns, rowHeight: row).y, 0,
+                "a viewport already at the top has nowhere further up to go -- which is what tells the grid to ask for earlier rows instead")
+
+    expectEqual(GridScroll.arrow(.right, fromY: 100, x: columns, rowHeight: row),
+                GridScroll.Landing(x: columns + step, y: 100),
+                "the right arrow moves the columns and leaves the rows alone")
+    expectEqual(GridScroll.arrow(.left, fromY: 100, x: columns, rowHeight: row),
+                GridScroll.Landing(x: columns - step, y: 100),
+                "and the left arrow brings them back")
+    expectEqual(GridScroll.arrow(.left, fromY: 100, x: 10, rowHeight: row).x, 0,
+                "stopping at the first column rather than to the left of it")
+}
+
+do {
+    // Bringing a stepped-to row back into view. Nil is the answer worth having:
+    // arrowing through the middle of a screenful must leave the view perfectly
+    // still, and "scroll to where you already are" is not still.
+    let columns: CGFloat = 268
+    let row: CGFloat = 20
+    let viewport: CGFloat = 600
+
+    // A window starting at row 1_000, scrolled 200 points into it: rows 1_010
+    // through 1_039 are on screen.
+    let start = 1_000
+    let top: CGFloat = 200
+
+    expect(GridScroll.reveal(rowAt: 1_020, windowStart: start, rowHeight: row,
+                             distanceFromTop: top, viewportHeight: viewport,
+                             keepingX: columns) == nil,
+           "a row in the middle of the viewport needs no scrolling at all")
+    expect(GridScroll.reveal(rowAt: 1_010, windowStart: start, rowHeight: row,
+                             distanceFromTop: top, viewportHeight: viewport,
+                             keepingX: columns) == nil,
+           "nor does the first row fully on screen")
+    expect(GridScroll.reveal(rowAt: 1_039, windowStart: start, rowHeight: row,
+                             distanceFromTop: top, viewportHeight: viewport,
+                             keepingX: columns) == nil,
+           "nor the last one")
+
+    // Just off an edge, brought just inside it: a selection moving a row at a
+    // time should scroll a row at a time, not jump half a screen each time it
+    // reaches the bottom.
+    expectEqual(GridScroll.reveal(rowAt: 1_009, windowStart: start, rowHeight: row,
+                                  distanceFromTop: top, viewportHeight: viewport,
+                                  keepingX: columns),
+                GridScroll.Landing(x: columns, y: 180),
+                "a step above the top edge scrolls up by exactly one row")
+    expectEqual(GridScroll.reveal(rowAt: 1_040, windowStart: start, rowHeight: row,
+                                  distanceFromTop: top, viewportHeight: viewport,
+                                  keepingX: columns),
+                GridScroll.Landing(x: columns, y: 220),
+                "and a step below the bottom edge scrolls down by exactly one")
+
+    // The row id is an offset into the whole result, so the window it sits in
+    // has to be subtracted -- a window anchored at row 1_000 draws its own first
+    // row at y = 0, not at y = 20_000.
+    expectEqual(GridScroll.reveal(rowAt: start, windowStart: start, rowHeight: row,
+                                  distanceFromTop: top, viewportHeight: viewport,
+                                  keepingX: columns),
+                GridScroll.Landing(x: columns, y: 0),
+                "the first row of a window anchored deep in the result is at the top of the content")
+    expectEqual(GridScroll.reveal(rowAt: 500, windowStart: start, rowHeight: row,
+                                  distanceFromTop: top, viewportHeight: viewport,
+                                  keepingX: columns)?.y,
+                0,
+                "and a row from before the window cannot ask to be scrolled above it")
+
+    // Before the scroll view has been laid out the grid reports a viewport of
+    // zero, which has no inside of a bottom edge to land against.
+    expectEqual(GridScroll.reveal(rowAt: 1_030, windowStart: start, rowHeight: row,
+                                  distanceFromTop: top, viewportHeight: 0,
+                                  keepingX: columns),
+                GridScroll.Landing(x: columns, y: 600),
+                "a viewport too short to hold a row puts that row's top at the top")
+}
+
+// MARK: - Grid selection
+
+section("Grid selection")
+
+do {
+    // With a row selected the grid is a list and the arrows step through it.
+    // The ends they run into are the ends of the *loaded window*, which are not
+    // the ends of the result -- so one of them is a request for rows rather than
+    // a refusal.
+    let start = 1_000
+    let loaded = 500  // rows 1_000 through 1_499
+
+    expectEqual(GridSelection.move(.down, from: 1_200, windowStart: start, loadedRows: loaded),
+                .select(1_201),
+                "the down arrow takes the next row")
+    expectEqual(GridSelection.move(.up, from: 1_200, windowStart: start, loadedRows: loaded),
+                .select(1_199),
+                "and the up arrow the previous one")
+
+    expectEqual(GridSelection.move(.up, from: start, windowStart: start, loadedRows: loaded),
+                .loadEarlier,
+                "stepping up off the front of a window that starts partway through the result asks for the rows above it")
+    expectEqual(GridSelection.move(.up, from: 0, windowStart: 0, loadedRows: loaded),
+                .stay,
+                "but the first row of the result itself has nothing above it")
+    expectEqual(GridSelection.move(.down, from: 1_499, windowStart: start, loadedRows: loaded),
+                .stay,
+                "and stepping down off the end waits for the next page rather than guessing at a row that is not there")
+
+    // A window can be paged out from under a selection -- jumping to the end of
+    // three billion rows leaves one behind at row 3. The press still means "move
+    // from here", so the nearest loaded row is where "here" now is.
+    expectEqual(GridSelection.move(.down, from: 3, windowStart: start, loadedRows: loaded),
+                .select(start),
+                "a selection left behind above the window lands on its first row")
+    expectEqual(GridSelection.move(.up, from: 9_000, windowStart: start, loadedRows: loaded),
+                .select(1_499),
+                "and one left behind below it lands on its last")
+
+    expectEqual(GridSelection.move(.down, from: 0, windowStart: 0, loadedRows: 0),
+                .stay,
+                "an empty result has no row to move to")
+    expectEqual(GridSelection.move(.down, from: 0, windowStart: 0, loadedRows: 1),
+                .stay,
+                "and a result of one row is already on the only row there is")
+}
+
+do {
+    // Which sidebar clicks let go of the selected row: the ones landing on the
+    // list but on none of its rows. Against a real table view, because the whole
+    // difficulty is that the cheaper ways of asking are wrong -- see
+    // `SidebarHit`, where three of them are written out.
+    //
+    // A table three rows tall in a view far taller than they are, which is the
+    // shape SwiftUI actually produces: the document view fills the viewport
+    // whether or not there are rows to fill it, so the empty area below the rows
+    // is *inside* it.
+    let rows = NSTableView()
+    rows.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name")))
+    rows.rowHeight = 20
+    rows.dataSource = ThreeRows.shared
+    // In a scroll view, because that is what produces the shape this is about: a
+    // table view standing on its own shrinks to fit its rows, and one in a
+    // viewport stretches to fill it. Only the second has an empty area at all.
+    let viewport = NSScrollView(frame: NSRect(x: 0, y: 0, width: 260, height: 400))
+    viewport.documentView = rows
+    rows.reloadData()
+    viewport.layoutSubtreeIfNeeded()
+
+    expectEqual(rows.numberOfRows, 3, "the fixture has the rows it says it has")
+    expect(rows.bounds.height > rows.rect(ofRow: 2).maxY + 100,
+           "and stretches well past them, the way SwiftUI's own does")
+    let lastRow = rows.rect(ofRow: 2)
+    expect(SidebarHit.isEmptyArea(CGPoint(x: 130, y: lastRow.minY - 20), in: rows) == false,
+           "a click on a row is a click on a row")
+    expect(SidebarHit.isEmptyArea(CGPoint(x: 130, y: lastRow.midY), in: rows) == false,
+           "and so is one on the last of them")
+    expect(SidebarHit.isEmptyArea(CGPoint(x: 130, y: lastRow.maxY + 100), in: rows),
+           "past the end of them is the empty area -- the click that lets go of the selected row")
+
+    // Everywhere outside the rows' own view means its own thing: the strip the
+    // list scrolls under the toolbar above it, and the grid beside it, where a
+    // click is how a row gets selected in the first place.
+    expect(SidebarHit.isEmptyArea(CGPoint(x: 130, y: -20), in: rows) == false,
+           "the toolbar the list scrolls under is not an empty area of the list")
+    expect(SidebarHit.isEmptyArea(CGPoint(x: 600, y: 200), in: rows) == false,
+           "and neither is anything beside the sidebar")
 }
 
 // MARK: - TableModel (the logic the UI drives)
