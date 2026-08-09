@@ -451,6 +451,68 @@ do {
            "and that URL is in fact what the listing produced")
 }
 
+// MARK: - Remembering which folders are open
+//
+// The sidebar's open folders outlive the session, so the set has to survive a
+// round trip through defaults — and come back pruned of everything a restarted
+// app can no longer draw.
+
+section("Sidebar expansion")
+
+do {
+    // A tree on disk, because what may be restored is decided by what is still
+    // there: hive/ and uniform/ are datasets, and both expand like any folder.
+    let root = fixtures
+    let hive = root.appendingPathComponent("hive")
+    let uniform = root.appendingPathComponent("uniform")
+
+    let saved = SidebarExpansion.encoded([root, hive, uniform])
+    expectEqual(Set(saved), Set([root.path, hive.path, uniform.path]),
+                "the open folders are saved as plain paths")
+    expectEqual(SidebarExpansion.decoded(saved, under: [root]), Set([root, hive, uniform]),
+                "and come back as the same folders, datasets included")
+
+    // The saved list is written on every toggle, so it has to be stable —
+    // otherwise identical state churns defaults on each keystroke of the tree.
+    expectEqual(SidebarExpansion.encoded([uniform, root, hive]), saved,
+                "the same set always saves in the same order")
+
+    // Everything below is a reason an entry cannot be drawn any more, and so
+    // has no business being restored.
+    expect(!SidebarExpansion.decoded([root.appendingPathComponent("gone").path], under: [root])
+        .contains(root.appendingPathComponent("gone")),
+           "a folder deleted since the last launch is not restored")
+    expect(SidebarExpansion.decoded([smallParquet.path], under: [root]).isEmpty,
+           "nor is a path that is now a file")
+    expect(SidebarExpansion.decoded([hive.path], under: [uniform]).isEmpty,
+           "nor one under no added folder — the row has nowhere to be")
+    expect(SidebarExpansion.decoded([hive.path], under: []).isEmpty,
+           "with every folder removed, nothing is left open")
+
+    // An added folder reached by a spelling of its own: the sidebar's rows are
+    // built by appending onto the root as the user chose it, so a restored URL
+    // that spells the same folder differently matches no row at all.
+    let slashed = URL(fileURLWithPath: root.path, isDirectory: true)
+    let restored = SidebarExpansion.decoded([hive.path], under: [slashed])
+    expectEqual(restored, Set([slashed.appendingPathComponent("hive")]),
+                "a restored folder is respelled onto the added folder holding it")
+    expect(restored.first.map { FileTree.children(of: slashed).map(\.url).contains($0) } == true,
+           "and so equals the URL the directory listing produces")
+
+    // Two saved spellings of one folder are one folder, so the cap counts rows
+    // rather than strings.
+    expectEqual(SidebarExpansion.decoded([hive.path, hive.path + "/"], under: [root]).count, 1,
+                "one folder saved twice is restored once")
+
+    // Expand All opens thousands at once; defaults should not grow without
+    // bound for a state whose whole job is to look like where you left off.
+    let many = (0..<(SidebarExpansion.limit + 500)).map { root.appendingPathComponent("d\($0)") }
+    let capped = SidebarExpansion.encoded(Set(many).union([root]))
+    expectEqual(capped.count, SidebarExpansion.limit, "the saved list is capped")
+    expectEqual(capped.first, root.path,
+                "and keeps the shallowest folders — the top of the tree is what is on screen")
+}
+
 // MARK: - Watching the added folders
 //
 // A folder in the sidebar is a view of a directory, not a photograph of it. The
