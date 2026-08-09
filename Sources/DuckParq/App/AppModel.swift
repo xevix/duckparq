@@ -16,6 +16,8 @@ final class AppModel {
         static let roots = "dev.xevix.duckparq.roots"
         static let formatOnSave = "dev.xevix.duckparq.formatOnSave"
         static let recentlyOpened = "dev.xevix.duckparq.recentlyOpened"
+        static let expandedFolders = "dev.xevix.duckparq.expandedFolders"
+        static let showsRecentlyOpened = "dev.xevix.duckparq.showsRecentlyOpened"
     }
 
     let engine: DuckDBEngine
@@ -55,7 +57,13 @@ final class AppModel {
     /// Folders the sidebar is showing the inside of. Held here rather than in
     /// each row's `@State` so Collapse All and Expand All have something to act
     /// on — per-row state is invisible to anything but that row.
-    var expandedFolders: Set<URL> = []
+    ///
+    /// Saved on every change, so quitting with a tree opened to the folder you
+    /// were working in reopens to it — see `SidebarExpansion`, which owns the
+    /// form it is saved in and the pruning it gets on the way back.
+    var expandedFolders: Set<URL> = [] {
+        didSet { persistExpansion() }
+    }
     /// True while `expandAll()` is still walking the tree.
     private(set) var isExpandingAll = false
 
@@ -68,7 +76,14 @@ final class AppModel {
     private(set) var recentlyOpened: [URL] = [] {
         didSet { persistRecentlyOpened() }
     }
-    var showsRecentlyOpened = true
+    /// Whether the Recently Opened section is showing its rows. Saved for the
+    /// same reason the tree's folders are: Collapse All shuts it too, and a
+    /// section that reopened itself on every launch would not stay shut.
+    var showsRecentlyOpened = true {
+        didSet {
+            UserDefaults.standard.set(showsRecentlyOpened, forKey: Defaults.showsRecentlyOpened)
+        }
+    }
 
     private static let recentlyOpenedLimit = 20
 
@@ -162,6 +177,9 @@ final class AppModel {
         )
 
         loadRoots()
+        // After the roots, which are what an expanded folder has to be found
+        // under before it is worth restoring.
+        loadExpansion()
         loadRecentlyOpened()
         refreshSavedQueries()
 
@@ -182,9 +200,6 @@ final class AppModel {
         let paths = UserDefaults.standard.stringArray(forKey: Defaults.roots) ?? []
         roots = paths.map { URL(fileURLWithPath: $0) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
-        // A folder you just added should show its contents; nested folders stay
-        // shut until asked for, which is what keeps adding a big tree instant.
-        expandedFolders.formUnion(roots)
     }
 
     private func persistRoots() {
@@ -405,6 +420,34 @@ final class AppModel {
 
     // MARK: - Sidebar expansion
 
+    /// Put the tree back the way it was left.
+    ///
+    /// Nothing saved means a first launch — or an upgrade from a build that did
+    /// not remember — and there the old rule still applies: a folder in the
+    /// sidebar shows its contents, while nested folders stay shut until asked
+    /// for, which is what keeps adding a big tree instant.
+    ///
+    /// An *empty* saved list is not that: it is a tree somebody collapsed, and
+    /// it has to survive the quit, so the two are told apart by whether the key
+    /// is there at all.
+    private func loadExpansion() {
+        let defaults = UserDefaults.standard
+        if let paths = defaults.stringArray(forKey: Defaults.expandedFolders) {
+            expandedFolders = SidebarExpansion.decoded(paths, under: roots)
+        } else {
+            expandedFolders = Set(roots)
+        }
+        if let saved = defaults.object(forKey: Defaults.showsRecentlyOpened) as? Bool {
+            showsRecentlyOpened = saved
+        }
+    }
+
+    private func persistExpansion() {
+        UserDefaults.standard.set(
+            SidebarExpansion.encoded(expandedFolders), forKey: Defaults.expandedFolders
+        )
+    }
+
     func isExpanded(_ url: URL) -> Bool { expandedFolders.contains(url) }
 
     func setExpanded(_ url: URL, _ expanded: Bool) {
@@ -473,6 +516,10 @@ final class AppModel {
 
     func removeRoot(_ url: URL) {
         roots.removeAll { $0 == url }
+        // The folders below it can no longer be drawn, so remembering them open
+        // would only leave Collapse All lit with nothing to collapse — and would
+        // keep saying so on every launch, since the set outlives the session now.
+        expandedFolders = expandedFolders.filter { FileTree.chain(to: $0, under: url) == nil }
         listings.forget(under: url)
         if let selection, selection.url.path.hasPrefix(url.path) {
             self.selection = nil
