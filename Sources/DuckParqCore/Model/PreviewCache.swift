@@ -93,11 +93,20 @@ public struct CachedStats: Sendable {
     public let fileSummary: RowBatch?
     public let columnStatistics: RowBatch?
     public let keyValues: RowBatch?
+    /// How the source is partitioned, and nil for the sources — single files,
+    /// plain folders — that are not partitioned at all.
+    public let hiveSummary: HiveSummary?
 
-    public init(fileSummary: RowBatch?, columnStatistics: RowBatch?, keyValues: RowBatch?) {
+    public init(
+        fileSummary: RowBatch?,
+        columnStatistics: RowBatch?,
+        keyValues: RowBatch?,
+        hiveSummary: HiveSummary? = nil
+    ) {
         self.fileSummary = fileSummary
         self.columnStatistics = columnStatistics
         self.keyValues = keyValues
+        self.hiveSummary = hiveSummary
     }
 }
 

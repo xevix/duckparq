@@ -8,6 +8,7 @@ struct SchemaInspectorView: View {
     @State private var fileMetadata: RowBatch?
     @State private var columnMetadata: RowBatch?
     @State private var keyValueMetadata: RowBatch?
+    @State private var hiveSummary: HiveSummary?
     @State private var loadError: String?
     @State private var isLoading = false
     /// Set a second into a load. A dataset of many files takes long enough to
@@ -72,6 +73,7 @@ struct SchemaInspectorView: View {
                 }
 
                 schemaSection
+                hiveSection
                 fileSection
                 columnStatsSection
                 keyValueSection
@@ -115,6 +117,43 @@ struct SchemaInspectorView: View {
         } header: {
             sectionHeader("Schema", subtitle: "\(app.table.columns.count) columns")
         }
+    }
+
+    /// How a hive dataset is divided up, between the columns it has and the
+    /// files it is made of — which is where the partition keys sit, being both.
+    ///
+    /// The keys are already in the schema above as ordinary columns, because
+    /// that is how `hive_partitioning` presents them; what the schema cannot
+    /// say is which of them are keys, in what order they nest, or how far each
+    /// one divides the dataset. Laid out like the schema rows — name left,
+    /// count right — so the two lists read as one.
+    @ViewBuilder
+    private var hiveSection: some View {
+        if let hiveSummary, !hiveSummary.keys.isEmpty {
+            Section {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(hiveSummary.keys, id: \.name) { key in
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text(key.name)
+                                .font(.system(size: 11, design: .monospaced))
+                            Spacer(minLength: 8)
+                            Text(distinctValueLabel(key.distinctValues))
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Divider().padding(.vertical, 2)
+                    metadataRow("Total partitions", hiveSummary.partitionCount.formatted())
+                }
+            } header: {
+                sectionHeader("Hive Schema", subtitle: "outermost key first")
+            }
+        }
+    }
+
+    /// "263 values", so a number beside a key cannot be read as its row count.
+    private func distinctValueLabel(_ count: Int) -> String {
+        "\(count.formatted()) \(count == 1 ? "value" : "values")"
     }
 
     @ViewBuilder
@@ -284,6 +323,7 @@ struct SchemaInspectorView: View {
         fileMetadata = nil
         columnMetadata = nil
         keyValueMetadata = nil
+        hiveSummary = nil
         deferredColumnStats = false
 
         showsProgress = false
@@ -306,14 +346,17 @@ struct SchemaInspectorView: View {
             fileMetadata = cached.fileSummary
             columnMetadata = cached.columnStatistics
             keyValueMetadata = cached.keyValues
+            hiveSummary = cached.hiveSummary
             deferredColumnStats = cached.columnStatistics == nil
             return
         }
 
-        // The cheap pair, concurrently.
+        // The cheap ones, concurrently. The hive summary is the cheapest of the
+        // three — a directory listing, where the other two open footers.
         async let file: Void = loadFileMetadata(source)
         async let keyValues: Void = loadKeyValueMetadata(source)
-        _ = await (file, keyValues)
+        async let hive: Void = loadHiveSummary(source)
+        _ = await (file, keyValues, hive)
 
         if rowGroupCount > Self.automaticRowGroupLimit {
             // Reading every row group's statistics here would cost more than
@@ -343,7 +386,8 @@ struct SchemaInspectorView: View {
             CachedStats(
                 fileSummary: fileMetadata,
                 columnStatistics: columnMetadata,
-                keyValues: keyValueMetadata
+                keyValues: keyValueMetadata,
+                hiveSummary: hiveSummary
             ),
             for: fingerprint
         )
@@ -370,6 +414,14 @@ struct SchemaInspectorView: View {
 
     private func loadKeyValueMetadata(_ source: DataSource) async {
         do { keyValueMetadata = try await app.probe.keyValueMetadata(of: source) } catch { record(error) }
+    }
+
+    /// A source that is not a hive dataset simply has no section, so a failure
+    /// here is not reported: it says nothing about the file the panel is
+    /// describing, and the panel would look broken over a question the user
+    /// never asked.
+    private func loadHiveSummary(_ source: DataSource) async {
+        hiveSummary = try? await app.probe.hiveSummary(of: source)
     }
 
     /// First failure wins. Three concurrent reads of the same broken file would

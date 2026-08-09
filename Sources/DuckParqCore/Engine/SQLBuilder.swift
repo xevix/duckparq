@@ -564,6 +564,16 @@ public enum SQLBuilder {
         return BoundSQL(sql: sql, params: [source.readPath])
     }
 
+    /// The paths of the files the source globs, and nothing else.
+    ///
+    /// `glob` is a directory listing: it opens no file and reads no footer, so
+    /// this is the cheapest question that can be asked about a dataset. It is
+    /// enough for `HiveSummary`, whose every answer is written in the directory
+    /// names the paths are made of.
+    public static func fileNames(source: DataSource) -> BoundSQL {
+        BoundSQL(sql: "SELECT file FROM glob($1)", params: [source.readPath])
+    }
+
     public static func keyValueMetadata(source: DataSource) -> BoundSQL {
         BoundSQL(
             sql: "SELECT CAST(key AS VARCHAR) AS key, CAST(value AS VARCHAR) AS value FROM parquet_kv_metadata($1)",

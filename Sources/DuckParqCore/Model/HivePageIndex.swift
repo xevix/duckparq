@@ -66,7 +66,12 @@ public final class HivePageIndex {
     }
 
     /// DuckDB's spelling of a NULL partition value on disk.
-    public static let nullPartition = "__HIVE_DEFAULT_PARTITION__"
+    ///
+    /// `nonisolated`, along with the path parsing below it, because reading a
+    /// key=value directory name is string work with no state behind it — the
+    /// index is on the main actor for its session and its cached counts, and
+    /// `HiveSummary` has neither.
+    public nonisolated static let nullPartition = "__HIVE_DEFAULT_PARTITION__"
 
     public let files: [File]
     /// Partition keys, outermost first — the `["year", "region"]` of a
@@ -154,7 +159,7 @@ public final class HivePageIndex {
     /// The `key=value` pairs on a file's path below the dataset root, outermost
     /// first. `__HIVE_DEFAULT_PARTITION__` becomes nil, since that is what it
     /// means.
-    public static func partitionComponents(
+    public nonisolated static func partitionComponents(
         of path: String, under root: URL
     ) -> (keys: [String], values: [String?]) {
         let rootComponents = root.standardizedFileURL.pathComponents

@@ -238,6 +238,25 @@ public struct Probe: Sendable {
         return try await session.queryAll(query.sql, params: query.params, limit: 4096)
     }
 
+    /// How the source is partitioned, or nil if it is not a hive dataset.
+    ///
+    /// One `glob` and some string work — no footer is opened and no column is
+    /// read. Nil for a single file, for a folder of plain parquet files, and
+    /// for a dataset of more than `HiveSummary.fileLimit` files, where the
+    /// listing cannot be trusted to be complete and every count drawn from it
+    /// would be short without saying so.
+    public func hiveSummary(of source: DataSource) async throws -> HiveSummary? {
+        guard case .dataset(let root) = source else { return nil }
+        let query = SQLBuilder.fileNames(source: source)
+        let batch = try await session.queryAll(
+            query.sql, params: query.params, limit: HiveSummary.fileLimit
+        )
+        guard batch.rowCount > 0, batch.rowCount < HiveSummary.fileLimit else { return nil }
+        return HiveSummary.summarize(
+            paths: (0..<batch.rowCount).compactMap { batch[$0, 0] }, under: root
+        )
+    }
+
     public func keyValueMetadata(of source: DataSource) async throws -> RowBatch {
         let query = SQLBuilder.keyValueMetadata(source: source)
         return try await session.queryAll(query.sql, params: query.params, limit: 256)

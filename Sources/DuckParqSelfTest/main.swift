@@ -1090,6 +1090,23 @@ do {
     expect(datasetColumns.contains { $0.name == "region" }, "second partition key appears as a column")
     let datasetRows = try await probe.rowCount(of: dataset)
     expectEqual(datasetRows, 3000, "the whole partitioned dataset is read")
+
+    // What the schema panel adds to those columns: which of them are keys, in
+    // what order, and how far each divides the dataset. The fixture is
+    // year=2023,2024 over region=us,eu,apac, so six partitions of one file.
+    let summary = try await probe.hiveSummary(of: dataset)
+    expectEqual(summary?.keys.map(\.name), ["year", "region"],
+                "the partition keys come back in hierarchy order")
+    expectEqual(summary?.keys.map(\.distinctValues), [2, 3],
+                "with the distinct values each key takes")
+    expectEqual(summary?.partitionCount, 6, "and the number of partitions on disk")
+
+    // Only a hive layout has one. A single file is not a dataset at all, and a
+    // folder of plain parquet files is one table without being partitioned.
+    expectEqual(try await probe.hiveSummary(of: .file(smallParquet)), HiveSummary?.none,
+                "a single file has no hive schema")
+    expectEqual(try await probe.hiveSummary(of: .dataset(uniformDirectory)), HiveSummary?.none,
+                "nor does a folder of files that merely agree on a schema")
 }
 
 // Filters must reach DuckDB and actually restrict the result.
@@ -2477,6 +2494,79 @@ do {
                 [HivePageIndex.Span(file: 0, offset: 0, count: 10),
                  HivePageIndex.Span(file: 2, offset: 0, count: 20)],
                 "an empty file is skipped rather than counted")
+}
+
+// MARK: - Hive summary
+
+// What the schema panel says about a partitioned dataset. Read from the paths
+// alone, so it is checked here without a database; the read that produces those
+// paths is exercised against the fixture in "Probes".
+
+section("Hive summary")
+
+do {
+    let root = URL(fileURLWithPath: "/data/weather")
+    func paths(_ years: [String], _ elements: [String]) -> [String] {
+        years.flatMap { year in
+            elements.map { "/data/weather/year=\(year)/element=\($0)/data_0.parquet" }
+        }
+    }
+
+    let summary = HiveSummary.summarize(
+        paths: paths(["2022", "2023", "2024"], ["TMAX", "TMIN"]), under: root)
+    expectEqual(summary?.keys.map(\.name), ["year", "element"],
+                "the keys are reported outermost first, as they nest on disk")
+    expectEqual(summary?.keys.map(\.distinctValues), [3, 2],
+                "each key reports how many distinct values it takes")
+    expectEqual(summary?.partitionCount, 6, "and the partitions are the combinations on disk")
+
+    // The counts are per key across the whole dataset, and the partition count
+    // is what exists rather than the product of them. A key present under one
+    // parent and absent under another is the ordinary shape of a real archive.
+    let ragged = HiveSummary.summarize(
+        paths: paths(["2022"], ["TMAX", "TMIN", "PRCP"]) + paths(["2023"], ["TMAX"]),
+        under: root)
+    expectEqual(ragged?.keys.map(\.distinctValues), [2, 3],
+                "a value seen under any parent counts once for its key")
+    expectEqual(ragged?.partitionCount, 4,
+                "partitions are counted, not multiplied out of the key cardinalities")
+
+    // A NULL partition is a partition, and its sentinel spelling is not a value
+    // of its own to be reported alongside the real ones.
+    let withNull = HiveSummary.summarize(
+        paths: ["/data/weather/year=2024/element=TMAX/d.parquet",
+                "/data/weather/year=2024/element=\(HivePageIndex.nullPartition)/d.parquet"],
+        under: root)
+    expectEqual(withNull?.keys.map(\.distinctValues), [1, 2],
+                "a NULL partition counts as one of its key's values")
+    expectEqual(withNull?.partitionCount, 2, "and as a partition of its own")
+
+    // Several files in one partition describe one partition.
+    let manyFiles = HiveSummary.summarize(
+        paths: (0..<5).map { "/data/weather/year=2024/element=TMAX/data_\($0).parquet" },
+        under: root)
+    expectEqual(manyFiles?.partitionCount, 1, "a partition of many files is still one partition")
+
+    // Nothing to describe: a folder of plain files, and a layout whose files
+    // disagree about what they are partitioned by. Both are cases where there
+    // is no single hierarchy, and the panel shows no section rather than a
+    // made-up one.
+    expectEqual(HiveSummary.summarize(paths: ["/data/weather/part-0.parquet"], under: root),
+                HiveSummary?.none, "a folder of unpartitioned files has no hive schema")
+    expectEqual(
+        HiveSummary.summarize(
+            paths: ["/data/weather/year=2024/element=TMAX/d.parquet",
+                    "/data/weather/year=2024/d.parquet"],
+            under: root),
+        HiveSummary?.none, "files at disagreeing depths describe no one hierarchy")
+    expectEqual(
+        HiveSummary.summarize(
+            paths: ["/data/weather/year=2024/element=TMAX/d.parquet",
+                    "/data/weather/year=2024/station=USW/d.parquet"],
+            under: root),
+        HiveSummary?.none, "and neither do files partitioned by different keys")
+    expectEqual(HiveSummary.summarize(paths: [], under: root), HiveSummary?.none,
+                "an empty listing describes nothing")
 }
 
 // MARK: - Grid scrolling
