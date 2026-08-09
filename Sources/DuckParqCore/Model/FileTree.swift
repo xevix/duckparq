@@ -358,14 +358,51 @@ public enum FileTree {
     /// they compare equal to the ones a directory listing produces — which is
     /// what the sidebar's expansion set is holding.
     public static func ancestors(of url: URL, upTo root: URL) -> [URL] {
-        guard let relative = relativeComponents(of: url, under: root) else { return [] }
+        chain(to: url, under: root)?.dropLast().map { $0 } ?? []
+    }
+
+    /// `root`, each directory below it, and `url` itself last — or nil when
+    /// `url` is not `root` and does not lie under it.
+    ///
+    /// Same construction as `ancestors`, and the reason both exist is the same:
+    /// the URLs are respelled onto `root`. What makes the inclusive form worth
+    /// having separately is where the paths come from. FSEvents answers in
+    /// resolved, canonical paths — `/private/var/…` for a folder added as
+    /// `/var/…`, never with a trailing slash — while every row in the sidebar
+    /// was built by appending onto the root as the user chose it. Those are two
+    /// unequal URLs for one folder, so a change reported by the system has to be
+    /// put back into the sidebar's spelling before anything keyed on its rows
+    /// can be found by it.
+    public static func chain(to url: URL, under root: URL) -> [URL]? {
+        if isSameDirectory(root, url) { return [root] }
+        guard let relative = relativeComponents(of: url, under: root) else { return nil }
         var chain = [root]
         var current = root
-        for component in relative.dropLast() {
+        for component in relative {
             current = current.appendingPathComponent(component)
             chain.append(current)
         }
         return chain
+    }
+
+    /// The chain under whichever added root holds `url`, deepest root first —
+    /// the same rule `root(containing:in:)` uses, and for the same reason.
+    public static func chain(to url: URL, in roots: [URL]) -> [URL]? {
+        roots
+            .sorted { $0.pathComponents.count > $1.pathComponents.count }
+            .lazy
+            .compactMap { chain(to: url, under: $0) }
+            .first
+    }
+
+    /// Whether two URLs name the same directory.
+    ///
+    /// Component-wise rather than by `URL` equality, which a trailing slash
+    /// breaks, and with symlinks resolved only as a fallback — see
+    /// `relativeComponents`, which is careful about both for the same reasons.
+    public static func isSameDirectory(_ lhs: URL, _ rhs: URL) -> Bool {
+        if lhs.pathComponents == rhs.pathComponents { return true }
+        return resolvedComponents(lhs) == resolvedComponents(rhs)
     }
 
     /// Recursive name search, used by the sidebar's filter field. Bounded so a

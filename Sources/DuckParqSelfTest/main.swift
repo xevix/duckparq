@@ -451,6 +451,201 @@ do {
            "and that URL is in fact what the listing produced")
 }
 
+// MARK: - Watching the added folders
+//
+// A folder in the sidebar is a view of a directory, not a photograph of it. The
+// three pieces of that are checked here: putting a path the system reported back
+// into the spelling the sidebar's rows are built from, the stream that reports
+// them, and the rows being re-read when one arrives.
+
+section("Folder watching")
+
+do {
+    let data = URL(fileURLWithPath: "/data")
+
+    expectEqual(FileTree.chain(to: URL(fileURLWithPath: "/data/2024/q1"), under: data)?.map(\.path) ?? [],
+                ["/data", "/data/2024", "/data/2024/q1"],
+                "the chain to a folder ends on the folder itself, unlike ancestors()")
+    expectEqual(FileTree.chain(to: data, under: data)?.map(\.path) ?? [],
+                ["/data"], "an added folder is its own chain")
+    expect(FileTree.chain(to: URL(fileURLWithPath: "/database/x"), under: data) == nil,
+           "a folder is not matched by a name it merely starts")
+
+    // The case the whole respelling exists for: FSEvents answers in resolved
+    // paths, and the roots are spelled however they were added.
+    expectEqual(FileTree.chain(to: URL(fileURLWithPath: "/private/tmp/sales"),
+                               under: URL(fileURLWithPath: "/tmp"))?.map(\.path) ?? [],
+                ["/tmp", "/tmp/sales"],
+                "a change reported through a symlinked root comes back in the root's spelling")
+
+    let roots = [data, URL(fileURLWithPath: "/data/2024")]
+    expectEqual(FileTree.chain(to: URL(fileURLWithPath: "/data/2024/q1"), in: roots)?.first?.path,
+                "/data/2024", "the deepest added folder is the one a change is rebased onto")
+    expect(FileTree.chain(to: URL(fileURLWithPath: "/elsewhere/x"), in: roots) == nil,
+           "a change outside every added folder belongs to none of them")
+
+    expect(FileTree.isSameDirectory(URL(fileURLWithPath: "/data", isDirectory: true), data),
+           "a trailing slash does not make it a different folder")
+    expect(FileTree.isSameDirectory(URL(fileURLWithPath: "/private/tmp"), URL(fileURLWithPath: "/tmp")),
+           "nor does a symlink in the path")
+    expect(!FileTree.isSameDirectory(data, URL(fileURLWithPath: "/data/2024")),
+           "a folder is not the same as one inside it")
+}
+
+/// Collects what a watcher reports, which arrives on a queue of its own.
+actor WatchLog {
+    private var changes: [DirectoryWatcher.Change] = []
+
+    func add(_ reported: [DirectoryWatcher.Change]) { changes += reported }
+
+    /// Wait for a change naming `directory` or something under it.
+    func sawChange(under directory: URL, timeout: TimeInterval = 10) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if changes.contains(where: { FileTree.chain(to: $0.url, under: directory) != nil }) {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return false
+    }
+}
+
+do {
+    // Deliberately under the temporary directory rather than the fixtures: it
+    // is reached through /var, which the system reports as /private/var, so the
+    // stream exercises the respelling above rather than sidestepping it.
+    let watched = FileManager.default.temporaryDirectory
+        .appendingPathComponent("duckparq-watch-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: watched, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: watched) }
+
+    let log = WatchLog()
+    let watcher = DirectoryWatcher(latency: 0.05) { changes in
+        Task { await log.add(changes) }
+    }
+    watcher.watch([watched])
+    expect(watcher.isWatching, "a watcher over an added folder has a stream running")
+
+    // Watching nothing is not an error, and must not leave a stream behind.
+    let idle = DirectoryWatcher { _ in }
+    idle.watch([])
+    expect(!idle.isWatching, "watching no folders starts no stream")
+
+    // The stream is created for events from now on, so a change made in the
+    // same breath as starting it has nothing to be attributed to.
+    try? await Task.sleep(for: .milliseconds(300))
+    try? FileManager.default.copyItem(at: smallParquet, to: watched.appendingPathComponent("a.parquet"))
+
+    expect(await log.sawChange(under: watched),
+           "a file appearing in a watched folder is reported")
+
+    watcher.stop()
+    expect(!watcher.isWatching, "and stopping takes the stream down")
+}
+
+/// Wait for a folder to have been read at least this many times.
+@MainActor
+func settleListing(_ listing: DirectoryListing, reads: Int, timeout: TimeInterval = 20) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if listing.reads >= reads { return true }
+        try? await Task.sleep(for: .milliseconds(30))
+    }
+    return false
+}
+
+do {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("duckparq-listings-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try? FileManager.default.copyItem(
+        at: uniformDirectory.appendingPathComponent("part-0.parquet"),
+        to: root.appendingPathComponent("part-0.parquet"))
+
+    let listings = DirectoryListings()
+    let listing = listings.listing(for: root)
+    expect(!listing.isLoaded, "a folder nothing has looked at has not been read")
+    expect(!listings.isLoaded(root), "and the store says so without asking for a read")
+
+    await listing.load()
+    expectEqual(listing.nodes.map(\.name), ["part-0.parquet"], "the folder's one file is listed")
+    expect(listing.isDataset, "a folder of one parquet file reads as one table")
+    expect(listings.isLoaded(root), "and the store knows it has been read")
+
+    // Rows are shared, not copied: a change has one place to land, whichever
+    // row asks for the folder.
+    expect(listings.listing(for: root) === listing, "asking twice yields the same folder")
+    expect(listings.listing(for: URL(fileURLWithPath: root.path, isDirectory: true)) === listing,
+           "and a trailing slash is not a different folder")
+
+    // What the watcher reports when a file lands: the folder, named by the
+    // resolved path, with no idea what changed inside it.
+    try? FileManager.default.copyItem(
+        at: mixedDirectory.appendingPathComponent("priced.parquet"),
+        to: root.appendingPathComponent("priced.parquet"))
+    listings.directoriesDidChange(
+        [DirectoryWatcher.Change(url: root.resolvingSymlinksInPath())], in: [root])
+
+    expect(await settleListing(listing, reads: 2), "the change starts a re-read")
+    expectEqual(listing.nodes.map(\.name).sorted(), ["part-0.parquet", "priced.parquet"],
+                "the file that appeared is in the rows, with nothing having asked for it")
+    expect(!listing.isDataset,
+           "and the folder stops being one table, so the remembered answer was forgotten too")
+
+    listings.forget(under: root)
+    expectEqual(listings.count, 0, "removing an added folder forgets what was read under it")
+}
+
+do {
+    // A folder is classified by globbing it *recursively*, so a file several
+    // levels down decides whether an added folder is one table. A change deep in
+    // the tree therefore has to re-read every folder above it, not just the one
+    // it happened in.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("duckparq-deep-\(UUID().uuidString)")
+    let sub = root.appendingPathComponent("sub")
+    try? FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try? FileManager.default.copyItem(
+        at: uniformDirectory.appendingPathComponent("part-0.parquet"),
+        to: root.appendingPathComponent("part-0.parquet"))
+
+    let listings = DirectoryListings()
+    let listing = listings.listing(for: root)
+    let subListing = listings.listing(for: sub)
+    await listing.load()
+    await subListing.load()
+    expect(listing.isDataset, "the folder reads as one table while nothing disagrees with it")
+
+    try? FileManager.default.copyItem(
+        at: mixedDirectory.appendingPathComponent("priced.parquet"),
+        to: sub.appendingPathComponent("priced.parquet"))
+    listings.directoriesDidChange(
+        [DirectoryWatcher.Change(url: sub.resolvingSymlinksInPath())], in: [root])
+
+    expect(await settleListing(listing, reads: 2), "a change below an added folder re-reads it too")
+    expect(!listing.isDataset,
+           "a file that disagrees, two levels down, takes the added folder's badge away")
+
+    // A dropped-events flag says the kernel stopped queueing them, so nothing
+    // under the path can be assumed to be current either.
+    let subReads = subListing.reads
+    listings.directoriesDidChange(
+        [DirectoryWatcher.Change(url: root.resolvingSymlinksInPath(), includesSubdirectories: true)],
+        in: [root])
+    expect(await settleListing(subListing, reads: subReads + 1),
+           "a change covering a subtree re-reads the folders below it as well")
+
+    // A folder named by nothing that was added has no rows to correct.
+    let before = listing.reads
+    listings.directoriesDidChange(
+        [DirectoryWatcher.Change(url: URL(fileURLWithPath: "/elsewhere"))], in: [root])
+    try? await Task.sleep(for: .milliseconds(200))
+    expectEqual(listing.reads, before, "a change outside every added folder re-reads nothing")
+}
+
 // MARK: - Column layout
 
 section("Column layout")

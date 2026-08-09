@@ -284,46 +284,44 @@ private struct RootHeader: View {
 /// A folder you added is often the dataset itself, so it is offered directly
 /// rather than making you find a file inside it first — but only once DuckDB
 /// has said the files read as one table, which is a question with a query
-/// behind it. Held in `@State` rather than asked in `body`, because a view's
-/// body runs on every redraw and this must not.
+/// behind it and so an answer that arrives after the rows do.
 private struct RootContents: View {
     let url: URL
 
-    @State private var isDataset = false
+    @Environment(AppModel.self) private var app
 
     var body: some View {
-        if isDataset { RootDatasetRow(url: url) }
-        // The task hangs off the contents rather than the row above it, for the
-        // same reason `DirectoryContents` always draws something: a modifier
-        // needs a view to live on, and the row it would decide the existence of
-        // is not there to host the decision.
+        if app.listings.listing(for: url).isDataset { RootDatasetRow(url: url) }
         DirectoryContents(url: url, depth: 0)
-            .task(id: url) { isDataset = await FileTree.looksLikeDataset(url) }
     }
 }
 
-/// One level of a directory, loaded on first appearance.
+/// One level of a directory, loaded on first appearance and re-read whenever it
+/// changes on disk.
 private struct DirectoryContents: View {
     let url: URL
     let depth: Int
 
     @Environment(AppModel.self) private var app
-    @State private var children: [FileNode] = []
-    @State private var outcome: FileTree.ListingOutcome = .ok
-    @State private var isLoaded = false
 
     var body: some View {
+        // The rows come from `AppModel.listings`, not from `@State` here, so the
+        // folder watcher has somewhere to put a re-read. Rows held in this view
+        // would be reachable only while it is on screen, and only through a
+        // modifier — which a body that draws a row per file has nowhere to hang.
+        let listing = app.listings.listing(for: url)
+
         // There is always exactly one row on screen, even before anything has
         // loaded. That matters: an empty ForEach renders no views at all, so a
         // .task attached to it has nothing to host it and never runs — which
         // left every folder permanently empty.
-        if !isLoaded {
+        if !listing.isLoaded {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
                 Text("Loading…").font(.callout).foregroundStyle(.secondary)
             }
-            .task(id: url) { await load() }
-        } else if outcome == .permissionDenied {
+            .task(id: url) { await listing.load() }
+        } else if listing.outcome == .permissionDenied {
             // Downloads, Desktop and Documents are TCC-protected. Re-picking the
             // folder in an open panel is what actually grants access, so offer
             // exactly that rather than a dead end.
@@ -335,26 +333,26 @@ private struct DirectoryContents: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("Grant Access…") {
-                    if app.grantAccess(to: url) { reload() }
+                    if app.grantAccess(to: url) { Task { await listing.refresh() } }
                 }
                 .controlSize(.small)
             }
             .padding(.vertical, 2)
-        } else if case .failed(let message) = outcome {
+        } else if case .failed(let message) = listing.outcome {
             Text(message)
                 .font(.caption)
                 .foregroundStyle(.red)
-        } else if outcome == .hivePartitioned {
+        } else if listing.outcome == .hivePartitioned {
             // The `key=value` folders under a hive layout are partitions of one
             // table. Listing them would invite opening a slice of a dataset as
             // though it were a file, so they are not offered at all.
             hiveNote
-        } else if children.isEmpty {
+        } else if listing.nodes.isEmpty {
             Text("No parquet files")
                 .font(.callout)
                 .foregroundStyle(.tertiary)
         } else {
-            ForEach(children) { node in
+            ForEach(listing.nodes) { node in
                 if node.isDirectory {
                     DirectoryRow(node: node, depth: depth)
                 } else {
@@ -382,25 +380,6 @@ private struct DirectoryContents: View {
             // so clicking the note should just open the dataset.
             app.select(FileNode(url: url, isDirectory: true, isDataset: true, byteSize: nil, modified: nil))
         }
-    }
-
-    private func reload() {
-        isLoaded = false
-        Task { await load() }
-    }
-
-    private func load() async {
-        // `listing` is nonisolated, so both halves of it — the directory read,
-        // which is slow on a network volume, and the schema probe behind each
-        // sub-folder's badge — run off the main actor and the sidebar stays
-        // responsive while they do.
-        let listing = await FileTree.listing(of: url)
-        children = listing.nodes
-        outcome = listing.outcome
-        isLoaded = true
-        // A row cannot be scrolled to before it exists. This is what lets a
-        // reveal walking down to a file know this folder's rows are there.
-        app.directoryDidList(url)
     }
 }
 

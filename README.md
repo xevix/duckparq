@@ -20,6 +20,21 @@ You need **macOS 15 or later on Apple silicon** and a **Swift 6 toolchain**.
 Xcode is not required — Command Line Tools are enough (`xcode-select
 --install`)
 
+## Adding a folder
+
+**File ▸ Add Folder…** (⌘O), the **+** in the sidebar, or a folder dragged onto
+the window. The folder joins the sidebar and stays there between launches.
+
+A folder in the sidebar is a view of a directory rather than a photograph of it
+taken when it was added. DuckParq watches every added folder, so a file written
+by a job running alongside it, a partition landing in a dataset, or a rename in
+Finder shows up on its own — including the *dataset* badge, which can appear or
+disappear as the files under a folder start or stop agreeing on a schema.
+
+The grid is deliberately left alone. What a folder holds is one question;
+re-running a query under someone reading its results is another, and **View ▸
+Refresh** (⌘R) is where that decision stays.
+
 ## Opening a single file
 
 Three ways in, all doing the same thing:

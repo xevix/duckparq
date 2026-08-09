@@ -34,8 +34,12 @@ public actor DatasetIndex {
     )
 
     private let session: DuckDBSession
-    private var answers: [URL: Bool] = [:]
-    private var inFlight: [URL: Task<Bool, Never>] = [:]
+    /// Keyed by path rather than by `URL`: the same folder arrives spelled
+    /// `/a/b` from an open panel, `/a/b/` from a directory listing and
+    /// `/private/a/b` from the filesystem watcher, and those are three unequal
+    /// URLs. `path` at least settles the trailing slash.
+    private var answers: [String: Bool] = [:]
+    private var inFlight: [String: Task<Bool, Never>] = [:]
 
     public init(session: DuckDBSession) {
         self.session = session
@@ -47,8 +51,9 @@ public actor DatasetIndex {
     /// Concurrent askers share one probe: the sidebar draws a folder's row and
     /// its disclosure contents from the same URL, and both arrive at once.
     public func readsAsOneTable(_ directory: URL) async -> Bool {
-        if let answer = answers[directory] { return answer }
-        if let running = inFlight[directory] { return await running.value }
+        let key = directory.path
+        if let answer = answers[key] { return answer }
+        if let running = inFlight[key] { return await running.value }
 
         let session = self.session
         let task = Task<Bool, Never> {
@@ -67,16 +72,26 @@ public actor DatasetIndex {
                 return false
             }
         }
-        inFlight[directory] = task
+        inFlight[key] = task
         let answer = await task.value
-        inFlight[directory] = nil
-        answers[directory] = answer
+        inFlight[key] = nil
+        answers[key] = answer
         return answer
     }
 
     /// Forget every answer, so the next question re-reads from disk.
     public func invalidate() {
         answers.removeAll()
+    }
+
+    /// Forget what was decided about one folder.
+    ///
+    /// What the watcher calls when a folder changes on disk. Whether a folder
+    /// reads as one table is a fact about the files in it, so a file arriving or
+    /// leaving is exactly the event that can overturn it — and the cached answer
+    /// would otherwise survive until relaunch.
+    public func invalidate(_ directory: URL) {
+        answers.removeValue(forKey: directory.path)
     }
 
     /// Run a probe for its success or failure. The rows are of no interest —

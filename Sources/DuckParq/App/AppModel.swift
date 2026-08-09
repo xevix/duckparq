@@ -29,7 +29,10 @@ final class AppModel {
     let probe: Probe
 
     var roots: [URL] = [] {
-        didSet { persistRoots() }
+        didSet {
+            persistRoots()
+            watchRoots()
+        }
     }
     var selection: FileNode?
     var searchQuery: String = ""
@@ -66,8 +69,15 @@ final class AppModel {
     /// as a change worth acting on.
     private(set) var revealNonce = 0
 
-    /// Folders whose rows the sidebar has read from disk and drawn.
-    private var listedDirectories: Set<URL> = []
+    /// Every folder the sidebar has read, and where its rows live.
+    let listings = DirectoryListings()
+
+    /// Watches the added folders, so the rows keep up with the disk.
+    ///
+    /// Created on the first root rather than in `init`, because watching nothing
+    /// costs an FSEvents stream for no reason — and a fresh install has no
+    /// folders at all.
+    private var watcher: DirectoryWatcher?
 
     var showsInspector = false
     var showsSQLEditor = false
@@ -164,6 +174,26 @@ final class AppModel {
 
     private func persistRoots() {
         UserDefaults.standard.set(roots.map(\.path), forKey: Defaults.roots)
+    }
+
+    /// Point the watcher at the current set of folders.
+    ///
+    /// Called for every write to `roots`, including the ones that only reorder
+    /// them; `DirectoryWatcher.watch` recognises an unchanged set and leaves its
+    /// stream running, which is what keeps events from being lost across a
+    /// change that was not about the folders at all.
+    private func watchRoots() {
+        if watcher == nil, !roots.isEmpty {
+            watcher = DirectoryWatcher { [weak self] changes in
+                // FSEvents answers on its own queue; the rows it is about are
+                // main-actor state.
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.listings.directoriesDidChange(changes, in: self.roots)
+                }
+            }
+        }
+        watcher?.watch(roots)
     }
 
     /// The app is not sandboxed, so a plain path is enough to keep access —
@@ -353,14 +383,9 @@ final class AppModel {
         revealNonce += 1
     }
 
-    /// Called by the sidebar when a folder's rows have been read and drawn.
-    func directoryDidList(_ url: URL) {
-        listedDirectories.insert(url)
-    }
-
     /// Whether a folder's rows exist to be scrolled to.
     func isDirectoryListed(_ url: URL) -> Bool {
-        listedDirectories.contains(url)
+        listings.isLoaded(url)
     }
 
     // MARK: - Sidebar expansion
@@ -433,6 +458,7 @@ final class AppModel {
 
     func removeRoot(_ url: URL) {
         roots.removeAll { $0 == url }
+        listings.forget(under: url)
         if let selection, selection.url.path.hasPrefix(url.path) {
             self.selection = nil
             table.clear()
