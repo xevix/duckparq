@@ -387,6 +387,94 @@ do {
            "so the folder is answered from the first probe, and is not a dataset")
 }
 
+// MARK: - Expanding into an only child
+//
+// A folder holding one folder, holding one folder, is a row whose only use is
+// to be clicked. Expanding the first opens the whole run of them, and where it
+// stops is the whole of the rule — see `FileTree.unbranchedDescent`.
+
+section("Expanding into an only child")
+
+do {
+    let base = fixtures.appendingPathComponent("descent-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: base) }
+
+    @discardableResult
+    func folder(_ path: String) -> URL {
+        let url = base.appendingPathComponent(path)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+    func parquet(_ path: String) {
+        try? FileManager.default.copyItem(at: smallParquet, to: base.appendingPathComponent(path))
+    }
+
+    // The tree the rule exists for: four folders deep before anything can be
+    // opened, and a dataset at the bottom of it.
+    let unbranched = folder("unbranched")
+    folder("unbranched/cc-index/table/cc-main/warc")
+    parquet("unbranched/cc-index/table/cc-main/warc/a.parquet")
+    parquet("unbranched/cc-index/table/cc-main/warc/b.parquet")
+    // Rows are counted as the sidebar draws them, and it draws neither hidden
+    // files nor ones it cannot open — so neither stops the walk.
+    try? "notes".write(to: unbranched.appendingPathComponent("README.md"),
+                       atomically: true, encoding: .utf8)
+
+    expectEqual(await FileTree.unbranchedDescent(from: unbranched).map(\.lastPathComponent),
+                ["cc-index", "table", "cc-main"],
+                "expanding a folder opens the run of only-children below it")
+    expect(await FileTree.looksLikeDataset(
+        unbranched.appendingPathComponent("cc-index/table/cc-main/warc")),
+           "and stops on a dataset, which is a table to read rather than a level to pass through")
+    expect(!(await FileTree.unbranchedDescent(from: unbranched).contains(unbranched)),
+           "the folder that was expanded is not in its own descent")
+
+    // Two rows is something to choose between, and the choice is the reader's.
+    let branch = folder("branch")
+    folder("branch/left")
+    folder("branch/right")
+    expect(await FileTree.unbranchedDescent(from: branch).isEmpty,
+           "a folder that branches opens no further")
+
+    // The one row is a file: there is nothing below it to open.
+    let singleFile = folder("single-file")
+    parquet("single-file/small.parquet")
+    expect(await FileTree.unbranchedDescent(from: singleFile).isEmpty,
+           "and neither does a folder whose one row is a file")
+
+    // It stops *at* the branch, not one short of it: the folder that leads there
+    // is still a row worth clicking through on the reader's behalf.
+    let oneThenTwo = folder("one-then-two")
+    folder("one-then-two/only/x")
+    folder("one-then-two/only/y")
+    expectEqual(await FileTree.unbranchedDescent(from: oneThenTwo).map(\.lastPathComponent),
+                ["only"],
+                "the pass-through folder is opened, the branching folder inside it is not")
+
+    // A hive layout is a dataset from its names alone, and is left shut for the
+    // same reason: its partitions are columns of one table, not folders.
+    let hiveChain = folder("hive-chain")
+    folder("hive-chain/one/partitioned/year=2024")
+    parquet("hive-chain/one/partitioned/year=2024/data.parquet")
+    expectEqual(await FileTree.unbranchedDescent(from: hiveChain).map(\.lastPathComponent),
+                ["one"],
+                "a hive dataset ends the descent, one row below the folder that was expanded")
+
+    // Bounded, because a symlink pointing back up its own chain is a run of
+    // only-children that never ends.
+    let deep = folder("deep")
+    folder("deep/a/b/c/d/e")
+    expectEqual(await FileTree.unbranchedDescent(from: deep).map(\.lastPathComponent),
+                ["a", "b", "c", "d", "e"], "a long run is followed to the end of it")
+    expectEqual(await FileTree.unbranchedDescent(from: deep, limit: 2).map(\.lastPathComponent),
+                ["a", "b"], "but never past the limit")
+
+    expect(await FileTree.unbranchedDescent(from: folder("empty")).isEmpty,
+           "an empty folder opens nothing further")
+    expect(await FileTree.unbranchedDescent(from: base.appendingPathComponent("gone")).isEmpty,
+           "nor does a folder that is not there")
+}
+
 // MARK: - Sifting a drop
 
 section("Dropped files")

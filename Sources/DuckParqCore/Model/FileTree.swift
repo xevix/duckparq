@@ -293,6 +293,52 @@ public enum FileTree {
         }
     }
 
+    // MARK: - Opening a folder that holds one folder
+
+    /// The folders to open along with `url` when it is expanded: the run below
+    /// it that holds nothing but one more folder.
+    ///
+    /// A tree like `common-crawl/cc-index/table/cc-main/warc` costs four clicks
+    /// to reach anything, and the first three of them land on a folder whose
+    /// single row exists only to be clicked in turn. Expanding a folder opens
+    /// that whole run instead, so the click arrives at the first place the tree
+    /// actually branches.
+    ///
+    /// Where it stops is what keeps that from overreaching:
+    ///
+    ///   - **Two or more rows.** There is something to choose between, and the
+    ///     choice is the reader's to make.
+    ///   - **A dataset.** The `warc` above: opening it is a table to read, not a
+    ///     level to pass through — see `looksLikeDataset`. It is left shut, one
+    ///     row below its now-open parent, which is where it can be seen and
+    ///     clicked.
+    ///   - **A file.** Nothing below it to open.
+    ///
+    /// Rows are counted as the sidebar draws them, since it is the sidebar's
+    /// single row this is about: `children(of:)` lists folders and parquet
+    /// files, so a folder holding one folder and a stray `README` is still one
+    /// row, and still passed through.
+    ///
+    /// `url` itself is never included — the caller has already expanded it. The
+    /// walk is bounded because it reads one directory at a time and a symlink
+    /// pointing back up its own chain would otherwise never end.
+    public static func unbranchedDescent(from url: URL, limit: Int = 32) async -> [URL] {
+        var chain: [URL] = []
+        var current = url
+        while chain.count < limit {
+            let rows = children(of: current)
+            guard rows.count == 1, let only = rows.first, only.isDirectory else { break }
+            // Asked only of the folder about to be walked into. This is the
+            // question `children(of:)` refuses to answer for every row it
+            // produces, and a chain of only-children is few enough rows to ask
+            // it about one at a time.
+            if await looksLikeDataset(only.url) { break }
+            chain.append(only.url)
+            current = only.url
+        }
+        return chain
+    }
+
     // MARK: - Locating a file in the added roots
 
     /// The components of `url` below `directory`, or nil when `url` is not

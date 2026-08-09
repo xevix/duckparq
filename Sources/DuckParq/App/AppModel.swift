@@ -451,7 +451,33 @@ final class AppModel {
     func isExpanded(_ url: URL) -> Bool { expandedFolders.contains(url) }
 
     func setExpanded(_ url: URL, _ expanded: Bool) {
-        if expanded { expandedFolders.insert(url) } else { expandedFolders.remove(url) }
+        if expanded {
+            expandedFolders.insert(url)
+            descend(from: url)
+        } else {
+            expandedFolders.remove(url)
+        }
+    }
+
+    /// Follow a just-expanded folder down as long as it holds one folder and
+    /// nothing else — see `FileTree.unbranchedDescent`, which owns the rule and
+    /// where it stops.
+    ///
+    /// Off the main actor and after the fact, because it reads a directory per
+    /// level and asks DuckDB about the folder it stops at. The folder the user
+    /// clicked is open the instant they click it; the run below it opens as the
+    /// walk finds it, which is the same way each of those folders' rows arrive
+    /// anyway.
+    ///
+    /// Collapsing before the walk returns cancels it: shutting a folder is a
+    /// statement about what should be on screen, and reopening the run under it
+    /// a moment later would take it back.
+    private func descend(from url: URL) {
+        Task { [weak self] in
+            let chain = await FileTree.unbranchedDescent(from: url)
+            guard let self, !chain.isEmpty, self.isExpanded(url) else { return }
+            self.expandedFolders.formUnion(chain)
+        }
     }
 
     func toggleExpanded(_ url: URL) { setExpanded(url, !isExpanded(url)) }
