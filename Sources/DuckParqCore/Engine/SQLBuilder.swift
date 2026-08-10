@@ -651,22 +651,174 @@ public enum SQLBuilder {
         }
     }
 
+    /// The codec a parquet export compresses its pages with.
+    ///
+    /// DuckDB's own default is Snappy, which is fast and weak. ZSTD is the
+    /// better default here: DuckParq writes a file once and someone reads it
+    /// many times, so a slower write that lands a materially smaller file is
+    /// the right trade, and every parquet reader worth naming has read ZSTD for
+    /// years. Snappy stays available for a reader that has not.
+    public enum ParquetCompression: String, Sendable, CaseIterable, Identifiable {
+        case zstd = "ZSTD"
+        case snappy = "Snappy"
+        case gzip = "GZIP"
+        case uncompressed = "None"
+
+        public var id: String { rawValue }
+
+        /// The name DuckDB knows the codec by.
+        public var duckDBName: String {
+            switch self {
+            case .zstd: return "zstd"
+            case .snappy: return "snappy"
+            case .gzip: return "gzip"
+            case .uncompressed: return "uncompressed"
+            }
+        }
+    }
+
+    /// How a parquet export is laid out on disk: which columns become hive
+    /// directories, in what order the rows are written, and how they are
+    /// compressed once they are.
+    ///
+    /// None of it means anything for the other formats, so `export` ignores
+    /// this for them rather than emitting options DuckDB would reject.
+    public struct ParquetLayout: Sendable, Equatable {
+        /// Columns to write as `key=value` directory levels, outermost first.
+        /// They are *moved* out of the files by DuckDB, not duplicated: a hive
+        /// read puts them back by parsing the paths.
+        public var partitionBy: [String]
+
+        /// An `ORDER BY` list, exactly as the user typed it.
+        ///
+        /// This is the one piece of an export that is text rather than
+        /// structure, and it is here because the useful orderings are the ones
+        /// nothing in the UI can name — `category, ts`, `length(url)`,
+        /// `hash(user_id) % 8`. Sorting is what makes a parquet file compress:
+        /// runs of equal values are what RLE and dictionary encoding are for,
+        /// and a column ordered by something correlated with it lands its
+        /// similar values in the same pages.
+        ///
+        /// Because it is text it must be checked before it runs — see
+        /// `exportBody`, which is shaped to be handed to
+        /// `DuckDBSession.validateReadOnly` first.
+        public var orderBy: String
+
+        /// The page codec. Pairs with `orderBy`: sorting is what creates the
+        /// runs of similar values, and the codec is what turns them into a
+        /// smaller file.
+        public var compression: ParquetCompression
+
+        public static let none = ParquetLayout()
+
+        public init(
+            partitionBy: [String] = [],
+            orderBy: String = "",
+            compression: ParquetCompression = .zstd
+        ) {
+            self.partitionBy = partitionBy
+            self.orderBy = orderBy
+            self.compression = compression
+        }
+
+        /// The ORDER BY text with surrounding whitespace gone, or nil when the
+        /// user left the field alone.
+        public var trimmedOrderBy: String? {
+            let trimmed = orderBy.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+
+        public var isPartitioned: Bool { !partitionBy.isEmpty }
+    }
+
+    /// What a `COPY` with this layout writes: one file, or a tree of them.
+    public static func writesDirectory(format: ExportFormat, layout: ParquetLayout) -> Bool {
+        format == .parquet && layout.isPartitioned
+    }
+
+    /// The `SELECT` a `COPY` wraps: the grid's query, capped to the rows on
+    /// screen, then reordered for the write.
+    ///
+    /// The order of those two steps is the point. `limit` means "write out what
+    /// I am looking at", and which rows those are was settled by the grid's own
+    /// ordering — so the cap goes on first and the user's `ORDER BY` rearranges
+    /// that set. Ordering first would let a different set of rows survive the
+    /// cap than the ones on screen.
+    ///
+    /// Exposed separately from `export` because `orderBy` is user-written text
+    /// interpolated into SQL, and this is the form that can be checked — see
+    /// `exportCheck`.
+    public static func exportBody(
+        query: BoundSQL,
+        limit: Int? = nil,
+        orderBy: String? = nil
+    ) -> BoundSQL {
+        var sql = query.sql
+        if let limit {
+            sql = "SELECT * FROM (\(sql)) LIMIT \(limit)"
+        }
+        if let orderBy, !orderBy.trimmingCharacters(in: .whitespaces).isEmpty {
+            sql = "SELECT * FROM (\(sql)) ORDER BY \(orderBy)"
+        }
+        return BoundSQL(sql: sql, params: query.params)
+    }
+
+    /// The export body as a statement to hand to `DuckDBSession.validateReadOnly`
+    /// before the `COPY` runs.
+    ///
+    /// The ORDER BY field is the only part of an export a person writes as text,
+    /// so it is the only part that can be something other than what it looks
+    /// like. Checking it as a `SELECT` gets both halves of the answer from
+    /// DuckDB itself: the parse rejects a second statement smuggled in past a
+    /// semicolon, and the bind names an unknown column while the destination is
+    /// still untouched.
+    ///
+    /// The path is written in rather than bound because the bind is the point.
+    /// A statement whose source is still `read_parquet($1)` has no schema yet —
+    /// nothing to resolve `ORDER BY total` against — so it would pass here and
+    /// fail halfway through the write. This statement is only ever prepared,
+    /// never executed; the `COPY` that runs still binds its parameters.
+    public static func exportCheck(
+        query: BoundSQL,
+        limit: Int? = nil,
+        orderBy: String? = nil
+    ) -> String {
+        inlined(exportBody(query: query, limit: limit, orderBy: orderBy))
+    }
+
     /// `COPY (<query>) TO <destination>`. The destination is a bound parameter,
     /// and `limit` caps the export to what the user is looking at when they ask
     /// for the current view rather than the whole filtered set.
+    ///
+    /// With `layout.partitionBy` set, the destination names a *directory*:
+    /// DuckDB writes `key=value/...` levels under it, one file per combination.
+    /// Deliberately no `OVERWRITE_OR_IGNORE` — writing into a directory that
+    /// already holds an export would leave last time's files sitting alongside
+    /// this time's, and a dataset half of which is stale reads as one table
+    /// without complaint. DuckDB refuses instead, and says so.
     public static func export(
         query: BoundSQL,
         to destination: URL,
         format: ExportFormat,
-        limit: Int? = nil
+        limit: Int? = nil,
+        layout: ParquetLayout = .none
     ) -> BoundSQL {
-        var params = query.params
-        var inner = query.sql
-        if let limit {
-            inner = "SELECT * FROM (\(inner)) LIMIT \(limit)"
-        }
+        let body = exportBody(
+            query: query,
+            limit: limit,
+            orderBy: format == .parquet ? layout.trimmedOrderBy : nil
+        )
+        var params = body.params
         params.append(destination.path)
-        let sql = "COPY (\(inner)) TO $\(params.count) (\(format.copyOptions))"
-        return BoundSQL(sql: sql, params: params)
+
+        var options = format.copyOptions
+        if format == .parquet {
+            options += ", COMPRESSION \(layout.compression.duckDBName)"
+            if layout.isPartitioned {
+                let keys = layout.partitionBy.map(quote).joined(separator: ", ")
+                options += ", PARTITION_BY (\(keys))"
+            }
+        }
+        return BoundSQL(sql: "COPY (\(body.sql)) TO $\(params.count) (\(options))", params: params)
     }
 }

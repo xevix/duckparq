@@ -27,12 +27,47 @@ public final class DuckDBEngine: @unchecked Sendable {
 
     let db: dpq_db
 
-    public init() throws {
+    /// Where DuckDB spills to disk when a query outgrows memory.
+    public let temporaryDirectory: URL
+
+    /// An in-memory database's `temp_directory` defaults to `.tmp` — a
+    /// *relative* path, resolved against the process's working directory. That
+    /// is fine for a CLI started in a project folder and wrong for an
+    /// application: a bundle launched from the Finder has `/` as its working
+    /// directory, which is read-only, so the first query that needed to spill
+    /// died with `Failed to create directory ".tmp": Read-only file system`.
+    ///
+    /// Nothing in the app hit it until parquet exports could partition, because
+    /// a partitioned write is the first thing DuckParq does that buffers rows
+    /// on disk rather than streaming them straight out — but the same fault was
+    /// waiting for any sort large enough to spill.
+    public static var defaultTemporaryDirectory: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("duckparq", isDirectory: true)
+    }
+
+    public init(temporaryDirectory: URL = DuckDBEngine.defaultTemporaryDirectory) throws {
         var err: UnsafeMutablePointer<CChar>?
         guard let handle = dpq_db_open(&err) else {
             throw DuckDBError.engine(takeMessage(&err) ?? "failed to open DuckDB")
         }
         self.db = handle
+        self.temporaryDirectory = temporaryDirectory
+
+        try? FileManager.default.createDirectory(
+            at: temporaryDirectory, withIntermediateDirectories: true)
+
+        // `temp_directory` is a global setting, so one connection sets it for
+        // the instance and every session opened later inherits it. This one is
+        // opened and closed here rather than kept: it exists to carry a single
+        // SET, and holding it would mean holding a connection nothing queries.
+        guard let conn = dpq_conn_open(handle, &err) else {
+            throw DuckDBError.engine(takeMessage(&err) ?? "failed to connect")
+        }
+        defer { dpq_conn_close(conn) }
+        let sql = "SET temp_directory = \(SQLBuilder.literal(temporaryDirectory.path))"
+        guard dpq_exec(conn, sql, nil, 0, &err) else {
+            throw DuckDBError.engine(takeMessage(&err) ?? "failed to set temp_directory")
+        }
     }
 
     deinit { dpq_db_close(db) }

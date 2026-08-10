@@ -1030,6 +1030,28 @@ expectEqual(columns.first?.typeName, "BIGINT", "id is a BIGINT")
 let count = try await probe.rowCount(of: .file(smallParquet))
 expectEqual(count, 1000, "row count matches the fixture")
 
+// Where DuckDB spills. Left alone, an in-memory database writes to `.tmp`
+// *relative to the working directory* — which for a bundle launched from the
+// Finder is `/`, so the first query big enough to spill died with
+// `Failed to create directory ".tmp": Read-only file system`. The suite never
+// saw it because a test process runs in the package directory, which is
+// writable; hence a check on the setting rather than on a spill.
+do {
+    let configured = try await session.queryAll("SELECT current_setting('temp_directory') AS path")
+    let path = configured.value(row: 0, named: "path") ?? ""
+    expectEqual(path, engine.temporaryDirectory.path, "the engine points spills at a path of its own")
+    expect(path.hasPrefix("/"), "which is absolute, so it does not depend on where the app was started")
+    var isDirectory: ObjCBool = false
+    expect(FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue,
+           "and exists by the time a query could need it")
+
+    // It is a global setting, so a session opened afterwards inherits it —
+    // which is what makes one SET at startup enough for all five sessions.
+    let later = try DuckDBSession(engine: engine, label: "selftest-temp")
+    let inherited = try await later.queryAll("SELECT current_setting('temp_directory') AS path")
+    expectEqual(inherited.value(row: 0, named: "path"), path, "as does every session opened later")
+}
+
 // Sorting must be DuckDB's, and must survive the bridge's VARCHAR wrap: a
 // lexicographic sort would give 0, 1, 10, 100 here rather than 0, 1, 2, 3.
 do {
@@ -2257,6 +2279,198 @@ do {
     expectEqual(lines.count, 11, "export writes a header plus the requested rows")
     expect(lines.first?.hasPrefix("id,category") == true, "export keeps column headers")
     try? FileManager.default.removeItem(at: destination)
+}
+
+// MARK: - Parquet layout: hive partitioning and a write ordering
+
+// A parquet export can be asked to split itself into `key=value` folders. The
+// promise is that the split is only a layout: the same rows come back, with the
+// partition columns restored from the paths they were moved into.
+do {
+    let destination = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("duckparq-selftest-hive")
+    try? FileManager.default.removeItem(at: destination)
+
+    let query = SQLBuilder.rows(source: .file(smallParquet))
+    let layout = SQLBuilder.ParquetLayout(partitionBy: ["category", "flagged"])
+    expect(SQLBuilder.writesDirectory(format: .parquet, layout: layout),
+           "a partitioned export writes a folder, so the save panel offers one")
+    expect(!SQLBuilder.writesDirectory(format: .csv, layout: layout),
+           "the layout means nothing for CSV, which still writes one file")
+
+    let copy = SQLBuilder.export(query: query, to: destination, format: .parquet, layout: layout)
+    expect(copy.sql.contains("PARTITION_BY (\"category\", \"flagged\")"),
+           "the keys are quoted identifiers in the order they were chosen")
+    try await session.execute(copy.sql, params: copy.params)
+
+    let directories = try FileManager.default
+        .contentsOfDirectory(atPath: destination.path).sorted()
+    expectEqual(directories, ["category=alpha", "category=beta", "category=delta", "category=gamma"],
+                "the first key is the outermost folder level")
+    expect(FileManager.default.fileExists(
+        atPath: destination.appendingPathComponent("category=alpha/flagged=true").path),
+           "and the second nests inside it")
+
+    // The columns are *moved*, not copied: they are gone from the files, and it
+    // is the path they are read back out of. `hive_partitioning = false` is what
+    // makes that visible — left to itself DuckDB recognises the `key=value`
+    // folders and hands them back, which is the behaviour being relied on but
+    // not the thing being checked here.
+    let leaf = try await session.queryAll(
+        "SELECT * FROM read_parquet($1, hive_partitioning = false) LIMIT 1",
+        params: [destination.appendingPathComponent("category=alpha/flagged=true/*.parquet").path])
+    expect(!leaf.columns.contains("category") && !leaf.columns.contains("flagged"),
+           "the partition columns are not written into the files")
+
+    let back = try await session.queryAll(
+        "SELECT count(*) AS n, count(DISTINCT category) AS c FROM \(SQLBuilder.readExpression(for: .dataset(destination)))")
+    expectEqual(back.value(row: 0, named: "n"), "1000", "every row is written exactly once")
+    expectEqual(back.value(row: 0, named: "c"), "4", "and reading it back as a dataset restores the key")
+
+    try? FileManager.default.removeItem(at: destination)
+}
+
+// The shape that failed in the shipped app: fifty partitions and enough rows
+// that DuckDB buffers them rather than streaming straight out, which is what
+// went looking for a temp directory and found `.tmp` under a read-only `/`.
+//
+// This checks the export, not the spill. Whether a given run actually spills is
+// DuckDB's call — it depends on the memory limit and the machine's core count,
+// and a test that leans on tipping that balance would stop testing anything the
+// day the heuristic moves. What guards the fix is the `temp_directory`
+// assertion in "Engine round-trip"; this guards the export it surfaced through.
+do {
+    let destination = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("duckparq-selftest-spill")
+    try? FileManager.default.removeItem(at: destination)
+
+    let wide = BoundSQL(
+        sql: """
+            SELECT i AS id, hash(i) % 50 AS bucket, repeat('x', 100) AS pad \
+            FROM range(300000) t(i)
+            """,
+        params: []
+    )
+    let copy = SQLBuilder.export(
+        query: wide, to: destination, format: .parquet,
+        layout: SQLBuilder.ParquetLayout(partitionBy: ["bucket"]))
+    try await session.execute(copy.sql, params: copy.params)
+
+    let back = try await session.queryAll(
+        "SELECT count(*) AS n, count(DISTINCT bucket) AS b FROM \(SQLBuilder.readExpression(for: .dataset(destination)))")
+    expectEqual(back.value(row: 0, named: "n"), "300000", "a many-partition export writes every row")
+    expectEqual(back.value(row: 0, named: "b"), "50", "into a directory per distinct key")
+    try? FileManager.default.removeItem(at: destination)
+}
+
+// The ORDER BY field. It decides the order rows are *written* in — which is
+// what makes a parquet file compress — without disturbing which rows those are.
+do {
+    let destination = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("duckparq-selftest-ordered.parquet")
+    try? FileManager.default.removeItem(at: destination)
+
+    let query = SQLBuilder.rows(source: .file(smallParquet), sort: [SortKey(column: "id", direction: .ascending)])
+    let layout = SQLBuilder.ParquetLayout(orderBy: "  score DESC  ")
+    expectEqual(layout.trimmedOrderBy, "score DESC", "surrounding whitespace is not part of the clause")
+    expectEqual(SQLBuilder.ParquetLayout(orderBy: "   ").trimmedOrderBy, nil,
+                "an untouched field adds no ORDER BY at all")
+
+    let copy = SQLBuilder.export(
+        query: query, to: destination, format: .parquet, limit: 10, layout: layout)
+    try await session.execute(copy.sql, params: copy.params)
+
+    // The cap is applied before the reordering, so the rows written are the ten
+    // the grid is showing — ids 0 through 9 — rearranged, not the ten with the
+    // highest scores in the whole file.
+    let written = try await session.queryAll(
+        "SELECT id, score FROM read_parquet($1)", params: [destination.path])
+    expectEqual(written.rowCount, 10, "the limit still names the rows on screen")
+    expectEqual(written.column("id").compactMap { $0.flatMap(Int.init) }.sorted(), Array(0..<10),
+                "and they are those rows, not the file's ten highest scores")
+    let scores = written.column("score").compactMap { $0.flatMap(Int.init) }
+    expectEqual(scores, scores.sorted(by: >), "the file's row order is the ordering that was asked for")
+
+    // Ordering is parquet's alone: the other formats are handed to COPY without it.
+    let asCSV = SQLBuilder.export(
+        query: query, to: destination, format: .csv, limit: 10, layout: layout)
+    expect(!asCSV.sql.contains("ORDER BY score"), "a CSV export ignores the parquet layout")
+
+    try? FileManager.default.removeItem(at: destination)
+}
+
+// The codec. DuckDB's own default is Snappy; DuckParq's is ZSTD, on the grounds
+// that an export is written once and read many times.
+do {
+    let query = SQLBuilder.rows(source: .file(smallParquet))
+    expectEqual(SQLBuilder.ParquetLayout().compression, .zstd, "ZSTD unless asked otherwise")
+
+    var written: [SQLBuilder.ParquetCompression: Int] = [:]
+    for codec in SQLBuilder.ParquetCompression.allCases {
+        let destination = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("duckparq-selftest-\(codec.duckDBName).parquet")
+        try? FileManager.default.removeItem(at: destination)
+
+        let layout = SQLBuilder.ParquetLayout(orderBy: "category, label", compression: codec)
+        let copy = SQLBuilder.export(query: query, to: destination, format: .parquet, layout: layout)
+        expect(copy.sql.contains("COMPRESSION \(codec.duckDBName)"),
+               "the codec is named in the COPY for \(codec.rawValue)")
+        try await session.execute(copy.sql, params: copy.params)
+
+        // Read back from the footer rather than trusted: this is the one place
+        // that says what the file is actually encoded with.
+        let stored = try await session.queryAll(
+            "SELECT DISTINCT compression FROM parquet_metadata($1)", params: [destination.path])
+        expectEqual(stored.column("compression").compactMap { $0?.uppercased() }.sorted(),
+                    [codec == .uncompressed ? "UNCOMPRESSED" : codec.rawValue.uppercased()],
+                    "and every column of the file is written with it")
+
+        let size = (try FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? Int) ?? 0
+        written[codec] = size
+        try? FileManager.default.removeItem(at: destination)
+    }
+    expect(written[.zstd]! < written[.uncompressed]!, "which is the point: ZSTD is smaller than none")
+    expect(written[.zstd]! < written[.snappy]!, "and smaller than the default it replaces")
+
+    // Only parquet has a codec. CSV's own COMPRESSION means gzip on the whole
+    // file, which is not what this option is, so it is never passed on.
+    let asCSV = SQLBuilder.export(
+        query: query, to: URL(fileURLWithPath: "/dev/null"), format: .csv,
+        layout: SQLBuilder.ParquetLayout(compression: .gzip))
+    expect(!asCSV.sql.contains("COMPRESSION"), "a CSV export is not handed a parquet codec")
+}
+
+// The ORDER BY is the one part of an export a person writes as text, so it is
+// checked before it runs — as a SELECT, which is a thing DuckDB can both parse
+// and bind. A second statement hidden past a semicolon is rejected as such, and
+// a column that does not exist is named before anything reaches the disk.
+do {
+    let query = SQLBuilder.rows(source: .file(smallParquet))
+
+    let honest = SQLBuilder.exportCheck(query: query, limit: 10, orderBy: "score DESC, id")
+    try await session.validateReadOnly(honest)
+
+    let smuggled = SQLBuilder.exportCheck(query: query, orderBy: "id; CREATE TABLE sneaky (x INT)")
+    do {
+        try await session.validateReadOnly(smuggled)
+        expect(false, "a semicolon in the ORDER BY field is refused")
+    } catch let error as SQLPolicyError {
+        expectEqual(error, .multipleStatements(2), "and is refused for being two statements")
+    }
+
+    // The check binds as well as parses, which is why the path is written into
+    // it: a statement whose source is still an unbound `$1` has no schema to
+    // resolve a column name against, so it would pass and fail at COPY time.
+    let misspelled = SQLBuilder.exportCheck(query: query, orderBy: "no_such_column")
+    do {
+        try await session.validateReadOnly(misspelled)
+        expect(false, "an unknown column is caught before the export runs")
+    } catch {
+        expect("\(error)".contains("no_such_column"), "and the message names it, got \(error)")
+    }
+
+    let empty = SQLBuilder.exportCheck(query: query, limit: 10, orderBy: nil)
+    try await session.validateReadOnly(empty)
 }
 
 // MARK: - SQL trace
