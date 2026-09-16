@@ -2,9 +2,13 @@
 
 [![CI](https://github.com/xevix/duckparq/actions/workflows/ci.yml/badge.svg)](https://github.com/xevix/duckparq/actions/workflows/ci.yml)
 
-A native macOS parquet viewer for glancing at files quickly: point it at a
-folder, click through parquet files in the sidebar, see rows immediately. Sort,
+A native macOS data viewer for glancing at columnar files quickly: point it at a
+folder, click through files in the sidebar, see rows immediately. Sort,
 filter, or drop into SQL when you need to. DuckDB does the querying.
+
+Supported Formats
+* Parquet
+* Vortex
 
 This project is not affiliated in any way with DuckDB, DuckLabs etc. It is an independent project.
 
