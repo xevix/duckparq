@@ -36,9 +36,9 @@ struct ExportSheet: View {
             .pickerStyle(.radioGroup)
             .disabled(isExporting)
 
-            if format == .parquet {
+            if columnarFormat != nil {
                 Divider()
-                parquetOptions
+                columnarOptions
             }
 
             Text("Filters and sort order are applied by DuckDB, so the export matches exactly what the grid shows.")
@@ -72,23 +72,44 @@ struct ExportSheet: View {
         .frame(width: 460)
     }
 
-    // MARK: - Parquet layout
+    // MARK: - Columnar layout
+
+    /// The columnar format being written, or nil for CSV, TSV and JSON — which
+    /// have no layout to choose.
+    private var columnarFormat: FileFormat? { format.fileFormat }
+
+    /// Whether the writer takes `PARTITION_BY`. DuckDB accepts the option on a
+    /// vortex `COPY` and then writes one empty file and drops the rest, so it
+    /// is not offered there — see `FileFormat.supportsPartitionedExport`.
+    private var partitions: Bool { columnarFormat?.supportsPartitionedExport == true }
+
+    /// Whether the export will actually partition. `isPartitioning` is the
+    /// toggle's own state, which survives switching to a format that has no
+    /// toggle — so every reading of it has to be qualified, and doing that once
+    /// here is what keeps the next one from forgetting.
+    private var isPartitioningActive: Bool { isPartitioning && partitions }
 
     /// Partitioning, a write ordering and a codec — the choices that only mean
-    /// something for parquet, so they only appear for parquet.
-    @ViewBuilder private var parquetOptions: some View {
-        Picker("Compression", selection: $compression) {
-            ForEach(SQLBuilder.ParquetCompression.allCases) { codec in
-                Text(codec.rawValue).tag(codec)
+    /// something for a columnar file, and then only the ones that writer takes.
+    /// Vortex compresses with its own cascading encodings and writes one file,
+    /// so it is offered the write ordering and neither of the others.
+    @ViewBuilder private var columnarOptions: some View {
+        if columnarFormat?.supportsCompressionChoice == true {
+            Picker("Compression", selection: $compression) {
+                ForEach(SQLBuilder.ParquetCompression.allCases) { codec in
+                    Text(codec.rawValue).tag(codec)
+                }
             }
+            .pickerStyle(.menu)
+            .disabled(isExporting)
         }
-        .pickerStyle(.menu)
-        .disabled(isExporting)
 
-        Toggle("Hive partitioning", isOn: $isPartitioning)
-            .disabled(isExporting || partitionCandidates.isEmpty)
+        if partitions {
+            Toggle("Hive partitioning", isOn: $isPartitioning)
+                .disabled(isExporting || partitionCandidates.isEmpty)
+        }
 
-        if isPartitioning {
+        if isPartitioningActive {
             partitionKeyList
             Text(partitionCaption)
                 .font(.caption)
@@ -157,13 +178,13 @@ struct ExportSheet: View {
             return "Choose at least one column to partition by."
         }
         let path = partitionKeys.map { "\($0)=…" }.joined(separator: "/")
-        return "Writes a folder: \(path)/data_0.parquet. Partition columns move into "
+        return "Writes a folder: \(path)/data_0.\(format.fileExtension). Partition columns move into "
             + "the folder names, and a hive read puts them back."
     }
 
-    private var layout: SQLBuilder.ParquetLayout {
-        SQLBuilder.ParquetLayout(
-            partitionBy: isPartitioning ? partitionKeys : [],
+    private var layout: SQLBuilder.ColumnarLayout {
+        SQLBuilder.ColumnarLayout(
+            partitionBy: isPartitioningActive ? partitionKeys : [],
             orderBy: orderBy,
             compression: compression
         )
@@ -172,7 +193,7 @@ struct ExportSheet: View {
     /// Whether the sheet describes an export that can be run. Partitioning by
     /// nothing is the one way to ask for something DuckDB cannot do.
     private var isConfigured: Bool {
-        format != .parquet || !isPartitioning || !partitionKeys.isEmpty
+        !isPartitioningActive || !partitionKeys.isEmpty
     }
 
     private var fullSetLabel: String {
@@ -227,7 +248,7 @@ struct ExportSheet: View {
         let limit = limitToLoaded ? app.table.rows.count : nil
         // Only an export carrying typed text has anything to check; without it
         // every part of the statement was built here.
-        let writeOrder = format == .parquet ? layout.trimmedOrderBy : nil
+        let writeOrder = SQLBuilder.writeOrder(format: format, layout: layout)
         let check = writeOrder.map {
             SQLBuilder.exportCheck(query: query, limit: limit, orderBy: $0)
         }

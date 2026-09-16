@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# Generate parquet fixtures used by the smoke gate, the tests, and manual QA.
-# Uses the duckdb CLI (a build-time convenience only -- the app itself never
-# shells out to duckdb).
+# Generate parquet and vortex fixtures used by the smoke gate, the tests, and
+# manual QA. Uses the duckdb CLI (a build-time convenience only -- the app
+# itself never shells out to duckdb).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FIX="$ROOT/.fixtures"
+VORTEX_EXT="$ROOT/Vendor/duckdb-extensions/vortex.duckdb_extension"
 
 if ! command -v duckdb >/dev/null 2>&1; then
   echo "ERROR: the 'duckdb' CLI is required to generate fixtures (brew install duckdb)" >&2
+  exit 1
+fi
+
+if [[ ! -f "$VORTEX_EXT" ]]; then
+  echo "ERROR: $VORTEX_EXT missing -- run 'make extensions' first" >&2
   exit 1
 fi
 
@@ -16,6 +22,11 @@ mkdir -p "$FIX"
 
 # -init /dev/null so a user's ~/.duckdbrc can't perturb fixture generation.
 run_sql() { duckdb -init /dev/null -c "$1"; }
+
+# Vortex is written by the same extension the app ships and loads by path, not
+# by whatever `INSTALL vortex` would fetch -- so the fixtures are written by
+# exactly the build that reads them, and no network is needed to make them.
+run_vortex_sql() { run_sql "LOAD '$VORTEX_EXT'; $1"; }
 
 echo "==> small.parquet (1k rows)"
 run_sql "
@@ -93,6 +104,65 @@ COPY (SELECT i AS id, 'row-' || i AS label FROM range(100) t(i))
   TO '$FIX/reordered/id-first.parquet' (FORMAT parquet);
 COPY (SELECT 'row-' || i AS label, i AS id FROM range(100) t(i))
   TO '$FIX/reordered/label-first.parquet' (FORMAT parquet);"
+
+# --- vortex -------------------------------------------------------------
+#
+# Deliberately the same shapes as the parquet fixtures above, because what the
+# tests are checking is that the app treats the two formats alike where the
+# readers agree and differs only where they do not. A vortex fixture with its
+# own schema would make every comparison a comparison of two things at once.
+
+echo "==> small.vortex (1k rows, same columns as small.parquet)"
+run_vortex_sql "
+COPY (
+  SELECT
+    i                                             AS id,
+    ['alpha','beta','gamma','delta'][(i % 4) + 1] AS category,
+    (i * 7919) % 1000                             AS score,
+    (i % 3) = 0                                   AS flagged,
+    DATE '2024-01-01' + INTERVAL (i % 365) DAY    AS day,
+    'row-' || i                                   AS label
+  FROM range(1000) t(i)
+) TO '$FIX/small.vortex' (FORMAT vortex);"
+
+echo "==> uniform-vortex/ (a folder of vortex files that agree on a schema)"
+rm -rf "$FIX/uniform-vortex"
+mkdir -p "$FIX/uniform-vortex"
+run_vortex_sql "
+COPY (SELECT i AS id, 'row-' || i AS label FROM range(500) t(i))
+  TO '$FIX/uniform-vortex/part-0.vortex' (FORMAT vortex);
+COPY (SELECT i AS id, 'row-' || i AS label FROM range(500, 1000) t(i))
+  TO '$FIX/uniform-vortex/part-1.vortex' (FORMAT vortex);"
+
+echo "==> mixed-vortex/ (a folder of vortex files that do not)"
+rm -rf "$FIX/mixed-vortex"
+mkdir -p "$FIX/mixed-vortex"
+run_vortex_sql "
+COPY (SELECT i AS id, 'row-' || i AS label FROM range(100) t(i))
+  TO '$FIX/mixed-vortex/labelled.vortex' (FORMAT vortex);
+COPY (SELECT i AS id, i * 1.5 AS amount FROM range(100) t(i))
+  TO '$FIX/mixed-vortex/priced.vortex' (FORMAT vortex);"
+
+# Vortex has no hive_partitioning, so this folder is a dataset that globs as one
+# table *without* year and region becoming columns of it. That is the difference
+# the app has to show honestly rather than paper over -- see FileFormat.
+echo "==> hive-vortex/ (key=value directories, laid out by hand)"
+rm -rf "$FIX/hive-vortex"
+for year in 2023 2024; do
+  mkdir -p "$FIX/hive-vortex/year=$year"
+  run_vortex_sql "
+  COPY (SELECT i AS id, (i * 31) % 500 AS value FROM range(500) t(i))
+    TO '$FIX/hive-vortex/year=$year/data_0.vortex' (FORMAT vortex);"
+done
+
+echo "==> both/ (parquet and vortex side by side -- not one table either way)"
+rm -rf "$FIX/both"
+mkdir -p "$FIX/both"
+run_sql "COPY (SELECT i AS id FROM range(50) t(i)) TO '$FIX/both/a.parquet' (FORMAT parquet);"
+run_vortex_sql "COPY (SELECT i AS id FROM range(50) t(i)) TO '$FIX/both/b.vortex' (FORMAT vortex);"
+
+echo "==> corrupt.vortex (invalid file, for error paths)"
+printf 'VORTEX1 this is not a valid vortex file' > "$FIX/corrupt.vortex"
 
 echo "==> corrupt.parquet (invalid file, for error paths)"
 printf 'PAR1this is not a valid parquet file' > "$FIX/corrupt.parquet"

@@ -122,17 +122,23 @@ public enum SQLBuilder {
     /// be a visible cost for an invisible fix. `EXCLUDE` drops them from the
     /// projection while leaving them nameable in the ORDER BY, which is exactly
     /// the split this needs.
+    ///
+    /// A source whose reader generates no row-identity columns — vortex — has
+    /// nothing to hide and gets a plain `SELECT *`. `EXCLUDE ()` is a syntax
+    /// error, so this is the guard rather than a tidiness.
     static func projection(of source: DataSource, tiebreak: SortDirection?) -> String {
-        guard tiebreak != nil else { return "SELECT *" }
-        let excluded = source.rowIdentityColumns.map(quote).joined(separator: ", ")
+        let identity = source.rowIdentityColumns
+        guard tiebreak != nil, !identity.isEmpty else { return "SELECT *" }
+        let excluded = identity.map(quote).joined(separator: ", ")
         return "SELECT * EXCLUDE (\(excluded))"
     }
 
     private static func readExpression(of source: DataSource, tiebreak: SortDirection?) -> String {
-        source.readExpression(
+        let identity = source.rowIdentityColumns
+        return source.readExpression(
             parameterIndex: 1,
-            filename: tiebreak != nil && source.rowIdentityColumns.contains(DataSource.fileColumn),
-            rowNumber: tiebreak != nil
+            filename: tiebreak != nil && identity.contains(DataSource.fileColumn),
+            rowNumber: tiebreak != nil && identity.contains(DataSource.rowNumberColumn)
         )
     }
 
@@ -542,7 +548,13 @@ public enum SQLBuilder {
     /// read of those rows would quietly under-report the row count of exactly
     /// the datasets big enough to care about. All of it comes from parquet
     /// footers, so it stays cheap.
-    public static func fileMetadata(source: DataSource) -> BoundSQL {
+    ///
+    /// Nil for a format DuckDB will not describe the storage of — see
+    /// `FileFormat.describesStorage`. The vortex extension registers a reader
+    /// and nothing else, so there is no statement to run rather than one that
+    /// fails, and the inspector simply leaves the section out.
+    public static func fileMetadata(source: DataSource) -> BoundSQL? {
+        guard source.format.describesStorage else { return nil }
         let sql = """
             SELECT count(*) AS files, sum(num_rows) AS num_rows, \
             sum(num_row_groups) AS num_row_groups, sum(file_size_bytes) AS file_size_bytes, \
@@ -552,7 +564,8 @@ public enum SQLBuilder {
         return BoundSQL(sql: sql, params: [source.readPath])
     }
 
-    public static func rowGroupMetadata(source: DataSource) -> BoundSQL {
+    public static func rowGroupMetadata(source: DataSource) -> BoundSQL? {
+        guard source.format.describesStorage else { return nil }
         let sql = """
             SELECT path_in_schema AS column_name, type, count(*) AS row_groups, \
             sum(num_values) AS values, sum(total_compressed_size) AS compressed_bytes, \
@@ -574,8 +587,19 @@ public enum SQLBuilder {
         BoundSQL(sql: "SELECT file FROM glob($1)", params: [source.readPath])
     }
 
-    public static func keyValueMetadata(source: DataSource) -> BoundSQL {
-        BoundSQL(
+    /// Every file the source globs and how many rows each holds — what
+    /// `HivePageIndex` pages a partitioned dataset by. Footers only.
+    public static func fileRowCounts(source: DataSource) -> BoundSQL? {
+        guard source.format.describesStorage else { return nil }
+        return BoundSQL(
+            sql: "SELECT file_name, num_rows FROM parquet_file_metadata($1)",
+            params: [source.readPath]
+        )
+    }
+
+    public static func keyValueMetadata(source: DataSource) -> BoundSQL? {
+        guard source.format.describesStorage else { return nil }
+        return BoundSQL(
             sql: "SELECT CAST(key AS VARCHAR) AS key, CAST(value AS VARCHAR) AS value FROM parquet_kv_metadata($1)",
             params: [source.readPath]
         )
@@ -583,8 +607,8 @@ public enum SQLBuilder {
 
     // MARK: - Does a folder read as one table?
 
-    /// A read of every parquet file under `directory` that DuckDB refuses
-    /// unless their schemas agree — the question behind `DatasetIndex`.
+    /// A read of every file under `directory` that DuckDB refuses unless their
+    /// schemas agree — the question behind `DatasetIndex`.
     ///
     /// The glob is the one `DataSource.dataset` would use, so what is asked is
     /// exactly what the "dataset" badge promises: that this folder opens as one
@@ -599,13 +623,26 @@ public enum SQLBuilder {
     /// those against each file in turn that raises "schema mismatch in glob".
     /// The probe therefore costs one footer per file, however many rows they
     /// hold.
-    public static func schemaAgreement(under directory: URL) -> BoundSQL {
-        BoundSQL(
+    ///
+    /// A reader with no `file_row_number` to switch on cannot be asked this
+    /// way at all. Nothing routes one here — `DatasetIndex` sends those formats
+    /// to its per-file walk instead — but the fallback below keeps the function
+    /// total rather than making it a precondition a caller could get wrong.
+    public static func schemaAgreement(
+        under directory: URL, format: FileFormat
+    ) -> BoundSQL {
+        let source = DataSource.dataset(directory, format: format)
+        guard format.supportsReadOptions else {
+            return schemaAgreementWithoutRowNumbers(under: directory, format: format)
+        }
+        // The read function only, never `source.readExpression` — that adds
+        // `union_by_name`, the option this probe exists to do without.
+        return BoundSQL(
             sql: """
-                SELECT * FROM read_parquet($1, file_row_number = true) \
+                SELECT * FROM \(format.readFunction)($1, file_row_number = true) \
                 WHERE \(quote(DataSource.rowNumberColumn)) < 0
                 """,
-            params: [DataSource.dataset(directory).readPath]
+            params: [source.readPath]
         )
     }
 
@@ -615,10 +652,13 @@ public enum SQLBuilder {
     /// `random() < 0` is false for every row like the filter it replaces, but it
     /// names no column, so nothing is pruned and every row is examined. That
     /// puts the cost on the rare folder rather than on all of them.
-    public static func schemaAgreementWithoutRowNumbers(under directory: URL) -> BoundSQL {
-        BoundSQL(
-            sql: "SELECT * FROM read_parquet($1) WHERE random() < 0",
-            params: [DataSource.dataset(directory).readPath]
+    public static func schemaAgreementWithoutRowNumbers(
+        under directory: URL, format: FileFormat
+    ) -> BoundSQL {
+        let source = DataSource.dataset(directory, format: format)
+        return BoundSQL(
+            sql: "SELECT * FROM \(format.readFunction)($1) WHERE random() < 0",
+            params: [source.readPath]
         )
     }
 
@@ -628,25 +668,42 @@ public enum SQLBuilder {
         case csv = "CSV"
         case tsv = "TSV"
         case parquet = "Parquet"
+        case vortex = "Vortex"
         case json = "JSON"
 
         public var id: String { rawValue }
 
+        /// The columnar format this writes, or nil for the text ones.
+        ///
+        /// What `layout` means is decided entirely by this: a codec, hive
+        /// directories and a write ordering are choices about a columnar file,
+        /// and the capabilities on `FileFormat` say which of them the writer in
+        /// question actually honours.
+        public var fileFormat: FileFormat? {
+            switch self {
+            case .parquet: return .parquet
+            case .vortex: return .vortex
+            case .csv, .tsv, .json: return nil
+            }
+        }
+
         public var fileExtension: String {
+            if let fileFormat { return fileFormat.primaryExtension }
             switch self {
             case .csv: return "csv"
             case .tsv: return "tsv"
-            case .parquet: return "parquet"
             case .json: return "json"
+            case .parquet, .vortex: return rawValue.lowercased()
             }
         }
 
         var copyOptions: String {
+            if let fileFormat { return "FORMAT \(fileFormat.copyFormatName)" }
             switch self {
             case .csv: return "FORMAT csv, HEADER"
             case .tsv: return "FORMAT csv, HEADER, DELIMITER '\t'"
-            case .parquet: return "FORMAT parquet"
             case .json: return "FORMAT json"
+            case .parquet, .vortex: return "FORMAT \(rawValue.lowercased())"
             }
         }
     }
@@ -677,13 +734,15 @@ public enum SQLBuilder {
         }
     }
 
-    /// How a parquet export is laid out on disk: which columns become hive
+    /// How a columnar export is laid out on disk: which columns become hive
     /// directories, in what order the rows are written, and how they are
     /// compressed once they are.
     ///
-    /// None of it means anything for the other formats, so `export` ignores
-    /// this for them rather than emitting options DuckDB would reject.
-    public struct ParquetLayout: Sendable, Equatable {
+    /// None of it means anything for CSV, TSV or JSON, so `export` ignores this
+    /// for them rather than emitting options DuckDB would reject — and a
+    /// columnar writer only gets the parts of it that its own `FileFormat` says
+    /// it honours. Vortex takes the write ordering and neither of the others.
+    public struct ColumnarLayout: Sendable, Equatable {
         /// Columns to write as `key=value` directory levels, outermost first.
         /// They are *moved* out of the files by DuckDB, not duplicated: a hive
         /// read puts them back by parsing the paths.
@@ -709,7 +768,7 @@ public enum SQLBuilder {
         /// smaller file.
         public var compression: ParquetCompression
 
-        public static let none = ParquetLayout()
+        public static let none = ColumnarLayout()
 
         public init(
             partitionBy: [String] = [],
@@ -732,8 +791,15 @@ public enum SQLBuilder {
     }
 
     /// What a `COPY` with this layout writes: one file, or a tree of them.
-    public static func writesDirectory(format: ExportFormat, layout: ParquetLayout) -> Bool {
-        format == .parquet && layout.isPartitioned
+    public static func writesDirectory(format: ExportFormat, layout: ColumnarLayout) -> Bool {
+        format.fileFormat?.supportsPartitionedExport == true && layout.isPartitioned
+    }
+
+    /// The write ordering this export honours, or nil when the format has
+    /// nowhere to put one. Both columnar writers do: sorting is what makes the
+    /// rows compress, whichever of them is doing the compressing.
+    public static func writeOrder(format: ExportFormat, layout: ColumnarLayout) -> String? {
+        format.fileFormat == nil ? nil : layout.trimmedOrderBy
     }
 
     /// The `SELECT` a `COPY` wraps: the grid's query, capped to the rows on
@@ -801,20 +867,22 @@ public enum SQLBuilder {
         to destination: URL,
         format: ExportFormat,
         limit: Int? = nil,
-        layout: ParquetLayout = .none
+        layout: ColumnarLayout = .none
     ) -> BoundSQL {
         let body = exportBody(
             query: query,
             limit: limit,
-            orderBy: format == .parquet ? layout.trimmedOrderBy : nil
+            orderBy: writeOrder(format: format, layout: layout)
         )
         var params = body.params
         params.append(destination.path)
 
         var options = format.copyOptions
-        if format == .parquet {
-            options += ", COMPRESSION \(layout.compression.duckDBName)"
-            if layout.isPartitioned {
+        if let columnar = format.fileFormat {
+            if columnar.supportsCompressionChoice {
+                options += ", COMPRESSION \(layout.compression.duckDBName)"
+            }
+            if columnar.supportsPartitionedExport, layout.isPartitioned {
                 let keys = layout.partitionBy.map(quote).joined(separator: ", ")
                 options += ", PARTITION_BY (\(keys))"
             }

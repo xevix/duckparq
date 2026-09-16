@@ -398,7 +398,9 @@ private struct RootContents: View {
     @Environment(AppModel.self) private var app
 
     var body: some View {
-        if app.listings.listing(for: url).isDataset { RootDatasetRow(url: url) }
+        if let format = app.listings.listing(for: url).datasetFormat {
+            RootDatasetRow(url: url, format: format)
+        }
         DirectoryContents(url: url, depth: 0)
     }
 }
@@ -455,7 +457,7 @@ private struct DirectoryContents: View {
             // though it were a file, so they are not offered at all.
             hiveNote
         } else if listing.nodes.isEmpty {
-            Text("No parquet files")
+            Text("No parquet or vortex files")
                 .font(.callout)
                 .foregroundStyle(.tertiary)
         } else {
@@ -469,12 +471,30 @@ private struct DirectoryContents: View {
         }
     }
 
+    /// What the partitions actually buy, which depends on who reads them.
+    ///
+    /// Only a reader that takes `hive_partitioning` puts the `key=value` names
+    /// back as columns. A vortex folder laid out the same way still globs as
+    /// one table, and saying more than that here would be the one place in the
+    /// app that claims what `HivePageIndex`, `Probe.hiveSummary` and
+    /// `TableModel.defaultSort` all decline to — see
+    /// `FileFormat.supportsHivePartitioning`.
+    private var hiveDescription: String {
+        hiveFormat.supportsHivePartitioning
+            ? "Partitions are columns of one table — open the folder itself."
+            : "The files beneath read as one table — open the folder itself."
+    }
+
+    private var hiveFormat: FileFormat {
+        app.listings.listing(for: url).datasetFormat ?? .parquet
+    }
+
     private var hiveNote: some View {
         VStack(alignment: .leading, spacing: 2) {
             Label("Hive-partitioned", systemImage: "square.grid.3x3")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text("Partitions are columns of one table — open the folder itself.")
+            Text(hiveDescription)
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -485,18 +505,23 @@ private struct DirectoryContents: View {
             // Same effect as tapping "All files as one dataset" for this
             // folder: hive partitions are a dead end to browse individually,
             // so clicking the note should just open the dataset.
-            app.select(FileNode(url: url, isDirectory: true, isDataset: true, byteSize: nil, modified: nil))
+            app.select(FileNode(
+                url: url, isDirectory: true, byteSize: nil, modified: nil, format: hiveFormat
+            ))
         }
     }
 }
 
-/// Opens an added folder as one dataset — every parquet file beneath it.
+/// Opens an added folder as one dataset — every data file beneath it.
 private struct RootDatasetRow: View {
     let url: URL
+    let format: FileFormat
     @Environment(AppModel.self) private var app
 
     private var node: FileNode {
-        FileNode(url: url, isDirectory: true, isDataset: true, byteSize: nil, modified: nil)
+        FileNode(
+            url: url, isDirectory: true, byteSize: nil, modified: nil, format: format
+        )
     }
 
     private var isSelected: Bool { app.selection?.url == url }
@@ -512,7 +537,7 @@ private struct RootDatasetRow: View {
         .contentShape(Rectangle())
         .onTapGesture { app.select(node) }
         .listRowBackground(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
-        .help("Read every parquet file under \(url.lastPathComponent) as a single table")
+        .help("Read every \(format.rawValue) file under \(url.lastPathComponent) as a single table")
         .contextMenu { FileContextMenu(node: node) }
     }
 }
@@ -559,7 +584,7 @@ private struct DirectoryRow: View {
                 }
             }
             .help(node.isDataset
-                  ? "Open every parquet file under \(node.name) as one dataset"
+                  ? "Open every \(node.format?.rawValue ?? "data") file under \(node.name) as one dataset"
                   : node.url.path)
             .contextMenu { FileContextMenu(node: node) }
         }
@@ -607,15 +632,24 @@ struct FileContextMenu: View {
         }
         Button("Copy Path") { copy(node.url.path) }
         Button("Copy Name") { copy(node.name) }
-        Button("Copy as read_parquet(…)") { copy(readExpression) }
+        Button("Copy as \(readFunction)(…)") { copy(readExpression) }
         Divider()
         Button("Reveal in Finder") {
             NSWorkspace.shared.activateFileViewerSelecting([node.url])
         }
     }
 
+    /// The row's own source when it has one — a plain folder does not, and
+    /// falls back to reading it as a parquet dataset, which is what this menu
+    /// item offered before there was anything else to read.
+    private var source: DataSource {
+        node.dataSource ?? .dataset(node.url)
+    }
+
+    private var readFunction: String { source.format.readFunction }
+
     private var readExpression: String {
-        SQLBuilder.readExpression(for: node.isDirectory ? .dataset(node.url) : .file(node.url))
+        SQLBuilder.readExpression(for: source)
     }
 
     /// Writes to the general pasteboard — the same place `pbcopy` writes, so the

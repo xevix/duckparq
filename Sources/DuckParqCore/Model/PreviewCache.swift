@@ -30,8 +30,9 @@ public struct SourceFingerprint: Sendable, Hashable {
     public static func compute(for source: DataSource, fileLimit: Int = 20_000) -> SourceFingerprint? {
         let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey, .isRegularFileKey]
 
-        switch source {
-        case .file(let url):
+        let url = source.url
+        switch source.kind {
+        case .file:
             guard let values = try? url.resourceValues(forKeys: keys) else { return nil }
             return SourceFingerprint(
                 path: url.path,
@@ -40,7 +41,7 @@ public struct SourceFingerprint: Sendable, Hashable {
                 newestModified: values.contentModificationDate?.timeIntervalSince1970 ?? 0
             )
 
-        case .dataset(let url):
+        case .dataset:
             guard let walker = FileManager.default.enumerator(
                 at: url,
                 includingPropertiesForKeys: Array(keys),
@@ -50,8 +51,12 @@ public struct SourceFingerprint: Sendable, Hashable {
             var count = 0
             var bytes: Int64 = 0
             var newest: TimeInterval = 0
+            // Hoisted: `extensions` is computed, so asking it inside the loop
+            // built a fresh `Set` for every one of up to `fileLimit` entries.
+            let extensions = source.format.extensions
             for case let entry as URL in walker {
-                guard FileTree.parquetExtensions.contains(entry.pathExtension.lowercased()) else { continue }
+                guard extensions.contains(entry.pathExtension.lowercased())
+                else { continue }
                 count += 1
                 if count > fileLimit { return nil }
                 guard let values = try? entry.resourceValues(forKeys: keys) else { continue }

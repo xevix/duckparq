@@ -69,7 +69,7 @@ struct SQLEditorView: View {
                     }
                     .buttonStyle(.link)
                     .font(.caption)
-                    .help("Insert the full read_parquet(...) call for the current selection")
+                    .help("Insert the full read_parquet(...) / read_vortex(...) call for the current selection")
                 }
 
                 if app.table.isSQLMode {

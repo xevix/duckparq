@@ -234,7 +234,7 @@ final class AppModel {
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = true
         panel.prompt = "Add Folder"
-        panel.message = "Choose a folder to browse for parquet files"
+        panel.message = "Choose a folder to browse for data files"
         guard panel.runModal() == .OK else { return }
         addRoots(panel.urls)
     }
@@ -253,7 +253,7 @@ final class AppModel {
 
     // MARK: - Opening a file
 
-    /// Choose a parquet file in a panel and open it.
+    /// Choose a data file in a panel and open it.
     ///
     /// Deliberately the same call as a double-click in Finder, down to leaving
     /// the containing folder out of the sidebar: picking one file to look at is
@@ -264,20 +264,21 @@ final class AppModel {
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
-        // Parquet has no system type, so this resolves through the extensions
-        // the bundle declares — one type covering all three where the bundle is
-        // registered, one per extension where it is not, hence the dedupe. An
-        // empty list filters nothing, which is the right way to fail here:
-        // showing every file beats showing none.
+        // Neither parquet nor vortex has a system type, so this resolves
+        // through the extensions the bundle declares — one type covering a
+        // format's spellings where the bundle is registered, one per extension
+        // where it is not, hence the dedupe. An empty list filters nothing,
+        // which is the right way to fail here: showing every file beats showing
+        // none.
         var types: [UTType] = []
-        for suffix in FileTree.parquetExtensions.sorted() {
+        for suffix in FileFormat.allExtensions.sorted() {
             if let type = UTType(filenameExtension: suffix), !types.contains(type) {
                 types.append(type)
             }
         }
         panel.allowedContentTypes = types
         panel.prompt = "Open"
-        panel.message = "Choose a parquet file to open"
+        panel.message = "Choose a parquet or vortex file to open"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         open(url)
     }
@@ -294,7 +295,7 @@ final class AppModel {
     ///   - Folders go into the sidebar, exactly as Add Folder… puts them there.
     ///     Every folder dropped is added — the panel takes several at once too,
     ///     and a folder costs a row rather than the window's one table.
-    ///   - Files: the first parquet file is opened. A window shows one table,
+    ///   - Files: the first readable file is opened. A window shows one table,
     ///     and picking the first is at least a rule that can be predicted.
     ///
     /// Folders first, so a drop of a folder and a file inside it opens the file
@@ -308,13 +309,13 @@ final class AppModel {
         let folders = FileTree.directories(in: urls)
         addRoots(folders)
 
-        let file = FileTree.parquetFiles(in: urls).first
+        let file = FileTree.dataFiles(in: urls).first
         if let file { open(file) }
 
         return !folders.isEmpty || file != nil
     }
 
-    /// Open a parquet file, and put a row for it on screen.
+    /// Open a data file, and put a row for it on screen.
     ///
     /// Shared by Finder and by Open File — see `openFile()`.
     ///
@@ -583,7 +584,7 @@ final class AppModel {
     }
 
     /// Expose the selection to the SQL editor as `t`, so a query can just say
-    /// `FROM t` instead of repeating the read_parquet(...) call.
+    /// `FROM t` instead of repeating the read_parquet(...) / read_vortex(...) call.
     ///
     /// See `SQLBuilder.createSourceView` for why this is a plain view with an
     /// inlined path. Both details were previously wrong in ways `try?` hid: the

@@ -17,13 +17,16 @@ public final class DirectoryListing {
     /// Whether the folder has ever been read. Distinguishes an empty folder,
     /// which has an answer, from one that has not been looked at yet.
     public private(set) var isLoaded = false
-    /// Whether the folder itself reads as one dataset — see
-    /// `FileTree.looksLikeDataset`.
-    public private(set) var isDataset = false
+    /// Which reader opens the folder itself as one dataset, or nil when it is
+    /// a folder to browse — see `FileTree.datasetFormat`.
+    public private(set) var datasetFormat: FileFormat?
+
+    /// Whether the folder itself reads as one dataset.
+    public var isDataset: Bool { datasetFormat != nil }
     /// Bumped whenever a read finishes, so a test can watch for one.
     public private(set) var reads = 0
 
-    @ObservationIgnored private var reader: Task<(FileTree.Listing, Bool), Never>?
+    @ObservationIgnored private var reader: Task<(FileTree.Listing, FileFormat?), Never>?
     /// Which read is the current one. A `Task` is a value, so there is nothing
     /// to compare two of them by; this is what a finished read checks itself
     /// against before publishing.
@@ -62,7 +65,7 @@ public final class DirectoryListing {
         // probe behind the badge, which is a query. The sidebar stays
         // responsive while they do.
         let task = Task { [url] in
-            (await FileTree.listing(of: url), await FileTree.looksLikeDataset(url))
+            (await FileTree.listing(of: url), await FileTree.datasetFormat(url))
         }
         reader = task
 
@@ -74,7 +77,7 @@ public final class DirectoryListing {
         reader = nil
         nodes = listing.nodes
         outcome = listing.outcome
-        isDataset = dataset
+        datasetFormat = dataset
         isLoaded = true
         reads += 1
     }
@@ -131,7 +134,7 @@ public final class DirectoryListings {
     /// 2. **Every folder above it, up to the added root.** A folder's dataset
     ///    badge is decided by globbing it *recursively*, so a file appearing
     ///    several levels down can be the file that stops an ancestor reading as
-    ///    one table — see `FileTree.looksLikeDataset`.
+    ///    one table — see `FileTree.datasetFormat`.
     /// 3. **Everything below it**, when the change came with a dropped-events
     ///    flag and so covers a subtree rather than a directory.
     ///

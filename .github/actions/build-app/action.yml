@@ -1,7 +1,7 @@
 name: Build DuckParq.app
 description: >
-  Fetch and verify DuckDB, run the suite, build the bundle, check the three
-  things only a linked product can be checked for, and zip it.
+  Fetch and verify DuckDB and its loadable extensions, run the suite, build the
+  bundle, check the things only a linked product can be checked for, and zip it.
 
 # A composite action rather than a reusable workflow: the steps run inside the
 # caller's job, so the release job has the zip on disk and needs no artifact
@@ -63,17 +63,23 @@ runs:
     # Before `make smoke`, which builds the ordinary fixtures itself: the
     # fixtures target keys off small.parquet existing, so asking for the big
     # one afterwards would find the target already satisfied and do nothing.
+    #
+    # `make fixtures` pulls in `make extensions` on its own, because the vortex
+    # fixtures are written by the vendored extension rather than by whatever
+    # `INSTALL vortex` would fetch.
     - name: Generate the 10M-row fixture
       if: inputs.big == 'true'
       shell: bash
       run: BIG=1 make fixtures
 
-    # Vendor/ is deliberately not cached. The download is 25 MB and takes a
-    # second or two, and fetch-duckdb.sh short-circuits on its stamp file --
-    # so a restored cache would skip the SHA256 check entirely. Fetching every
-    # run keeps the checksum an assertion rather than a comment, and means CI
-    # notices if the pinned release asset ever moves.
-    - name: Smoke test the static link
+    # Vendor/ is deliberately not cached. The downloads are 25 MB and 16 MB and
+    # take a second or two, and the fetch scripts short-circuit on their stamp
+    # files -- so a restored cache would skip the SHA256 checks entirely.
+    # Fetching every run keeps the checksums assertions rather than comments,
+    # and means CI notices if a pinned asset ever moves. That matters more for
+    # the extension than for the static libs: extensions.duckdb.org is a path
+    # DuckDB can republish into, where a GitHub release asset is immutable.
+    - name: Smoke test the static link and the vortex extension
       shell: bash
       run: make smoke
 
@@ -87,7 +93,7 @@ runs:
         DUCKPARQ_VERSION: ${{ inputs.version }}
       run: make app
 
-    # The three properties that make the bundle worth shipping, none of which
+    # The properties that make the bundle worth shipping, none of which
     # the suite can check because they are about the linked product rather
     # than the code.
     - name: Verify the bundle
@@ -117,6 +123,16 @@ runs:
           fi
         done
         echo "ok: licence notices are in the bundle"
+
+        # Vortex is the one reader that is not compiled in. A bundle without it
+        # still launches and still claims .vortex in its document types, so the
+        # failure would be a file that opens into an error rather than a build
+        # that did not ship.
+        if [[ ! -f "$app/Contents/Resources/vortex.duckdb_extension" ]]; then
+          echo "FAIL: vortex.duckdb_extension missing -- the app would claim .vortex and not read it" >&2
+          exit 1
+        fi
+        echo "ok: the vortex extension ships in the bundle"
 
         /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$app/Contents/Info.plist"
 

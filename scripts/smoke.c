@@ -11,6 +11,13 @@
  * So this deliberately queries a real parquet file rather than SELECT 42.
  * It also exercises the exact streaming path the bridge uses:
  *   prepare -> pending_prepared_streaming -> execute_pending -> fetch_chunk
+ *
+ * Vortex is the other half of the gate, and a different question: it is not
+ * linked in at all but LOADed from the vendored .duckdb_extension, by path, the
+ * way DuckDBEngine does it. A statically linked DuckDB loading a signed dynamic
+ * extension is not obviously going to work, so it is proved here before any app
+ * code depends on it -- including the signature check, which this does not
+ * disable.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,9 +30,27 @@ static int fail(const char *what, const char *err) {
   return 1;
 }
 
+/* Run a statement for its success alone, reporting the first column of the
+ * first row when there is one. */
+static int check_scalar(duckdb_connection con, const char *what, const char *sql) {
+  duckdb_result result;
+  if (duckdb_query(con, sql, &result) == DuckDBError) {
+    int rc = fail(what, duckdb_result_error(&result));
+    duckdb_destroy_result(&result);
+    return rc;
+  }
+  char *value = duckdb_row_count(&result) > 0 ? duckdb_value_varchar(&result, 0, 0) : NULL;
+  printf("%s: ok%s%s\n", what, value ? " -> " : "", value ? value : "");
+  duckdb_free(value);
+  duckdb_destroy_result(&result);
+  return 0;
+}
+
 int main(int argc, char **argv) {
-  if (argc < 2) {
-    fprintf(stderr, "usage: %s <fixture.parquet>\n", argv[0]);
+  if (argc < 4) {
+    fprintf(stderr,
+            "usage: %s <fixture.parquet> <vortex.duckdb_extension> <fixture.vortex>\n",
+            argv[0]);
     return 2;
   }
 
@@ -115,8 +140,6 @@ int main(int argc, char **argv) {
 
   duckdb_destroy_result(&result);
   duckdb_destroy_prepare(&stmt);
-  duckdb_disconnect(&con);
-  duckdb_close(&db);
 
   if (total_rows == 0) {
     fprintf(stderr, "FAIL: parquet query returned no rows\n");
@@ -124,5 +147,23 @@ int main(int argc, char **argv) {
   }
   printf("\nOK: read %llu rows of parquet from a statically linked DuckDB\n",
          (unsigned long long)total_rows);
+
+  /* The vortex half. LOAD by path, exactly as DuckDBEngine.load(extension:on:) does --
+   * never `LOAD vortex`, which would go looking in ~/.duckdb and then at the
+   * network and so could pass here on a machine that has one installed while
+   * the shipped bundle fails. */
+  printf("\n");
+  char load[4096];
+  snprintf(load, sizeof load, "LOAD '%s'", argv[2]);
+  if (check_scalar(con, "load vortex extension", load) != 0) return 1;
+
+  char vortex[4096];
+  snprintf(vortex, sizeof vortex, "SELECT count(*) FROM read_vortex('%s')", argv[3]);
+  if (check_scalar(con, "read_vortex", vortex) != 0) return 1;
+
+  duckdb_disconnect(&con);
+  duckdb_close(&db);
+
+  printf("\nOK: read vortex through the vendored extension too\n");
   return 0;
 }

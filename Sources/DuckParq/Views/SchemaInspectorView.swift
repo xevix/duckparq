@@ -1,7 +1,7 @@
 import DuckParqCore
 import SwiftUI
 
-/// Schema and parquet file metadata for the current selection.
+/// Schema and stored-file metadata for the current selection.
 struct SchemaInspectorView: View {
     @Environment(AppModel.self) private var app
 
@@ -82,6 +82,13 @@ struct SchemaInspectorView: View {
         }
     }
 
+    /// Name, path, and which reader opened it.
+    ///
+    /// The format is worth a line of its own because the panel below it is not
+    /// the same panel for both: a vortex file has no row groups, codecs or
+    /// footer key/values to show, so those sections simply are not there. Said
+    /// here, that reads as a property of the format; left unsaid, it reads as
+    /// the panel having failed to load.
     private func header(_ source: DataSource) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(source.displayName).font(.headline).lineLimit(2)
@@ -90,12 +97,19 @@ struct SchemaInspectorView: View {
                 .foregroundStyle(.tertiary)
                 .lineLimit(3)
                 .textSelection(.enabled)
+            Text(source.format.rawValue.capitalized)
+                .font(.system(size: 9, weight: .semibold))
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1)
+                .background(Color.secondary.opacity(0.15), in: Capsule())
+                .foregroundStyle(.secondary)
+                .padding(.top, 2)
         }
     }
 
     private var schemaSection: some View {
         Section {
-            // Lazy, because this is one row per column and a parquet file can
+            // Lazy, because this is one row per column and a columnar file can
             // carry thousands of them.
             LazyVStack(alignment: .leading, spacing: 3) {
                 ForEach(app.table.columns) { column in

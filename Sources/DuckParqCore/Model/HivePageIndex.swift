@@ -103,16 +103,22 @@ public final class HivePageIndex {
     ///
     /// Returns nil for anything that is not a hive-partitioned dataset, which
     /// is the caller's signal to page it the ordinary way.
+    ///
+    /// That includes a dataset whose format has no footer to read the row
+    /// counts out of — there is nothing to index and nothing the index would
+    /// buy. See `SQLBuilder.fileRowCounts` and `FileFormat.describesStorage`.
+    /// Whether the layout is really partitioned is settled below, by the files
+    /// themselves rather than by a flag.
     public static func build(
         source: DataSource,
         session: DuckDBSession
     ) async throws -> HivePageIndex? {
-        guard case .dataset(let root) = source else { return nil }
+        guard let query = SQLBuilder.fileRowCounts(source: source),
+              let root = source.datasetRoot
+        else { return nil }
 
         let batch = try await session.queryAll(
-            "SELECT file_name, num_rows FROM parquet_file_metadata($1)",
-            params: [source.readPath],
-            limit: metadataRowLimit
+            query.sql, params: query.params, limit: metadataRowLimit
         )
         // A truncated file list would index part of the dataset and quietly
         // page as though that were all of it — rows past the cut would simply

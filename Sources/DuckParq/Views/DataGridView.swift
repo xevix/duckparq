@@ -776,7 +776,7 @@ struct DataGridView: View {
             Image(systemName: "tablecells")
                 .font(.system(size: 40, weight: .light))
                 .foregroundStyle(.tertiary)
-            Text(app.roots.isEmpty ? "Add a folder to start browsing" : "Select a parquet file")
+            Text(app.roots.isEmpty ? "Add a folder to start browsing" : "Select a file")
                 .foregroundStyle(.secondary)
             if app.roots.isEmpty {
                 Button("Add Folder…") { app.addRoot() }

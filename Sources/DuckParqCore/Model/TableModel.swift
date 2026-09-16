@@ -238,21 +238,48 @@ public final class TableModel {
         defaultSort = Self.defaultSort(for: source)
         sort = defaultSort
         discardValueIndexes()
+
+        // A build whose vortex extension did not load would otherwise answer a
+        // vortex file with "Table Function with name read_vortex does not
+        // exist", which describes the SQL rather than the situation. Said here,
+        // once, before a query that cannot succeed is issued.
+        if let reason = unreadableFormatReason(for: source) {
+            rows = []
+            columns = []
+            totalRowCount = nil
+            errorMessage = reason
+            return
+        }
         reload()
+    }
+
+    /// Why this source cannot be read at all, or nil when it can be.
+    ///
+    /// A reader can be missing only where it arrives as an extension rather
+    /// than compiled in — see `FileFormat.requiredExtension`. The engine has
+    /// already tried to load it and kept the reason it could not.
+    private func unreadableFormatReason(for source: DataSource) -> String? {
+        guard let why = gridSession.loadError(for: source.format) else { return nil }
+        return "This build cannot read \(source.format.rawValue) files: \(why)"
     }
 
     /// The sort a source opens in.
     ///
-    /// Empty for a file, and for a plain folder of parquet files. A hive
+    /// Empty for a file, and for a plain folder of data files. A hive
     /// dataset opens ordered by its top-level partition key, which is the
     /// column it is physically laid out by — so the order is close to free,
     /// and having one is what lets the end of the dataset be read by turning
     /// the sort around instead of counting to it. See `fetchPage`.
     ///
+    /// Empty too where the partition key is not a column at all: only a reader
+    /// that takes `hive_partitioning` puts one there, so ordering by it would
+    /// be ordering by a name the query cannot resolve.
+    ///
     /// A default rather than a fixture: clicking the header clears it like any
     /// other sort, and `clearSort()` leaves the dataset unordered.
     private static func defaultSort(for source: DataSource) -> [SortKey] {
-        guard case .dataset(let url) = source,
+        guard source.format.supportsHivePartitioning,
+              let url = source.datasetRoot,
               let key = FileTree.topLevelHiveKey(of: url)
         else { return [] }
         return [SortKey(column: key, direction: .ascending)]
@@ -562,11 +589,17 @@ public final class TableModel {
     /// file keeps the untiebroken ORDER BY and the tie defect that comes with
     /// it, which is a great deal better than failing to open.
     ///
+    /// A format whose reader has no such option at all — vortex — is in the
+    /// same position for a different reason, and `rowIdentityColumns` being
+    /// empty is how it says so.
+    ///
     /// Read off the loaded schema. Empty columns answer "yes", which is only
     /// reachable before the first DESCRIBE lands — and the sorts that get here
     /// come from clicking a header that does not exist until it has.
     private var canTiebreak: Bool {
-        !columns.contains { $0.name == DataSource.rowNumberColumn }
+        guard case .source(let source) = mode, !source.rowIdentityColumns.isEmpty
+        else { return false }
+        return !columns.contains { $0.name == DataSource.rowNumberColumn }
     }
 
     /// `currentQuery` bounded to the window the grid is showing.
@@ -750,14 +783,16 @@ public final class TableModel {
     /// enough to do before the first page rather than alongside it. On its own
     /// session, so it does not queue behind the grid's own reads.
     private func ensureHiveIndex() async {
-        guard case .source(let source) = mode, case .dataset(let url) = source else {
+        guard case .source(let source) = mode, let url = source.datasetRoot else {
             hiveIndex = nil
             hiveIndexSource = nil
             return
         }
         if hiveIndexSource == source { return }
-        guard FileTree.topLevelHiveKey(of: url) != nil else {
-            // A plain folder of parquet files has no partition order to walk.
+        guard source.format.supportsHivePartitioning,
+              FileTree.topLevelHiveKey(of: url) != nil
+        else {
+            // A plain folder of data files has no partition order to walk.
             hiveIndex = nil
             hiveIndexSource = source
             return

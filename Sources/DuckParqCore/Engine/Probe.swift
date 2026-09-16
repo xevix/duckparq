@@ -228,25 +228,38 @@ public struct Probe: Sendable {
         return (0..<batch.rowCount).compactMap { batch[$0, 0] }
     }
 
+    /// How the source is stored — files, row groups, codecs and the footer's
+    /// own key/values.
+    ///
+    /// Empty rather than an error for a format DuckDB will not describe the
+    /// storage of. The schema inspector draws each of these sections only when
+    /// it has rows for it, so a vortex file shows its schema and no storage
+    /// sections, which is the truth about what can be known.
     public func fileMetadata(of source: DataSource) async throws -> RowBatch {
-        let query = SQLBuilder.fileMetadata(source: source)
+        guard let query = SQLBuilder.fileMetadata(source: source) else { return .empty }
         return try await session.queryAll(query.sql, params: query.params, limit: 64)
     }
 
     public func columnMetadata(of source: DataSource) async throws -> RowBatch {
-        let query = SQLBuilder.rowGroupMetadata(source: source)
+        guard let query = SQLBuilder.rowGroupMetadata(source: source) else { return .empty }
         return try await session.queryAll(query.sql, params: query.params, limit: 4096)
     }
 
     /// How the source is partitioned, or nil if it is not a hive dataset.
     ///
     /// One `glob` and some string work — no footer is opened and no column is
-    /// read. Nil for a single file, for a folder of plain parquet files, and
+    /// read. Nil for a single file, for a folder of plain data files, and
     /// for a dataset of more than `HiveSummary.fileLimit` files, where the
     /// listing cannot be trusted to be complete and every count drawn from it
     /// would be short without saying so.
+    ///
+    /// Also nil for a format whose reader does not turn `key=value` directories
+    /// into columns. The directories may well be there — nothing stops anyone
+    /// laying vortex files out that way — but a summary of "partition keys" is
+    /// a claim about columns of the table, and for vortex there are none.
     public func hiveSummary(of source: DataSource) async throws -> HiveSummary? {
-        guard case .dataset(let root) = source else { return nil }
+        guard source.format.supportsHivePartitioning, let root = source.datasetRoot
+        else { return nil }
         let query = SQLBuilder.fileNames(source: source)
         let batch = try await session.queryAll(
             query.sql, params: query.params, limit: HiveSummary.fileLimit
@@ -258,7 +271,7 @@ public struct Probe: Sendable {
     }
 
     public func keyValueMetadata(of source: DataSource) async throws -> RowBatch {
-        let query = SQLBuilder.keyValueMetadata(source: source)
+        guard let query = SQLBuilder.keyValueMetadata(source: source) else { return .empty }
         return try await session.queryAll(query.sql, params: query.params, limit: 256)
     }
 }

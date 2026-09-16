@@ -20,7 +20,7 @@ public enum DuckDBError: Error, LocalizedError, Sendable {
     }
 }
 
-/// The process-wide DuckDB instance. Parquet files are read from disk per query,
+/// The process-wide DuckDB instance. Data files are read from disk per query,
 /// so an in-memory database is all that is needed.
 public final class DuckDBEngine: @unchecked Sendable {
     public static let shared = try! DuckDBEngine()
@@ -29,6 +29,19 @@ public final class DuckDBEngine: @unchecked Sendable {
 
     /// Where DuckDB spills to disk when a query outgrows memory.
     public let temporaryDirectory: URL
+
+    /// Why a format's reader is unavailable, for each format whose extension
+    /// would not load. Empty when every reader is there.
+    ///
+    /// Not thrown, because a DuckParq that reads parquet and not vortex is
+    /// still most of an application — where one that refuses to start is none
+    /// of it. The message is kept so the failure can be reported against a file
+    /// the user tried to open rather than as a launch-time alert about a format
+    /// they may never touch.
+    public let loadErrors: [FileFormat: String]
+
+    /// Why this format cannot be read, or nil when it can be.
+    public func loadError(for format: FileFormat) -> String? { loadErrors[format] }
 
     /// An in-memory database's `temp_directory` defaults to `.tmp` — a
     /// *relative* path, resolved against the process's working directory. That
@@ -68,6 +81,85 @@ public final class DuckDBEngine: @unchecked Sendable {
         guard dpq_exec(conn, sql, nil, 0, &err) else {
             throw DuckDBError.engine(takeMessage(&err) ?? "failed to set temp_directory")
         }
+
+        // Same connection, same reason: LOAD is global to the instance, so the
+        // statements here make every loadable reader reachable from every
+        // session opened later.
+        self.loadErrors = Self.loadExtensions(on: conn)
+    }
+
+    // MARK: - Loadable readers
+
+    /// Load the vendored extension every format that needs one needs, and
+    /// report the ones that did not load.
+    ///
+    /// Driven off `FileFormat.requiredExtension` rather than naming vortex, so
+    /// a third format that arrives as an extension is loaded by declaring it.
+    private static func loadExtensions(on conn: dpq_conn) -> [FileFormat: String] {
+        var errors: [FileFormat: String] = [:]
+        for format in FileFormat.allCases {
+            guard let name = format.requiredExtension else { continue }
+            if let why = load(extension: name, on: conn) { errors[format] = why }
+        }
+        return errors
+    }
+
+    /// Load one vendored extension, returning why it could not be.
+    ///
+    /// By path, never by name. `LOAD vortex` would send DuckDB looking in
+    /// `~/.duckdb/extensions` and, failing that, to the network — so a machine
+    /// that happened to have a different build of it installed would get that
+    /// one, and a machine with none would get a download nobody asked for. The
+    /// file that ships in the bundle is the only one this ever loads.
+    ///
+    /// The signature is checked by DuckDB against its own built-in key, so a
+    /// tampered file is refused here rather than trusted.
+    private static func load(extension name: String, on conn: dpq_conn) -> String? {
+        guard let url = extensionURL(named: name) else {
+            return "\(name).duckdb_extension is not in the bundle"
+        }
+        var err: UnsafeMutablePointer<CChar>?
+        let sql = "LOAD \(SQLBuilder.literal(url.path))"
+        guard dpq_exec(conn, sql, nil, 0, &err) else {
+            return takeMessage(&err) ?? "failed to load \(url.lastPathComponent)"
+        }
+        return nil
+    }
+
+    /// Where a vendored extension is, in the three places it can be.
+    ///
+    /// 1. `DUCKPARQ_EXTENSION_DIR`, which is what a test harness sets.
+    /// 2. The app bundle's Resources, which is where a shipped DuckParq finds
+    ///    it — see `scripts/make-app.sh`.
+    /// 3. `Vendor/duckdb-extensions` above the running executable, which is
+    ///    where `swift build` leaves the developer and the self-test suite:
+    ///    `.build/debug/DuckParqSelfTest` is three levels under the checkout.
+    ///
+    /// Nil when none of them holds it, which is a build that reads parquet
+    /// only.
+    public static func extensionURL(named name: String) -> URL? {
+        let name = "\(name).duckdb_extension"
+        var candidates: [URL] = []
+
+        if let override = ProcessInfo.processInfo.environment["DUCKPARQ_EXTENSION_DIR"] {
+            candidates.append(URL(fileURLWithPath: override).appendingPathComponent(name))
+        }
+        if let bundled = Bundle.main.resourceURL?.appendingPathComponent(name) {
+            candidates.append(bundled)
+        }
+        var directory = URL(fileURLWithPath: CommandLine.arguments[0])
+            .resolvingSymlinksInPath()
+            .deletingLastPathComponent()
+        for _ in 0..<6 {
+            candidates.append(
+                directory
+                    .appendingPathComponent("Vendor/duckdb-extensions")
+                    .appendingPathComponent(name)
+            )
+            directory = directory.deletingLastPathComponent()
+        }
+
+        return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
     }
 
     deinit { dpq_db_close(db) }
@@ -103,6 +195,10 @@ public final class DuckDBSession: @unchecked Sendable {
     /// Names this session in an `SQLTrace` line, so a trace shows which of the
     /// four sessions ran a statement — the whole point of their being separate.
     private let label: String
+
+    /// Why the session's engine cannot read vortex, or nil when it can.
+    /// Reached through the session because that is what the model holds.
+    public func loadError(for format: FileFormat) -> String? { engine.loadError(for: format) }
 
     public init(engine: DuckDBEngine = .shared, label: String) throws {
         var err: UnsafeMutablePointer<CChar>?
@@ -284,6 +380,11 @@ public struct RowBatch: Sendable {
         self.cells = cells
         self.rowCount = rowCount
     }
+
+    /// A result with nothing in it — what a question DuckDB cannot be asked
+    /// about this source answers with, rather than an error about a function
+    /// that does not exist. See `Probe.fileMetadata`.
+    public static let empty = RowBatch(columns: [], cells: [], rowCount: 0)
 
     public subscript(row: Int, column: Int) -> String? {
         cells[row * columns.count + column]

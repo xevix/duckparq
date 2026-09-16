@@ -1,21 +1,32 @@
 # Third-party licenses
 
-DuckParq itself is MIT licensed (see [LICENSE](LICENSE)). It ships as a single
-statically linked binary, so everything below is compiled *into*
-`DuckParq.app` and its notices travel with any copy of the app you distribute.
+DuckParq itself is MIT licensed (see [LICENSE](LICENSE)). Almost all of it is a
+single statically linked binary, so nearly everything below is compiled *into*
+`DuckParq.app`. The one exception is the vortex reader, which is not published
+as a static archive and travels in the bundle as a signed loadable extension
+instead — see [Vortex](#vortex) below. Either way it ships inside the app, so
+these notices travel with any copy of it you distribute.
 
-Everything here is permissive — MIT, BSD-2/3-Clause, Apache-2.0, Boost, zlib,
-or the Unicode license. Nothing is copyleft, and nothing imposes a condition
-MIT cannot satisfy: the obligations are to preserve copyright notices and
-license text, which is what this file does. Two components are dual-licensed
-with a copyleft option and are taken under the permissive one, as their own
-terms allow — Mbed TLS under Apache-2.0 rather than GPL-2.0-or-later, and
-Zstandard under BSD-3-Clause rather than GPL-2.0.
+Everything here is permissive — MIT, BSD-2/3-Clause, Apache-2.0, ISC, Boost,
+zlib, the Unlicense, or the Unicode license. Nothing is copyleft, and nothing
+imposes a condition MIT cannot satisfy: the obligations are to preserve
+copyright notices and license text, which is what this file does. Two
+components are dual-licensed with a copyleft option and are taken under the
+permissive one, as their own terms allow — Mbed TLS under Apache-2.0 rather
+than GPL-2.0-or-later, and Zstandard under BSD-3-Clause rather than GPL-2.0.
 
-Everything comes from one place: the pinned DuckDB static-libs bundle
-(`v1.5.5`, `osx-arm64`) that [`scripts/fetch-duckdb.sh`](scripts/fetch-duckdb.sh)
-downloads and checksum-verifies. There are no other dependencies — no SwiftPM
-packages, nothing from Homebrew, nothing loaded at runtime.
+Everything comes from two places, both pinned by version and SHA256:
+
+  - the DuckDB static-libs bundle (`v1.5.5`, `osx-arm64`) that
+    [`scripts/fetch-duckdb.sh`](scripts/fetch-duckdb.sh) downloads and
+    checksum-verifies, which is the whole of the table below;
+  - the `vortex` extension (`v1.5.5`, `osx_arm64`) that
+    [`scripts/fetch-extensions.sh`](scripts/fetch-extensions.sh) downloads the
+    same way, which is [its own section](#vortex).
+
+There are no other dependencies — no SwiftPM packages, nothing from Homebrew,
+and nothing fetched at runtime: the extension is loaded from inside the bundle
+by path, never installed or downloaded by the app.
 
 | Component | License | Linked as |
 | --- | --- | --- |
@@ -1233,10 +1244,92 @@ code generated from it. Apache-2.0, below.
 https://github.com/tdunning/t-digest — the sketch behind approximate
 quantiles. Apache-2.0, below.
 
+## Vortex
+
+https://github.com/vortex-data/vortex — the Vortex columnar file format and its
+reader, an LF AI & Data incubation project. **Apache-2.0**, whose text is below.
+
+Unlike everything above, this is not compiled into the executable: DuckDB
+publishes no static archive for it, only a signed loadable extension. The build
+vendors `vortex.duckdb_extension` (DuckDB `v1.5.5`, `osx_arm64`, extension
+build `bbeb8e6`) into `DuckParq.app/Contents/Resources/`, and the app `LOAD`s it
+from there by path at startup. It is distributed with the app, so its notices
+belong here exactly as the statically linked ones do.
+
+The extension is built in Rust and links its crate dependencies statically, so
+those travel inside it. There are 121 of them, and every one is permissive;
+none is copyleft. Where a crate offers a choice, DuckParq takes it under the
+first permissive option that is compatible with everything else here — **MIT**
+for the `MIT OR Apache-2.0` majority, **MIT** for the `Unlicense OR MIT` ones,
+and **Apache-2.0** where Apache-2.0 is the only offer. The full texts of MIT,
+Apache-2.0, ISC and the Unicode license are all reproduced in this file.
+
+Taken under **MIT**, being offered as `MIT OR Apache-2.0`, `Apache-2.0 OR MIT`,
+`MIT/Apache-2.0`, `Unlicense OR MIT`, `Unlicense/MIT`,
+`Apache-2.0 OR ISC OR MIT`, or `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR
+MIT`:
+
+> ahash, aho-corasick, arc-swap, async-executor, async-fs, async-io,
+> async-task, atomic-waker, base64, bit-vec, blocking, chrono,
+> concurrent-queue, core-foundation, crossbeam-channel, crossbeam-epoch,
+> fastrand, form_urlencoded, futures-channel, futures-core, futures-util, geo,
+> geo-traits, geo-types, geoarrow-array, geoarrow-schema, glob, hashbrown,
+> heapless, http, httparse, humansize, humantime, hyper-rustls, idna,
+> indexmap, ipnet, itertools, itoa, jiff, jiff-core, lasso, lazy_static,
+> lexical-parse-float, memchr, num-bigint, object_store, once_cell, oneshot,
+> parking, parking_lot, parking_lot_core, percent-encoding, piper, polling,
+> rand, regex, regex-automata, regex-syntax, reqwest, roaring, robust, rstar,
+> rustix, rustls, rustls-pki-types, same-file, security-framework, serde,
+> serde_core, serde_json, simdutf8, smallvec, tagptr, thread_local,
+> tokio-rustls, url, walkdir, wkb, wkt, zstd-safe
+
+Offered as **MIT** alone:
+
+> async-stream, atoi, bitvec, bytes, dashmap, h2, hyper, hyper-util, kanal,
+> quick-xml, sharded-slab, slab, tokio, tower, tracing-core, tracing-log,
+> tracing-subscriber, want
+
+Offered as **Apache-2.0** alone:
+
+> alp, arrow-buffer, arrow-cast, arrow-data, arrow-ord, arrow-schema,
+> arrow-select, better_io, custom-labels, fastlanes, flatbuffers, fsst-rs,
+> onpair, pco, sketches-ddsketch
+
+Carrying **more than one license at once**, so every one of them applies rather
+than being a choice: `arrow-array` (Apache-2.0 **and** MIT), `moka`
+(MIT-or-Apache-2.0 **and** Apache-2.0), and `ring` (Apache-2.0 **and** ISC).
+
+Offered as **ISC** alone: `rustls-webpki` and `untrusted`.
+
+Under the **Unicode License v3**: `icu_normalizer`. Its terms are the same
+Unicode data license reproduced in full under [utf8proc](#utf8proc) above.
+
+## ISC License
+
+Applies to `rustls-webpki` and `untrusted`, and to the ISC half of `ring`,
+inside the vortex extension.
+
+```
+ISC License
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
+```
+
 ## Apache License 2.0
 
 Applies to Mbed TLS (as selected above), FastPFor, Apache Thrift, the Apache
-Parquet format definitions, and t-digest.
+Parquet format definitions, t-digest, Vortex, and the vortex extension's
+Apache-2.0 crates listed above.
 
 ```
 Apache License
