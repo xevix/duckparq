@@ -119,6 +119,9 @@ final class AppModel {
     var formatsOnSave: Bool {
         didSet { UserDefaults.standard.set(formatsOnSave, forKey: Defaults.formatOnSave) }
     }
+    /// Numeric columns shown without thousands separators, saved across files
+    /// and launches — see `DigitGrouping`.
+    var digitGrouping = DigitGrouping()
     /// Queries in the library directory, refreshed when the menu needs them.
     var savedQueries: [SavedQuery] = []
     /// Name of the `.sql` file currently loaded, shown in the editor header.

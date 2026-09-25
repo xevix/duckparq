@@ -65,9 +65,6 @@ struct DataGridView: View {
     /// Widths the user has dragged, keyed by column name. Anything absent is
     /// measured from the content.
     @State private var widthOverrides: [String: CGFloat] = [:]
-    /// Numeric columns the user has turned thousands separators off for, keyed
-    /// by name like `widthOverrides`. Every other numeric column is grouped.
-    @State private var ungroupedColumns: Set<String> = []
     /// Whether the grid has keyboard focus, so Home/End reach it rather than
     /// whatever text field last had it.
     @FocusState private var isGridFocused: Bool
@@ -150,7 +147,6 @@ struct DataGridView: View {
             // New shape of result: measure column widths again.
             if signature != measuredSignature {
                 widthOverrides = [:]
-                ungroupedColumns = []
                 app.selectedGridRow = nil
                 measuredSignature = signature
             }
@@ -179,7 +175,7 @@ struct DataGridView: View {
         let layout = self.layout.matches(table.columns)
             ? self.layout
             : GridLayout(columns: table.columns, rows: table.rows, overrides: widthOverrides,
-                         ungrouped: ungroupedColumns)
+                         ungrouped: app.digitGrouping.ungrouped)
         let widths = layout.widths
         let contentWidth = layout.contentWidth
         return GeometryReader { proxy in
@@ -692,7 +688,7 @@ struct DataGridView: View {
                         width: widths[index],
                         direction: table.sortDirection(for: column.name),
                         ordinal: table.sortOrdinal(for: column.name),
-                        groupsDigits: column.kind.isNumeric ? !ungroupedColumns.contains(column.name) : nil,
+                        groupsDigits: column.kind.isNumeric ? app.digitGrouping.groups(column) : nil,
                         onToggleGrouping: { toggleGrouping(column) },
                         onToggle: { additive in
                             GridTrace.log("tap column \(index) \(column.name) additive \(additive)",
@@ -813,11 +809,11 @@ struct DataGridView: View {
     /// Deriving these twice is what let them disagree.
     private func remeasure() {
         layout.update(columns: table.columns, rows: table.rows, overrides: widthOverrides,
-                      ungrouped: ungroupedColumns)
+                      ungrouped: app.digitGrouping.ungrouped)
     }
 
     private func toggleGrouping(_ column: ColumnInfo) {
-        if ungroupedColumns.remove(column.name) == nil { ungroupedColumns.insert(column.name) }
+        app.digitGrouping.toggle(column.name)
         remeasure()
     }
 

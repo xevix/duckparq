@@ -1090,6 +1090,35 @@ try await checkColumnLayout()
         grouped: ColumnLayout.groupsDigits(for: columns, ungrouped: ["year"]), style: us)
     expect(groupedWidths[0] > bareWidths[0], "a grouped column is measured with its separators")
     expectEqual(groupedWidths[1], bareWidths[1], "the other column keeps its width")
+
+    // The toggle is saved, and a fresh read — the next file, the next launch —
+    // sees it. A throwaway suite, so the app's own settings are never touched.
+    let suite = "dev.xevix.duckparq.selftest.grouping.\(UUID().uuidString)"
+    guard let defaults = UserDefaults(suiteName: suite) else {
+        expect(false, "a scratch defaults suite can be created")
+        return
+    }
+    defer { defaults.removePersistentDomain(forName: suite) }
+
+    var grouping = DigitGrouping(defaults: defaults)
+    expect(grouping.ungrouped.isEmpty, "nothing is turned off on a fresh install")
+    expect(grouping.groups(columns[0]), "a column named year is grouped by default")
+    grouping.toggle("year")
+    expect(!grouping.groups(columns[0]), "toggling turns year off")
+    expect(grouping.groups(columns[1]), "and leaves other columns grouped")
+
+    let relaunched = DigitGrouping(defaults: defaults)
+    expectEqual(relaunched.ungrouped, ["year"], "the choice survives a relaunch")
+    // Keyed by name, so it holds in any file with a column of that name.
+    expect(!relaunched.groups(ColumnInfo(name: "year", typeName: "BIGINT")),
+           "a year column in another file stays ungrouped")
+    expect(!relaunched.groups(ColumnInfo(name: "label", typeName: "VARCHAR")),
+           "a text column is never grouped")
+
+    grouping.toggle("year")
+    expect(DigitGrouping(defaults: defaults).ungrouped.isEmpty, "turning it back on is saved too")
+    expect(defaults.object(forKey: DigitGrouping.defaultsKey) == nil,
+           "nothing is left in defaults once every column is back to the default")
 }
 try await checkNumberDisplay()
 // MARK: - Horizontal virtualization
