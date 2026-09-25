@@ -274,14 +274,16 @@ public final class TableModel {
     /// and having one is what lets the end of the dataset be read by turning
     /// the sort around instead of counting to it. See `fetchPage`.
     ///
-    /// Empty too where the partition key is not a column at all: only a reader
-    /// that takes `hive_partitioning` puts one there, so ordering by it would
-    /// be ordering by a name the query cannot resolve.
+    /// Empty too where there is no `HivePageIndex` to page that order by —
+    /// vortex, which has no footers to read file row counts from. Without the
+    /// index an ORDER BY on the key is a sort of the whole dataset, bought on
+    /// every open for an order the files are already read in: a glob comes
+    /// back in path order, and the path starts with the key.
     ///
     /// A default rather than a fixture: clicking the header clears it like any
     /// other sort, and `clearSort()` leaves the dataset unordered.
     private static func defaultSort(for source: DataSource) -> [SortKey] {
-        guard source.format.supportsHivePartitioning,
+        guard source.format.describesStorage,
               let url = source.datasetRoot,
               let key = FileTree.topLevelHiveKey(of: url)
         else { return [] }
@@ -794,8 +796,7 @@ public final class TableModel {
             return
         }
         if hiveIndexSource == source { return }
-        guard source.format.supportsHivePartitioning,
-              FileTree.topLevelHiveKey(of: url) != nil
+        guard FileTree.topLevelHiveKey(of: url) != nil
         else {
             // A plain folder of data files has no partition order to walk.
             hiveIndex = nil

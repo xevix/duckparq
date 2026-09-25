@@ -78,10 +78,8 @@ struct ExportSheet: View {
     /// have no layout to choose.
     private var columnarFormat: FileFormat? { format.fileFormat }
 
-    /// Whether the writer takes `PARTITION_BY`. DuckDB accepts the option on a
-    /// vortex `COPY` and then writes one empty file and drops the rest, so it
-    /// is not offered there — see `FileFormat.supportsPartitionedExport`.
-    private var partitions: Bool { columnarFormat?.supportsPartitionedExport == true }
+    /// Whether the writer takes `PARTITION_BY`: both columnar writers do.
+    private var partitions: Bool { columnarFormat != nil }
 
     /// Whether the export will actually partition. `isPartitioning` is the
     /// toggle's own state, which survives switching to a format that has no
@@ -91,8 +89,8 @@ struct ExportSheet: View {
 
     /// Partitioning, a write ordering and a codec — the choices that only mean
     /// something for a columnar file, and then only the ones that writer takes.
-    /// Vortex compresses with its own cascading encodings and writes one file,
-    /// so it is offered the write ordering and neither of the others.
+    /// Vortex compresses with its own cascading encodings, so it is offered
+    /// partitioning and the write ordering but no codec.
     @ViewBuilder private var columnarOptions: some View {
         if columnarFormat?.supportsCompressionChoice == true {
             Picker("Compression", selection: $compression) {

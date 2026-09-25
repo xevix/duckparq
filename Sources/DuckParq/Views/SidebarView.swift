@@ -471,18 +471,10 @@ private struct DirectoryContents: View {
         }
     }
 
-    /// What the partitions actually buy, which depends on who reads them.
-    ///
-    /// Only a reader that takes `hive_partitioning` puts the `key=value` names
-    /// back as columns. A vortex folder laid out the same way still globs as
-    /// one table, and saying more than that here would be the one place in the
-    /// app that claims what `HivePageIndex`, `Probe.hiveSummary` and
-    /// `TableModel.defaultSort` all decline to — see
-    /// `FileFormat.supportsHivePartitioning`.
+    /// What the partitions buy. Both readers put the `key=value` names back
+    /// as columns, so the same thing is true of either format.
     private var hiveDescription: String {
-        hiveFormat.supportsHivePartitioning
-            ? "Partitions are columns of one table — open the folder itself."
-            : "The files beneath read as one table — open the folder itself."
+        "Partitions are columns of one table — open the folder itself."
     }
 
     private var hiveFormat: FileFormat {

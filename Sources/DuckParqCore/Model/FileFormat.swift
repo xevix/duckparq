@@ -49,34 +49,15 @@ public enum FileFormat: String, Sendable, Hashable, CaseIterable, Codable {
     /// A format where they differ overrides this.
     public var primaryExtension: String { rawValue }
 
-    /// Options every read of this format carries, whatever the read is for,
-    /// written with the leading comma so they follow the path directly.
+    /// Whether the reader takes `file_row_number` and `union_by_name`.
     ///
-    /// Vortex builds since September 2026 take `hive_partitioning`, and with
-    /// it unset they autodetect `key=value` directories and add a column for
-    /// each — even when reading one file. Nothing else the app does with vortex
-    /// knows about those columns (no partition summary, no partitioned export,
-    /// no tiebreaker to page them by), so they are switched off explicitly and
-    /// vortex reads the way it always has. Parquet needs nothing here: a read
-    /// that wants partitions asks for them.
-    public var fixedReadOptions: String {
-        switch self {
-        case .parquet: return ""
-        case .vortex: return ", hive_partitioning = false"
-        }
-    }
-
-    /// Whether the reader takes the named options the grid leans on:
-    /// `filename`, `file_row_number`, `hive_partitioning`, `union_by_name`.
-    ///
-    /// `read_vortex` takes none of them in the form the grid needs — no
-    /// `file_row_number` and no `union_by_name`, and its `hive_partitioning` is
-    /// pinned off by `fixedReadOptions`. Everything
-    /// those options buy is therefore unavailable on vortex and has to degrade
-    /// rather than fail: no `file_row_number` tiebreaker (see
-    /// `DataSource.rowIdentityColumns`), no partition columns from `key=value`
-    /// directories, and no tolerance for files whose columns disagree.
-    public var supportsReadOptions: Bool {
+    /// `read_vortex` takes `hive_partitioning` and `filename` like parquet, but
+    /// neither of these, and rejects them outright. What they buy has to
+    /// degrade rather than fail on vortex: no `file_row_number` tiebreaker (see
+    /// `DataSource.rowIdentityColumns`), no cheap schema-agreement probe (see
+    /// `DatasetIndex.agreesFileByFile`), and no tolerance for files whose
+    /// columns disagree.
+    public var supportsRowNumbers: Bool {
         switch self {
         case .parquet: return true
         case .vortex: return false
@@ -92,30 +73,6 @@ public enum FileFormat: String, Sendable, Hashable, CaseIterable, Codable {
     /// registers `read_vortex` and nothing else. The inspector shows the schema
     /// for a vortex file and leaves those sections out.
     public var describesStorage: Bool {
-        switch self {
-        case .parquet: return true
-        case .vortex: return false
-        }
-    }
-
-    /// Whether a `key=value` directory layout reads back as partition columns.
-    ///
-    /// Only where `hive_partitioning` can be switched on. A folder of vortex
-    /// files under `year=2024/` still globs as one table — the files are simply
-    /// found and read — but the year is not a column of it, so nothing in the
-    /// app may claim it is. See `HivePageIndex` and `Probe.hiveSummary`, both
-    /// of which decline for a format that cannot do this.
-    public var supportsHivePartitioning: Bool { supportsReadOptions }
-
-    /// Whether an export can partition into `key=value` directories.
-    ///
-    /// DuckDB accepts `PARTITION_BY` on a vortex `COPY` and then writes one
-    /// empty file and drops the rest, so the option is not offered: an export
-    /// that silently loses rows is worse than one that cannot be asked for.
-    /// Not `supportsHivePartitioning`, though the two agree today: that one is
-    /// about what the reader gives back, this one about what the writer lays
-    /// down, and a writer could be fixed without a reader being.
-    public var supportsPartitionedExport: Bool {
         switch self {
         case .parquet: return true
         case .vortex: return false

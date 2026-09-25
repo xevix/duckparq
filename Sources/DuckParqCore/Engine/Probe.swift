@@ -256,13 +256,8 @@ public struct Probe: Sendable {
     /// for a dataset of more than `HiveSummary.fileLimit` files, where the
     /// listing cannot be trusted to be complete and every count drawn from it
     /// would be short without saying so.
-    ///
-    /// Also nil for a format whose reader does not turn `key=value` directories
-    /// into columns. The directories may well be there — nothing stops anyone
-    /// laying vortex files out that way — but a summary of "partition keys" is
-    /// a claim about columns of the table, and for vortex there are none.
     public func hiveSummary(of source: DataSource) async throws -> HiveSummary? {
-        guard source.format.supportsHivePartitioning, let root = source.datasetRoot
+        guard let root = source.datasetRoot
         else { return nil }
         let query = SQLBuilder.fileNames(source: source)
         let batch = try await session.queryAll(

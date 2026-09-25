@@ -81,13 +81,14 @@ public struct DataSource: Sendable, Hashable {
     /// The virtual columns that together name a row of this source uniquely,
     /// in order of significance.
     ///
-    /// Empty for a format whose reader generates neither — vortex, whose
-    /// `read_vortex` takes no named options at all. A source with no row
+    /// Empty for a format whose reader has no `file_row_number` — vortex. A
+    /// file name alone does not name a row, so a vortex dataset gets nothing
+    /// either. A source with no row
     /// identity gets no tiebreaker, and pages of a broadly-tied sort can
     /// disagree there exactly as they do in SQL mode; see
     /// `SQLBuilder.tiebreakingOrder`, which emits nothing for an empty list.
     public var rowIdentityColumns: [String] {
-        guard format.supportsReadOptions else { return [] }
+        guard format.supportsRowNumbers else { return [] }
         switch kind {
         case .file: return [Self.rowNumberColumn]
         case .dataset: return [Self.fileColumn, Self.rowNumberColumn]
@@ -100,30 +101,33 @@ public struct DataSource: Sendable, Hashable {
     /// `filename` and `rowNumber` add the virtual columns above. Both are off
     /// by default because they would otherwise show up as columns of the grid;
     /// the callers that ask for them either alias them (`rowCountsByFile`) or
-    /// project them back out (`SQLBuilder.rows`). Both are ignored by a format
-    /// whose reader has no such option — asking for one there is a bind error,
-    /// and the callers already cope with not getting the column because
+    /// project them back out (`SQLBuilder.rows`). `rowNumber` is ignored by a
+    /// format whose reader has no such option — asking for one there is a bind
+    /// error, and the callers already cope with not getting the column because
     /// `rowIdentityColumns` told them it would not arrive.
+    ///
+    /// Both formats read `key=value` directories back as partition columns: a
+    /// dataset asks for it, and a single file gets the readers' own autodetect,
+    /// which does the same when the file sits under such a directory.
     public func readExpression(
         parameterIndex: Int,
         filename: Bool = false,
         rowNumber: Bool = false
     ) -> String {
         let call = format.readFunction
-        guard format.supportsReadOptions else {
-            return "\(call)($\(parameterIndex)\(format.fixedReadOptions))"
-        }
-
+        let rows = format.supportsRowNumbers
         let filenameOption = filename ? ", filename = '\(Self.fileColumn)'" : ""
-        let rowNumberOption = rowNumber ? ", file_row_number = true" : ""
+        let rowNumberOption = rowNumber && rows ? ", file_row_number = true" : ""
         switch kind {
         case .file:
             return "\(call)($\(parameterIndex)\(filenameOption)\(rowNumberOption))"
         case .dataset:
             // hive_partitioning surfaces key=value directory names as columns;
-            // union_by_name tolerates files whose column order differs.
-            return "\(call)($\(parameterIndex), hive_partitioning = true, "
-                + "union_by_name = true\(filenameOption)\(rowNumberOption))"
+            // union_by_name tolerates files whose column order differs, where
+            // the reader can.
+            let union = rows ? ", union_by_name = true" : ""
+            return "\(call)($\(parameterIndex), hive_partitioning = true"
+                + "\(union)\(filenameOption)\(rowNumberOption))"
         }
     }
 }

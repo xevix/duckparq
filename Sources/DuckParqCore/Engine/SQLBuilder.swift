@@ -431,6 +431,20 @@ public enum SQLBuilder {
         )
     }
 
+    /// A file's own columns, leaving out any the reader would add from the
+    /// `key=value` directories above it.
+    ///
+    /// For comparing files with each other: the partition columns come from
+    /// the path, not the file, and are typed from one path's values at a time —
+    /// `region=123` and `region=apac` would read as a disagreement between two
+    /// files that hold exactly the same columns.
+    public static func describeOwnColumns(of file: URL, format: FileFormat) -> BoundSQL {
+        BoundSQL(
+            sql: "DESCRIBE SELECT * FROM \(format.readFunction)($1, hive_partitioning = false)",
+            params: [file.path]
+        )
+    }
+
     /// Column names and types of an arbitrary query the user typed, without
     /// running it.
     public static func describe(rawSQL: String) -> BoundSQL {
@@ -639,7 +653,7 @@ public enum SQLBuilder {
         under directory: URL, format: FileFormat
     ) -> BoundSQL {
         let source = DataSource.dataset(directory, format: format)
-        guard format.supportsReadOptions else {
+        guard format.supportsRowNumbers else {
             return schemaAgreementWithoutRowNumbers(under: directory, format: format)
         }
         // The read function only, never `source.readExpression` — that adds
@@ -664,7 +678,7 @@ public enum SQLBuilder {
     ) -> BoundSQL {
         let source = DataSource.dataset(directory, format: format)
         return BoundSQL(
-            sql: "SELECT * FROM \(format.readFunction)($1\(format.fixedReadOptions)) WHERE random() < 0",
+            sql: "SELECT * FROM \(format.readFunction)($1) WHERE random() < 0",
             params: [source.readPath]
         )
     }
@@ -799,7 +813,7 @@ public enum SQLBuilder {
 
     /// What a `COPY` with this layout writes: one file, or a tree of them.
     public static func writesDirectory(format: ExportFormat, layout: ColumnarLayout) -> Bool {
-        format.fileFormat?.supportsPartitionedExport == true && layout.isPartitioned
+        format.fileFormat != nil && layout.isPartitioned
     }
 
     /// The write ordering this export honours, or nil when the format has
@@ -889,7 +903,7 @@ public enum SQLBuilder {
             if columnar.supportsCompressionChoice {
                 options += ", COMPRESSION \(layout.compression.duckDBName)"
             }
-            if columnar.supportsPartitionedExport, layout.isPartitioned {
+            if layout.isPartitioned {
                 let keys = layout.partitionBy.map(quote).joined(separator: ", ")
                 options += ", PARTITION_BY (\(keys))"
             }

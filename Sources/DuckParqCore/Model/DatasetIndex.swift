@@ -68,7 +68,7 @@ public actor DatasetIndex {
         let task = Task<Bool, Never> {
             // A reader that cannot be asked to prune has to be asked file by
             // file instead. See `agreesFileByFile`.
-            guard format.supportsReadOptions else {
+            guard format.supportsRowNumbers else {
                 return await Self.agreesFileByFile(under: directory, format: format, on: session)
             }
             do {
@@ -130,7 +130,7 @@ public actor DatasetIndex {
     /// a time.
     ///
     /// The scan-shaped probe above cannot be used on vortex. `read_vortex`
-    /// takes no options, so there is no `file_row_number` to prune on, and the
+    /// has no `file_row_number`, so there is nothing to prune on, and the
     /// fallback that prunes nothing — `WHERE random() < 0` — does exactly what
     /// it says: it reads every row of every file. On a folder holding a 21 GB
     /// vortex file that was 87 seconds and 1,200 CPU-seconds spent deciding
@@ -138,7 +138,7 @@ public actor DatasetIndex {
     /// rare case for parquet and would have been every case here.
     ///
     /// So the question is turned around. "Do these files read as one table?" is
-    /// answered by asking each file what its columns are — a bind, one footer,
+    /// answered by asking each file what its own columns are — a bind, one footer,
     /// no data — and checking they all say the same thing. The cost becomes the
     /// number of files rather than the size of them: the same 21 GB file is 50
     /// milliseconds.
@@ -166,7 +166,7 @@ public actor DatasetIndex {
             // A file that cannot even be described is a file the folder cannot
             // be read through, which is the same answer as a disagreement.
             guard let described = try? await probe.columns(
-                of: .file(URL(fileURLWithPath: path), format: format)
+                of: SQLBuilder.describeOwnColumns(of: URL(fileURLWithPath: path), format: format)
             ) else { return false }
 
             // Names and types, not the whole `ColumnInfo`: nullability is a

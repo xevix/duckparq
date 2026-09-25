@@ -4610,19 +4610,22 @@ try await checkScale()
     expectEqual(DataSource.file(URL(fileURLWithPath: "/x/unknown.bin")).format, .parquet,
                 "an unrecognised name falls back to parquet, as it did before there was a choice")
 
-    // None of the options the grid leans on may be emitted -- `read_vortex` has no
-    // file_row_number or union_by_name, and asking is a bind error on every query
-    // rather than a missing column. The one option it does get pins partition
-    // autodetection off, so key=value folders never turn into columns.
+    // `read_vortex` takes hive_partitioning and filename like parquet, but has no
+    // file_row_number or union_by_name -- asking for either is a bind error on
+    // every query rather than a missing column, so they must never be emitted.
     expectEqual(
         DataSource.file(smallVortex).readExpression(parameterIndex: 1, filename: true, rowNumber: true),
-        "read_vortex($1, hive_partitioning = false)",
-        "no grid option survives onto a vortex read, however loudly it was asked for")
+        "read_vortex($1, filename = '\(DataSource.fileColumn)')",
+        "a vortex file read takes filename but never file_row_number")
     expectEqual(
         DataSource.dataset(uniformVortexDirectory, format: .vortex)
             .readExpression(parameterIndex: 1, filename: true, rowNumber: true),
-        "read_vortex($1, hive_partitioning = false)",
-        "including on a dataset, which gets partitions switched off and no union_by_name")
+        "read_vortex($1, hive_partitioning = true, filename = '\(DataSource.fileColumn)')",
+        "a vortex dataset reads its partitions as a parquet one does, without union_by_name")
+    expectEqual(
+        DataSource.dataset(uniformVortexDirectory, format: .vortex).readExpression(parameterIndex: 1),
+        "read_vortex($1, hive_partitioning = true)",
+        "and asks for nothing else when nothing else is wanted")
     expect(DataSource.dataset(uniformVortexDirectory, format: .vortex).readPath
             .hasSuffix("/**/*.vortex"),
            "a vortex dataset globs vortex files, not parquet ones")
@@ -4743,8 +4746,10 @@ try await checkScale()
     // form, and it still must not say union_by_name.
     do {
         let probeSQL = SQLBuilder.schemaAgreement(under: uniformVortexDirectory, format: .vortex)
-        expect(probeSQL.sql.contains("read_vortex($1, hive_partitioning = false)"),
-               "the vortex probe reads vortex, with partitions off like every other vortex read")
+        expect(probeSQL.sql.contains("read_vortex($1)"), "the vortex probe reads vortex")
+        expectEqual(SQLBuilder.describeOwnColumns(of: smallVortex, format: .vortex).sql,
+                    "DESCRIBE SELECT * FROM read_vortex($1, hive_partitioning = false)",
+                    "files are compared on their own columns, not the ones their folders add")
         expect(!probeSQL.sql.contains("union_by_name"),
                "and never with union_by_name, which is the option that would hide a mismatch")
         expect(!probeSQL.sql.contains(DataSource.rowNumberColumn),
@@ -4778,20 +4783,26 @@ try await checkScale()
                "a folder holding one unreadable file is not a dataset either")
     }
 
-    // `key=value` directories are just directories to a reader with no
-    // hive_partitioning. The folder still globs as one table -- it is the claim
-    // that year is a *column* of that table which has to be withheld.
+    // `key=value` directories are partition columns for vortex exactly as they
+    // are for parquet: the key is in the schema, the summary describes it, and
+    // the rows under every partition are all there.
     expect(await FileTree.datasetFormat(hiveVortexDirectory) == .vortex,
-           "a vortex layout under key=value folders still opens as one dataset")
+           "a vortex layout under key=value folders opens as one dataset")
     do {
         let hiveVortex = DataSource.dataset(hiveVortexDirectory, format: .vortex)
         let vortexColumns = try await probe.columns(of: hiveVortex)
-        expect(!vortexColumns.contains { $0.name == "year" },
-               "but year is not one of its columns: \(vortexColumns.map(\.name))")
+        expectEqual(vortexColumns.map(\.name), ["id", "value", "year"],
+                    "and year is one of its columns")
+        expectEqual(vortexColumns.last?.kind, .integer, "typed from the folder names as a number")
         expectEqual(try await probe.rowCount(of: hiveVortex), 1000,
-                    "while every row under every partition is still read")
-        expectEqual(try await probe.hiveSummary(of: hiveVortex), HiveSummary?.none,
-                    "and no partition summary is offered for keys that are not columns")
+                    "every row under every partition is read")
+        expectEqual(try await probe.rowCount(of: hiveVortex, filters: [
+                        Filter(column: ColumnInfo(name: "year", typeName: "BIGINT"),
+                               mode: .comparison(.equal, ["2024"]))]), 500,
+                    "and a filter on the partition key finds its partition's rows")
+        let vortexSummary = try await probe.hiveSummary(of: hiveVortex)
+        expectEqual(vortexSummary?.keys.map(\.name), ["year"], "the summary names the partition key")
+        expectEqual(vortexSummary?.partitionCount, 2, "and counts its partitions")
 
         let parquetHive = DataSource.dataset(hiveDirectory)
         let parquetColumns = try await probe.columns(of: parquetHive)
@@ -4801,14 +4812,38 @@ try await checkScale()
                "and does describe how it is divided")
 
         expect(try await HivePageIndex.build(source: hiveVortex, session: session) == nil,
-               "file-order paging needs footers and partition columns, so vortex pages the ordinary way")
+               "file-order paging needs footers with row counts, so vortex pages the ordinary way")
 
-        // Newer vortex builds autodetect partitions even on one file, so this is
-        // the read that shows whether the pin reaches single-file opens too.
+        // One file under a key=value folder reads the folder's key as a column,
+        // for both formats alike.
         let partitionFile = hiveVortexDirectory.appendingPathComponent("year=2023/data_0.vortex")
         expectEqual(try await probe.columns(of: .file(partitionFile, format: .vortex)).map(\.name),
-                    ["id", "value"],
-                    "one vortex file under a key=value folder gets no column from the folder's name")
+                    ["id", "value", "year"],
+                    "one vortex file under a key=value folder gets its key, as a parquet one does")
+        let parquetPartitionFile = try FileManager.default
+            .subpathsOfDirectory(atPath: hiveDirectory.path)
+            .first { $0.hasSuffix(".parquet") }
+            .map { hiveDirectory.appendingPathComponent($0) }
+        if let parquetPartitionFile {
+            expect(try await probe.columns(of: .file(parquetPartitionFile)).contains { $0.name == "year" },
+                   "which is what a parquet file under the same layout already did")
+        }
+
+        // Two files whose partitions type differently still agree: they hold the
+        // same columns, and the partition values are the path's, not theirs.
+        let typed = FileManager.default.temporaryDirectory
+            .appendingPathComponent("duckparq-vortex-keys-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: typed) }
+        for key in ["region=123", "region=apac"] {
+            let folder = typed.appendingPathComponent(key)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(
+                at: uniformVortexDirectory.appendingPathComponent("part-0.vortex"),
+                to: folder.appendingPathComponent("data.vortex"))
+        }
+        let keyIndex = DatasetIndex(session: try DuckDBSession(engine: engine, label: "vortex-keys"))
+        expect(await keyIndex.readsAsOneTable(typed, format: .vortex),
+               "files whose partition values type differently still read as one table")
     }
 
     // A hive layout is a dataset because `key=value` says so — but only once
@@ -4836,8 +4871,7 @@ try await checkScale()
                "and is one as soon as there is something under it to read")
     }
 
-    // Export. Vortex takes the write ordering and neither the codec nor
-    // PARTITION_BY -- DuckDB accepts the latter and then writes one empty file.
+    // Export. Vortex takes the write ordering and PARTITION_BY, but no codec.
     do {
         let query = SQLBuilder.rows(source: .file(smallParquet), sort: [SortKey(column: "id", direction: .ascending)])
         let destination = FileManager.default.temporaryDirectory
@@ -4852,14 +4886,14 @@ try await checkScale()
                "and offers no codec, which the writer has no option for: \(copy.sql)")
         expect(copy.sql.contains("ORDER BY score DESC"),
                "while the write ordering still applies — sorting is what makes rows compress")
-        expect(!SQLBuilder.writesDirectory(
+        expect(SQLBuilder.writesDirectory(
                 format: .vortex,
                 layout: SQLBuilder.ColumnarLayout(partitionBy: ["category"])),
-               "a partitioned vortex export is not offered, so it never writes a directory")
+               "a partitioned vortex export writes a directory")
         expect(SQLBuilder.writesDirectory(
                 format: .parquet,
                 layout: SQLBuilder.ColumnarLayout(partitionBy: ["category"])),
-               "where a partitioned parquet export still does")
+               "as a partitioned parquet export does")
         expectEqual(SQLBuilder.ExportFormat.vortex.fileExtension, "vortex",
                     "and the file it writes is named .vortex")
 
@@ -4870,6 +4904,28 @@ try await checkScale()
         expectEqual(readBack.value(row: 0, named: "n"), "1000", "the exported file holds every row")
         expectEqual(readBack.value(row: 0, named: "top"), "999",
                     "and DuckParq reads back what it wrote")
+
+        // Partitioned, end to end. Older vortex builds accepted PARTITION_BY and
+        // then wrote one file and dropped the rest, so this checks every row
+        // lands, under the folder its key says, and reads back as a dataset.
+        let tree = FileManager.default.temporaryDirectory
+            .appendingPathComponent("duckparq-export-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tree) }
+        let partitioned = SQLBuilder.export(
+            query: query, to: tree, format: .vortex,
+            layout: SQLBuilder.ColumnarLayout(partitionBy: ["category"]))
+        expect(partitioned.sql.contains("PARTITION_BY (\"category\")"),
+               "a partitioned vortex export asks for its partitions: \(partitioned.sql)")
+        try await session.execute(partitioned.sql, params: partitioned.params)
+        let folders = try FileManager.default.contentsOfDirectory(atPath: tree.path)
+            .filter { $0.hasPrefix("category=") }
+        expectEqual(folders.count, 4, "one folder per category")
+        let treeSource = DataSource.dataset(tree, format: .vortex)
+        expectEqual(try await probe.rowCount(of: treeSource), 1000, "holding every row between them")
+        expectEqual(try await probe.rowCount(of: treeSource, filters: [
+                        Filter(column: ColumnInfo(name: "category", typeName: "VARCHAR"),
+                               mode: .comparison(.equal, ["alpha"]))]), 250,
+                    "each under the folder its key names")
     }
 
     // End to end: a vortex file opened in the grid behaves like any other, ties and
@@ -4905,15 +4961,32 @@ try await checkScale()
         model.clearFilters()
         await settle(model)
 
-        // A hive-shaped vortex dataset opens on its files rather than on a sort by
-        // a partition key that is not a column of it.
+        // A hive-shaped vortex dataset opens with its partition key as a column,
+        // in the order its files are read -- without the page index a default
+        // sort by the key would be a sort of the whole dataset.
         model.open(.dataset(hiveVortexDirectory, format: .vortex))
         await settle(model)
         expectEqual(model.errorMessage, String?.none, "a hive-shaped vortex folder opens as one table")
+        expect(model.columns.contains { $0.name == "year" }, "with its partition key as a column")
         expect(model.defaultSort.isEmpty,
-               "with no default sort, since its partition key is not a column it could sort by")
+               "and no default sort, which would cost a full sort without a page index")
         expect(!model.pagesByFile, "and no file-order paging, which needs footers it has not got")
         expectEqual(model.totalRowCount, 1000, "over every row under every partition")
+        let yearIndex = model.columns.firstIndex { $0.name == "year" }
+        expectEqual(yearIndex.flatMap { model.rows.first?.cells[$0] }, "2023",
+                    "starting in the first partition, since files are read in path order")
+
+        model.filter(column: ColumnInfo(name: "year", typeName: "BIGINT"), matching: "2024")
+        await settle(model)
+        expectEqual(model.errorMessage, String?.none, "filtering on the partition key runs")
+        expectEqual(model.totalRowCount, 500, "and keeps only that partition's rows")
+        model.clearFilters()
+        await settle(model)
+        model.toggleSort(column: "year")
+        model.toggleSort(column: "year")
+        await settle(model)
+        expectEqual(yearIndex.flatMap { model.rows.first?.cells[$0] }, "2024",
+                    "and sorting by it descending puts the last partition first")
     }
 
 }
