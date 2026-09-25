@@ -110,7 +110,9 @@ public struct DataSource: Sendable, Hashable {
         rowNumber: Bool = false
     ) -> String {
         let call = format.readFunction
-        guard format.supportsReadOptions else { return "\(call)($\(parameterIndex))" }
+        guard format.supportsReadOptions else {
+            return "\(call)($\(parameterIndex)\(format.fixedReadOptions))"
+        }
 
         let filenameOption = filename ? ", filename = '\(Self.fileColumn)'" : ""
         let rowNumberOption = rowNumber ? ", file_row_number = true" : ""

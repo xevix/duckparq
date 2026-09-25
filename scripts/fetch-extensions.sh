@@ -33,7 +33,7 @@ DUCKDB_PLATFORM="osx_arm64"
 # URL is a path DuckDB publishes into and can republish. A mismatch here is
 # therefore "the pinned build moved", not necessarily "someone tampered" --
 # check the new file, then update the hash below.
-VORTEX_SHA256="5674bfc9a2e55a06c2ac68f2a18935ce217e6ad5479b01dea8406346a3bfaf66"
+VORTEX_SHA256="3d167ee9312b156a5c65d25a878d9739eeae4b04e974bae3865347bc3a6c2d56"
 
 VENDOR="$ROOT/Vendor/duckdb-extensions"
 STAMP="$VENDOR/.stamp"

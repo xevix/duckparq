@@ -4610,18 +4610,19 @@ try await checkScale()
     expectEqual(DataSource.file(URL(fileURLWithPath: "/x/unknown.bin")).format, .parquet,
                 "an unrecognised name falls back to parquet, as it did before there was a choice")
 
-    // The one option the reader takes is the path, so none of the ones the grid
-    // leans on may be emitted -- `read_vortex` rejects any named parameter at all,
-    // which would be a bind error on every query rather than a missing column.
+    // None of the options the grid leans on may be emitted -- `read_vortex` has no
+    // file_row_number or union_by_name, and asking is a bind error on every query
+    // rather than a missing column. The one option it does get pins partition
+    // autodetection off, so key=value folders never turn into columns.
     expectEqual(
         DataSource.file(smallVortex).readExpression(parameterIndex: 1, filename: true, rowNumber: true),
-        "read_vortex($1)",
-        "no named option survives onto a vortex read, however loudly it was asked for")
+        "read_vortex($1, hive_partitioning = false)",
+        "no grid option survives onto a vortex read, however loudly it was asked for")
     expectEqual(
         DataSource.dataset(uniformVortexDirectory, format: .vortex)
             .readExpression(parameterIndex: 1, filename: true, rowNumber: true),
-        "read_vortex($1)",
-        "including on a dataset, which gets no hive_partitioning or union_by_name either")
+        "read_vortex($1, hive_partitioning = false)",
+        "including on a dataset, which gets partitions switched off and no union_by_name")
     expect(DataSource.dataset(uniformVortexDirectory, format: .vortex).readPath
             .hasSuffix("/**/*.vortex"),
            "a vortex dataset globs vortex files, not parquet ones")
@@ -4742,7 +4743,8 @@ try await checkScale()
     // form, and it still must not say union_by_name.
     do {
         let probeSQL = SQLBuilder.schemaAgreement(under: uniformVortexDirectory, format: .vortex)
-        expect(probeSQL.sql.contains("read_vortex($1)"), "the vortex probe reads vortex")
+        expect(probeSQL.sql.contains("read_vortex($1, hive_partitioning = false)"),
+               "the vortex probe reads vortex, with partitions off like every other vortex read")
         expect(!probeSQL.sql.contains("union_by_name"),
                "and never with union_by_name, which is the option that would hide a mismatch")
         expect(!probeSQL.sql.contains(DataSource.rowNumberColumn),
@@ -4800,6 +4802,13 @@ try await checkScale()
 
         expect(try await HivePageIndex.build(source: hiveVortex, session: session) == nil,
                "file-order paging needs footers and partition columns, so vortex pages the ordinary way")
+
+        // Newer vortex builds autodetect partitions even on one file, so this is
+        // the read that shows whether the pin reaches single-file opens too.
+        let partitionFile = hiveVortexDirectory.appendingPathComponent("year=2023/data_0.vortex")
+        expectEqual(try await probe.columns(of: .file(partitionFile, format: .vortex)).map(\.name),
+                    ["id", "value"],
+                    "one vortex file under a key=value folder gets no column from the folder's name")
     }
 
     // A hive layout is a dataset because `key=value` says so — but only once

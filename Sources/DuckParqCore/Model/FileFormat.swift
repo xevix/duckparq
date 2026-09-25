@@ -49,11 +49,29 @@ public enum FileFormat: String, Sendable, Hashable, CaseIterable, Codable {
     /// A format where they differ overrides this.
     public var primaryExtension: String { rawValue }
 
+    /// Options every read of this format carries, whatever the read is for,
+    /// written with the leading comma so they follow the path directly.
+    ///
+    /// Vortex builds since September 2026 take `hive_partitioning`, and with
+    /// it unset they autodetect `key=value` directories and add a column for
+    /// each — even when reading one file. Nothing else the app does with vortex
+    /// knows about those columns (no partition summary, no partitioned export,
+    /// no tiebreaker to page them by), so they are switched off explicitly and
+    /// vortex reads the way it always has. Parquet needs nothing here: a read
+    /// that wants partitions asks for them.
+    public var fixedReadOptions: String {
+        switch self {
+        case .parquet: return ""
+        case .vortex: return ", hive_partitioning = false"
+        }
+    }
+
     /// Whether the reader takes the named options the grid leans on:
     /// `filename`, `file_row_number`, `hive_partitioning`, `union_by_name`.
     ///
-    /// `read_vortex` takes none of them — it accepts a path or a list of paths
-    /// and nothing else, and rejects any named parameter outright. Everything
+    /// `read_vortex` takes none of them in the form the grid needs — no
+    /// `file_row_number` and no `union_by_name`, and its `hive_partitioning` is
+    /// pinned off by `fixedReadOptions`. Everything
     /// those options buy is therefore unavailable on vortex and has to degrade
     /// rather than fail: no `file_row_number` tiebreaker (see
     /// `DataSource.rowIdentityColumns`), no partition columns from `key=value`

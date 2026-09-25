@@ -664,7 +664,7 @@ public enum SQLBuilder {
     ) -> BoundSQL {
         let source = DataSource.dataset(directory, format: format)
         return BoundSQL(
-            sql: "SELECT * FROM \(format.readFunction)($1) WHERE random() < 0",
+            sql: "SELECT * FROM \(format.readFunction)($1\(format.fixedReadOptions)) WHERE random() < 0",
             params: [source.readPath]
         )
     }
