@@ -45,9 +45,16 @@ public enum ColumnLayout {
         index: Int
     ) -> CGFloat {
         var longest = column.name.count + headerAffordance
+        // Numbers are drawn with thousands separators, so they are measured
+        // with them too.
+        let grouped = column.kind.isNumeric
         for row in rows.prefix(sampleRows) where index < row.cells.count {
             // NULL renders as the literal text "NULL", so it needs room too.
-            longest = max(longest, (row.cells[index] ?? "NULL").count)
+            guard let value = row.cells[index] else {
+                longest = max(longest, 4)
+                continue
+            }
+            longest = max(longest, grouped ? NumberDisplay.groupedCount(value) : value.count)
         }
         return clamp(CGFloat(longest) * characterWidth + horizontalPadding)
     }

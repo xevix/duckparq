@@ -842,6 +842,9 @@ struct GridLayout: Equatable {
     /// tests, and a cell would otherwise ask that question every time it was
     /// built.
     private(set) var trailingAligned: [Bool] = []
+    /// Whether each column's values are numbers drawn with thousands
+    /// separators. Precomputed for the same reason as `trailingAligned`.
+    private(set) var groupsDigits: [Bool] = []
     /// Moves only when the widths actually change, so a re-measure that lands
     /// on the same numbers rebuilds nothing.
     private(set) var version = 0
@@ -863,10 +866,16 @@ struct GridLayout: Equatable {
         overrides: [String: CGFloat]
     ) {
         let measured = ColumnLayout.widths(for: columns, rows: rows, overrides: overrides)
-        guard measured != widths else { return }
+        let kinds = columns.map(\.kind)
+        let trailing = kinds.map(\.prefersTrailingAlignment)
+        let grouped = kinds.map(\.isNumeric)
+        // The flags are compared too: a new result can land on the same widths
+        // with different column types.
+        guard measured != widths || trailing != trailingAligned || grouped != groupsDigits else { return }
         widths = measured
         offsets = ColumnLayout.offsets(for: measured)
-        trailingAligned = columns.map(\.kind.prefersTrailingAlignment)
+        trailingAligned = trailing
+        groupsDigits = grouped
         version += 1
     }
 
@@ -1083,10 +1092,13 @@ private struct RowView: View, Equatable {
     }
 
     private var tooltip: String? {
-        guard let hovered, let cell = hoveredCell, let value = cell.value,
-              hovered < layout.widths.count,
-              CGFloat(value.count) * Self.characterWidth > layout.widths[hovered] - 12
+        guard let hovered, let cell = hoveredCell, let raw = cell.value,
+              hovered < layout.widths.count
         else { return nil }
+        // The value as drawn, so the tooltip shows what was cut off.
+        let grouped = hovered < layout.groupsDigits.count && layout.groupsDigits[hovered]
+        let value = grouped ? NumberDisplay.grouped(raw) : raw
+        guard CGFloat(value.count) * Self.characterWidth > layout.widths[hovered] - 12 else { return nil }
         return value
     }
 
@@ -1175,7 +1187,8 @@ private struct RowCanvas: View, Equatable {
         let x = layout.offsets[index]
         let cellWidth = layout.widths[index]
 
-        let string = value ?? "NULL"
+        let grouped = index < layout.groupsDigits.count && layout.groupsDigits[index]
+        let string = value.map { grouped ? NumberDisplay.grouped($0) : $0 } ?? "NULL"
         let inner = CGRect(x: x + Self.padding, y: 0,
                            width: max(cellWidth - Self.padding * 2, 0), height: Self.height)
 

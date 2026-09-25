@@ -986,8 +986,60 @@ try await checkFolderWatching()
         expectEqual(absurd[2], ColumnLayout.maxWidth, "an override is clamped to the maximum")
     }
 
+    do {
+        // Numeric columns are drawn with thousands separators, so they must be
+        // measured with them — otherwise the separators push the tail out.
+        let wide = [TableModel.GridRow(id: 0, cells: ["1234567890123", "1234567890123"])]
+        let grouped = ColumnLayout.widths(
+            for: [ColumnInfo(name: "n", typeName: "BIGINT"), ColumnInfo(name: "s", typeName: "VARCHAR")],
+            rows: wide)
+        expect(grouped[0] > grouped[1], "a numeric column is measured with its separators")
+    }
+
 }
 try await checkColumnLayout()
+// MARK: - Number display
+@MainActor private func checkNumberDisplay() async throws {
+    section("Number display")
+
+    let cases: [(String, String)] = [
+        ("0", "0"),
+        ("999", "999"),
+        ("1000", "1,000"),
+        ("-1000", "-1,000"),
+        ("+12345", "+12,345"),
+        ("123456", "123,456"),
+        ("1234567", "1,234,567"),
+        ("1234567.891", "1,234,567.891"),
+        ("-9876543.21", "-9,876,543.21"),
+        ("0.00012345", "0.00012345"),
+        ("170141183460469231731687303715884105727",
+         "170,141,183,460,469,231,731,687,303,715,884,105,727"),
+        // Anything that is not a plain decimal is left exactly as DuckDB wrote it.
+        ("1.5e+20", "1.5e+20"),
+        ("inf", "inf"),
+        ("-inf", "-inf"),
+        ("nan", "nan"),
+        ("", ""),
+        ("-", "-"),
+        ("12a34", "12a34"),
+        ("1234.", "1,234."),
+        (".5", ".5"),
+    ]
+    for (input, expected) in cases {
+        expectEqual(NumberDisplay.grouped(input), expected, "\(input) is shown as \(expected)")
+        expectEqual(NumberDisplay.groupedCount(input), expected.count,
+                    "the measured length of \(input) matches what is drawn")
+    }
+
+    for type in ["BIGINT", "INTEGER", "HUGEINT", "DECIMAL(18,4)", "DOUBLE", "FLOAT"] {
+        expect(ColumnInfo.kind(forType: type).isNumeric, "\(type) values are grouped")
+    }
+    for type in ["VARCHAR", "DATE", "TIMESTAMP", "BIGINT[]", "BOOLEAN"] {
+        expect(!ColumnInfo.kind(forType: type).isNumeric, "\(type) values are left alone")
+    }
+}
+try await checkNumberDisplay()
 // MARK: - Horizontal virtualization
 @MainActor private func checkHorizontalVirtualization() async throws {
     //

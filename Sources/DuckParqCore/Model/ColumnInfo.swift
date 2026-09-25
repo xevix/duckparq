@@ -69,3 +69,57 @@ public struct ColumnInfo: Sendable, Hashable, Identifiable {
         return .other
     }
 }
+
+/// How numbers are shown in the grid: with the integer part grouped in
+/// thousands, so `1234567.5` reads as `1,234,567.5`.
+///
+/// Display only. The cells keep DuckDB's own text, so copying a value or
+/// filtering on it uses the number exactly as stored — a grouped `1,234` would
+/// not parse back as the number it came from.
+public enum NumberDisplay {
+    public static let separator: Character = ","
+
+    /// `value` with its integer digits grouped, or `value` unchanged when it
+    /// is not a plain decimal number — `inf`, `NaN` and exponent forms such as
+    /// `1.5e+20` are left as DuckDB wrote them.
+    public static func grouped(_ value: String) -> String {
+        guard let parts = split(value), parts.digits.count > 3 else { return value }
+        var result = String(parts.sign)
+        result.reserveCapacity(value.count + parts.digits.count / 3)
+        let leading = parts.digits.count % 3
+        for (offset, digit) in parts.digits.enumerated() {
+            if offset > 0, (offset - leading) % 3 == 0 { result.append(separator) }
+            result.append(digit)
+        }
+        result.append(contentsOf: parts.rest)
+        return result
+    }
+
+    /// How many characters `grouped(value)` would be, without building it.
+    /// Column measurement asks this of every sampled cell.
+    public static func groupedCount(_ value: String) -> Int {
+        guard let parts = split(value) else { return value.count }
+        return value.count + (parts.digits.count - 1) / 3
+    }
+
+    /// The sign, the integer digits and everything from the decimal point on,
+    /// or nil if `value` is not `[+-]digits[.digits]`.
+    private static func split(_ value: String) -> (sign: Substring, digits: Substring, rest: Substring)? {
+        let utf8 = value.utf8
+        var start = utf8.startIndex
+        if let first = utf8.first, first == UInt8(ascii: "-") || first == UInt8(ascii: "+") {
+            start = utf8.index(after: start)
+        }
+        var point = start
+        while point < utf8.endIndex, (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(utf8[point]) {
+            point = utf8.index(after: point)
+        }
+        guard point > start else { return nil }
+        if point < utf8.endIndex {
+            guard utf8[point] == UInt8(ascii: ".") else { return nil }
+            let fraction = utf8[utf8.index(after: point)...]
+            guard fraction.allSatisfy({ (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0) }) else { return nil }
+        }
+        return (value[..<start], value[start..<point], value[point...])
+    }
+}
