@@ -65,6 +65,9 @@ struct DataGridView: View {
     /// Widths the user has dragged, keyed by column name. Anything absent is
     /// measured from the content.
     @State private var widthOverrides: [String: CGFloat] = [:]
+    /// Numeric columns the user has turned thousands separators off for, keyed
+    /// by name like `widthOverrides`. Every other numeric column is grouped.
+    @State private var ungroupedColumns: Set<String> = []
     /// Whether the grid has keyboard focus, so Home/End reach it rather than
     /// whatever text field last had it.
     @FocusState private var isGridFocused: Bool
@@ -147,6 +150,7 @@ struct DataGridView: View {
             // New shape of result: measure column widths again.
             if signature != measuredSignature {
                 widthOverrides = [:]
+                ungroupedColumns = []
                 app.selectedGridRow = nil
                 measuredSignature = signature
             }
@@ -162,6 +166,9 @@ struct DataGridView: View {
             for: NSScroller.preferredScrollerStyleDidChangeNotification)) { _ in
             scrollerStyleGeneration += 1
         }
+        // A change of region changes the separators, and with them the widths.
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSLocale.currentLocaleDidChangeNotification)) { _ in remeasure() }
     }
 
     private var grid: some View {
@@ -171,7 +178,8 @@ struct DataGridView: View {
         // steady state the counts match and nothing is computed here.
         let layout = self.layout.matches(table.columns)
             ? self.layout
-            : GridLayout(columns: table.columns, rows: table.rows, overrides: widthOverrides)
+            : GridLayout(columns: table.columns, rows: table.rows, overrides: widthOverrides,
+                         ungrouped: ungroupedColumns)
         let widths = layout.widths
         let contentWidth = layout.contentWidth
         return GeometryReader { proxy in
@@ -684,6 +692,8 @@ struct DataGridView: View {
                         width: widths[index],
                         direction: table.sortDirection(for: column.name),
                         ordinal: table.sortOrdinal(for: column.name),
+                        groupsDigits: column.kind.isNumeric ? !ungroupedColumns.contains(column.name) : nil,
+                        onToggleGrouping: { toggleGrouping(column) },
                         onToggle: { additive in
                             GridTrace.log("tap column \(index) \(column.name) additive \(additive)",
                                           dedupe: false)
@@ -802,7 +812,13 @@ struct DataGridView: View {
     /// Re-derive the one width array the header and every row render from.
     /// Deriving these twice is what let them disagree.
     private func remeasure() {
-        layout.update(columns: table.columns, rows: table.rows, overrides: widthOverrides)
+        layout.update(columns: table.columns, rows: table.rows, overrides: widthOverrides,
+                      ungrouped: ungroupedColumns)
+    }
+
+    private func toggleGrouping(_ column: ColumnInfo) {
+        if ungroupedColumns.remove(column.name) == nil { ungroupedColumns.insert(column.name) }
+        remeasure()
     }
 
     private func resize(_ column: ColumnInfo, currentWidth: CGFloat, by delta: CGFloat) {
@@ -845,6 +861,9 @@ struct GridLayout: Equatable {
     /// Whether each column's values are numbers drawn with thousands
     /// separators. Precomputed for the same reason as `trailingAligned`.
     private(set) var groupsDigits: [Bool] = []
+    /// The region's separators, read once per measurement rather than once
+    /// per cell drawn.
+    private(set) var numberStyle = NumberStyle(groupingSeparator: ",", decimalSeparator: ".")
     /// Moves only when the widths actually change, so a re-measure that lands
     /// on the same numbers rebuilds nothing.
     private(set) var version = 0
@@ -853,8 +872,13 @@ struct GridLayout: Equatable {
 
     init() {}
 
-    init(columns: [ColumnInfo], rows: [TableModel.GridRow], overrides: [String: CGFloat]) {
-        update(columns: columns, rows: rows, overrides: overrides)
+    init(
+        columns: [ColumnInfo],
+        rows: [TableModel.GridRow],
+        overrides: [String: CGFloat],
+        ungrouped: Set<String>
+    ) {
+        update(columns: columns, rows: rows, overrides: overrides, ungrouped: ungrouped)
     }
 
     /// Whether these widths still describe `columns`.
@@ -863,19 +887,25 @@ struct GridLayout: Equatable {
     mutating func update(
         columns: [ColumnInfo],
         rows: [TableModel.GridRow],
-        overrides: [String: CGFloat]
+        overrides: [String: CGFloat],
+        ungrouped: Set<String>
     ) {
-        let measured = ColumnLayout.widths(for: columns, rows: rows, overrides: overrides)
-        let kinds = columns.map(\.kind)
-        let trailing = kinds.map(\.prefersTrailingAlignment)
-        let grouped = kinds.map(\.isNumeric)
-        // The flags are compared too: a new result can land on the same widths
-        // with different column types.
-        guard measured != widths || trailing != trailingAligned || grouped != groupsDigits else { return }
+        let style = NumberStyle.current
+        let grouped = ColumnLayout.groupsDigits(for: columns, ungrouped: ungrouped)
+        let measured = ColumnLayout.widths(for: columns, rows: rows, overrides: overrides,
+                                           grouped: grouped, style: style)
+        let trailing = columns.map(\.kind.prefersTrailingAlignment)
+        // Everything drawn from is compared, not just the widths: a new result,
+        // a toggled column or a change of region can each land on the same
+        // widths and still need redrawing.
+        guard measured != widths || trailing != trailingAligned || grouped != groupsDigits
+                || style != numberStyle
+        else { return }
         widths = measured
         offsets = ColumnLayout.offsets(for: measured)
         trailingAligned = trailing
         groupsDigits = grouped
+        numberStyle = style
         version += 1
     }
 
@@ -889,6 +919,10 @@ private struct HeaderCell: View {
     let width: CGFloat
     let direction: SortDirection?
     let ordinal: Int?
+    /// Whether the column's numbers are grouped in thousands; nil for a column
+    /// that is not numeric, which gets no toggle.
+    let groupsDigits: Bool?
+    let onToggleGrouping: () -> Void
     let onToggle: (Bool) -> Void
     let onResize: (CGFloat) -> Void
 
@@ -923,6 +957,11 @@ private struct HeaderCell: View {
         .help("\(column.name) — \(column.typeName)\nClick to sort ascending, descending, then unsorted. Shift-click to add a secondary sort.")
         .contextMenu {
             Button("Filter \(column.name)…") { showsFilterPopover = true }
+            if let groupsDigits {
+                Toggle("Thousands Separators", isOn: Binding(
+                    get: { groupsDigits },
+                    set: { _ in onToggleGrouping() }))
+            }
             Divider()
             Button("Copy Column Name") {
                 NSPasteboard.general.clearContents()
@@ -1097,7 +1136,7 @@ private struct RowView: View, Equatable {
         else { return nil }
         // The value as drawn, so the tooltip shows what was cut off.
         let grouped = hovered < layout.groupsDigits.count && layout.groupsDigits[hovered]
-        let value = grouped ? NumberDisplay.grouped(raw) : raw
+        let value = grouped ? layout.numberStyle.format(raw) : raw
         guard CGFloat(value.count) * Self.characterWidth > layout.widths[hovered] - 12 else { return nil }
         return value
     }
@@ -1188,7 +1227,7 @@ private struct RowCanvas: View, Equatable {
         let cellWidth = layout.widths[index]
 
         let grouped = index < layout.groupsDigits.count && layout.groupsDigits[index]
-        let string = value.map { grouped ? NumberDisplay.grouped($0) : $0 } ?? "NULL"
+        let string = value.map { grouped ? layout.numberStyle.format($0) : $0 } ?? "NULL"
         let inner = CGRect(x: x + Self.padding, y: 0,
                            width: max(cellWidth - Self.padding * 2, 0), height: Self.height)
 

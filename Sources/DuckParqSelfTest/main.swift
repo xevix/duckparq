@@ -990,9 +990,10 @@ try await checkFolderWatching()
         // Numeric columns are drawn with thousands separators, so they must be
         // measured with them — otherwise the separators push the tail out.
         let wide = [TableModel.GridRow(id: 0, cells: ["1234567890123", "1234567890123"])]
+        let cols = [ColumnInfo(name: "n", typeName: "BIGINT"), ColumnInfo(name: "s", typeName: "VARCHAR")]
         let grouped = ColumnLayout.widths(
-            for: [ColumnInfo(name: "n", typeName: "BIGINT"), ColumnInfo(name: "s", typeName: "VARCHAR")],
-            rows: wide)
+            for: cols, rows: wide, grouped: ColumnLayout.groupsDigits(for: cols),
+            style: NumberStyle(groupingSeparator: ",", decimalSeparator: "."))
         expect(grouped[0] > grouped[1], "a numeric column is measured with its separators")
     }
 
@@ -1002,6 +1003,7 @@ try await checkColumnLayout()
 @MainActor private func checkNumberDisplay() async throws {
     section("Number display")
 
+    let us = NumberStyle(groupingSeparator: ",", decimalSeparator: ".")
     let cases: [(String, String)] = [
         ("0", "0"),
         ("999", "999"),
@@ -1027,10 +1029,34 @@ try await checkColumnLayout()
         (".5", ".5"),
     ]
     for (input, expected) in cases {
-        expectEqual(NumberDisplay.grouped(input), expected, "\(input) is shown as \(expected)")
-        expectEqual(NumberDisplay.groupedCount(input), expected.count,
+        expectEqual(us.format(input), expected, "\(input) is shown as \(expected)")
+        expectEqual(us.formattedCount(input), expected.count,
                     "the measured length of \(input) matches what is drawn")
     }
+
+    // Regions that swap the marks, or use a multi-character or empty separator.
+    let styled: [(NumberStyle, String, String)] = [
+        (NumberStyle(groupingSeparator: ".", decimalSeparator: ","), "-1234567.891", "-1.234.567,891"),
+        (NumberStyle(groupingSeparator: "\u{202F}", decimalSeparator: ","), "1234567.5", "1\u{202F}234\u{202F}567,5"),
+        (NumberStyle(groupingSeparator: "’", decimalSeparator: "."), "1234567", "1’234’567"),
+        (NumberStyle(groupingSeparator: "", decimalSeparator: ","), "1234567.5", "1234567,5"),
+        (NumberStyle(groupingSeparator: " ", decimalSeparator: "·"), "999.25", "999·25"),
+        (NumberStyle(groupingSeparator: ".", decimalSeparator: ","), "1.5e+20", "1.5e+20"),
+    ]
+    for (style, input, expected) in styled {
+        expectEqual(style.format(input), expected,
+                    "\(input) is shown as \(expected) with \(style.groupingSeparator)/\(style.decimalSeparator)")
+        expectEqual(style.formattedCount(input), expected.count,
+                    "the measured length of \(input) matches what is drawn in that region")
+    }
+
+    // The marks come from the region, not a fixed comma.
+    let german = NumberStyle(locale: Locale(identifier: "de_DE"))
+    expectEqual(german.decimalSeparator, ",", "a German region uses a decimal comma")
+    expectEqual(german.format("1234.5"), "1\(german.groupingSeparator)234,5",
+                "a German region groups with its own separator")
+    let american = NumberStyle(locale: Locale(identifier: "en_US"))
+    expectEqual(american.format("1234.5"), "1,234.5", "a US region groups with commas")
 
     for type in ["BIGINT", "INTEGER", "HUGEINT", "DECIMAL(18,4)", "DOUBLE", "FLOAT"] {
         expect(ColumnInfo.kind(forType: type).isNumeric, "\(type) values are grouped")
@@ -1038,6 +1064,32 @@ try await checkColumnLayout()
     for type in ["VARCHAR", "DATE", "TIMESTAMP", "BIGINT[]", "BOOLEAN"] {
         expect(!ColumnInfo.kind(forType: type).isNumeric, "\(type) values are left alone")
     }
+
+    // Every numeric column is grouped by default, whatever it is called; only
+    // an explicit toggle turns it off, and only for that column.
+    let columns = [
+        ColumnInfo(name: "year", typeName: "INTEGER"),
+        ColumnInfo(name: "amount", typeName: "BIGINT"),
+        ColumnInfo(name: "label", typeName: "VARCHAR"),
+    ]
+    expectEqual(ColumnLayout.groupsDigits(for: columns), [true, true, false],
+                "numeric columns are grouped by default, even one named year")
+    expectEqual(ColumnLayout.groupsDigits(for: columns, ungrouped: ["year"]), [false, true, false],
+                "turning grouping off affects only that column")
+    expectEqual(ColumnLayout.groupsDigits(for: columns, ungrouped: ["label"]), [true, true, false],
+                "a text column is never grouped either way")
+
+    // A grouped column is measured with its separators, and toggling it off
+    // measures it bare again.
+    let rows = [TableModel.GridRow(id: 0, cells: ["1234567890123", "1234567890123", "x"])]
+    let groupedWidths = ColumnLayout.widths(
+        for: columns, rows: rows,
+        grouped: ColumnLayout.groupsDigits(for: columns), style: us)
+    let bareWidths = ColumnLayout.widths(
+        for: columns, rows: rows,
+        grouped: ColumnLayout.groupsDigits(for: columns, ungrouped: ["year"]), style: us)
+    expect(groupedWidths[0] > bareWidths[0], "a grouped column is measured with its separators")
+    expectEqual(groupedWidths[1], bareWidths[1], "the other column keeps its width")
 }
 try await checkNumberDisplay()
 // MARK: - Horizontal virtualization

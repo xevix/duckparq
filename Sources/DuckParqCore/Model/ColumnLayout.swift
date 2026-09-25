@@ -26,35 +26,49 @@ public enum ColumnLayout {
     /// Positional, not keyed by name: parquet files can contain duplicate or
     /// empty column names, and a name-keyed lookup would collapse them and shift
     /// every column after the collision.
+    ///
+    /// `grouped` says which columns are drawn with thousands separators — see
+    /// `groupsDigits(for:ungrouped:)` — and `style` which marks they use, so
+    /// those columns are measured the way they are drawn. Absent, nothing is
+    /// grouped.
     public static func widths(
         for columns: [ColumnInfo],
         rows: [TableModel.GridRow],
-        overrides: [String: CGFloat] = [:]
+        overrides: [String: CGFloat] = [:],
+        grouped: [Bool] = [],
+        style: NumberStyle = .current
     ) -> [CGFloat] {
         columns.enumerated().map { index, column in
             if let override = overrides[column.name] {
                 return clamp(override)
             }
-            return estimatedWidth(for: column, rows: rows, index: index)
+            let style = index < grouped.count && grouped[index] ? style : nil
+            return estimatedWidth(for: column, rows: rows, index: index, style: style)
         }
     }
 
+    /// Which columns get thousands separators: every numeric one, unless the
+    /// user has turned them off for it. The name alone never decides — a column
+    /// called `year` is grouped like any other until someone says otherwise.
+    public static func groupsDigits(for columns: [ColumnInfo], ungrouped: Set<String> = []) -> [Bool] {
+        columns.map { $0.kind.isNumeric && !ungrouped.contains($0.name) }
+    }
+
+    /// `style` is set when the column's numbers are drawn formatted with it.
     public static func estimatedWidth(
         for column: ColumnInfo,
         rows: [TableModel.GridRow],
-        index: Int
+        index: Int,
+        style: NumberStyle? = nil
     ) -> CGFloat {
         var longest = column.name.count + headerAffordance
-        // Numbers are drawn with thousands separators, so they are measured
-        // with them too.
-        let grouped = column.kind.isNumeric
         for row in rows.prefix(sampleRows) where index < row.cells.count {
             // NULL renders as the literal text "NULL", so it needs room too.
             guard let value = row.cells[index] else {
                 longest = max(longest, 4)
                 continue
             }
-            longest = max(longest, grouped ? NumberDisplay.groupedCount(value) : value.count)
+            longest = max(longest, style?.formattedCount(value) ?? value.count)
         }
         return clamp(CGFloat(longest) * characterWidth + horizontalPadding)
     }
