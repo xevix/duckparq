@@ -89,7 +89,11 @@ public struct Probe: Sendable {
     }
 
     public func columns(of source: DataSource) async throws -> [ColumnInfo] {
-        let query = SQLBuilder.describe(source: source)
+        try await columns(of: SQLBuilder.describe(source: source))
+    }
+
+    /// The columns a DESCRIBE query reports.
+    public func columns(of query: BoundSQL) async throws -> [ColumnInfo] {
         let batch = try await session.queryAll(query.sql, params: query.params)
         return (0..<batch.rowCount).compactMap { row in
             guard let name = batch.value(row: row, named: "column_name") else { return nil }

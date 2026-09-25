@@ -1058,6 +1058,9 @@ try await checkColumnLayout()
     let american = NumberStyle(locale: Locale(identifier: "en_US"))
     expectEqual(american.format("1234.5"), "1,234.5", "a US region groups with commas")
 
+    expectEqual(SQLBuilder.describe(rawSQL: "  SELECT 1 AS x;\n").sql, "DESCRIBE SELECT * FROM (SELECT 1 AS x)",
+                "a typed query is described without its trailing semicolon")
+
     for type in ["BIGINT", "INTEGER", "HUGEINT", "DECIMAL(18,4)", "DOUBLE", "FLOAT"] {
         expect(ColumnInfo.kind(forType: type).isNumeric, "\(type) values are grouped")
     }
@@ -3480,6 +3483,18 @@ func settle(_ model: TableModel, timeout: TimeInterval = 30) async {
         expectEqual(model.rows.count, 4, "the aggregate returns one row per category")
         expectEqual(model.errorMessage, String?.none, "a valid query produces no error")
 
+        // The cursor renders everything as text, so a SQL result's types have to
+        // be described separately — without them no column is numeric, and the
+        // grid offers no thousands separators or right-alignment.
+        func describedKinds() async -> [ColumnKind] {
+            for _ in 0..<200 where model.columns.map(\.kind) == [.text, .text] {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            return model.columns.map(\.kind)
+        }
+        expectEqual(await describedKinds(), [.text, .integer],
+                    "a SQL result's count column is typed as a number")
+
         // A bad query must surface a message and leave the app usable. It is
         // rejected before it runs, so the rows already on screen stay — there is no
         // reason to blank the grid over a query that never executed.
@@ -3506,6 +3521,18 @@ func settle(_ model: TableModel, timeout: TimeInterval = 30) async {
             !FileManager.default.fileExists(atPath: "/tmp/duckparq-selftest-should-not-exist.csv"),
             "the refused COPY wrote nothing to disk"
         )
+
+        model.runSQL("SELECT 1234567::BIGINT AS big, 3.5::DOUBLE AS ratio, 'x' AS label;")
+        await settle(model)
+        for _ in 0..<200 where !(model.columns.first?.kind.isNumeric ?? false) {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        expectEqual(model.columns.map(\.kind), [.integer, .floating, .text],
+                    "an edited query's numeric columns are typed, even with a trailing semicolon")
+        model.toggleSort(column: "big")
+        await settle(model)
+        expectEqual(model.columns.map(\.kind), [.integer, .floating, .text],
+                    "re-sorting a SQL result keeps its column types")
 
         // EXPLAIN, end to end. It is the one read-only statement that can be
         // neither windowed nor rendered as text, since both are a SELECT over it —

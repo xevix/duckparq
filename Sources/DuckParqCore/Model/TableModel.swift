@@ -156,6 +156,9 @@ public final class TableModel {
     /// Where to file this result once it has both a page and a count.
     private var pendingCacheKey: SourceFingerprint?
     private var loadedSource: DataSource?
+    /// The SQL-mode query whose column types have been described, so a re-sort
+    /// of the same query does not describe it again.
+    private var describedSQL: String?
     /// Raised by `continuePastCap()`, so the memory guard is the user's to lift.
     private var rowCap = TableModel.loadedRowCap
     /// What DuckDB's parser made of the statement in `.sql` mode. Only `EXPLAIN`
@@ -324,6 +327,7 @@ public final class TableModel {
             self.defaultSort = []
             self.sort = []
             self.columns = []
+            self.describedSQL = nil
             self.discardValueIndexes()
             self.reload()
         }
@@ -338,6 +342,7 @@ public final class TableModel {
         errorMessage = nil
         totalRowCount = nil
         loadedSource = nil
+        describedSQL = nil
         pendingCacheKey = nil
         defaultSort = []
         windowSize = Self.pageSize
@@ -915,6 +920,10 @@ public final class TableModel {
 
     /// DESCRIBE for the current source, if its schema isn't already known.
     private func startSchemaLoad(generation: Int) {
+        if case .sql(let text) = mode {
+            startSQLSchemaLoad(text, generation: generation)
+            return
+        }
         guard case .source(let source) = mode else { return }
         if loadedSource == source, !columns.isEmpty { return }
 
@@ -930,6 +939,34 @@ public final class TableModel {
                 // The preview may be perfectly fine without types — alignment
                 // and filter widgets degrade, the rows do not. If the file is
                 // genuinely unreadable the cursor reports it.
+            }
+        }
+    }
+
+    /// Column types for a query from the SQL editor.
+    ///
+    /// The cursor renders every column as text, so without this a SQL result
+    /// is all VARCHAR as far as the grid can tell: numbers sit left-aligned and
+    /// get no thousands separators. DESCRIBE binds the query without running
+    /// it, which is the same trade the file path makes.
+    ///
+    /// Only applied when it names the same columns the cursor did, in case
+    /// the two ever disagree — a wrong type is worse than none. EXPLAIN is left
+    /// alone: it cannot be selected from, and its output is text anyway.
+    private func startSQLSchemaLoad(_ text: String, generation: Int) {
+        guard !isExplain, describedSQL != text else { return }
+
+        schemaTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let described = try await self.probe.columns(of: SQLBuilder.describe(rawSQL: text))
+                guard generation == self.generation, !described.isEmpty else { return }
+                guard self.columns.isEmpty || self.columns.map(\.name) == described.map(\.name)
+                else { return }
+                self.columns = described
+                self.describedSQL = text
+            } catch {
+                // As for a file: the rows are fine without types.
             }
         }
     }

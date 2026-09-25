@@ -431,6 +431,13 @@ public enum SQLBuilder {
         )
     }
 
+    /// Column names and types of an arbitrary query the user typed, without
+    /// running it.
+    public static func describe(rawSQL: String) -> BoundSQL {
+        let trimmed = rawSQL.trimmingCharacters(in: CharacterSet(charactersIn: " \t\n\r;"))
+        return BoundSQL(sql: "DESCRIBE SELECT * FROM (\(trimmed))", params: [])
+    }
+
     public static func rowCount(source: DataSource, filters: [Filter] = []) -> BoundSQL {
         var params: [String] = [source.readPath]
         var sql = "SELECT count(*) AS row_count FROM \(source.readExpression(parameterIndex: 1)) AS \(sourceAlias)"
